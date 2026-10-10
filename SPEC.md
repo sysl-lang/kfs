@@ -292,9 +292,18 @@ written atomically); the rest of the block is zero.
 **`CLEAN`** is cleared, directly, at mount and set, directly, at a clean unmount together with exact
 `free_blocks` and `free_inodes`. The authoritative free counts are always the group descriptors'
 (journaled); the superblock's totals are a convenience for tools and are exact only when `CLEAN` is
-set. Mount recomputes the totals from the descriptors whatever `CLEAN` says. **`ERROR`** is set when
-the kernel detects an inconsistency (a checksum failure, an impossible structure); a filesystem with
+set. Mount recomputes the totals from the descriptors whatever `CLEAN` says. **`ERROR`** means the
+kernel detected an inconsistency (a checksum failure, an impossible structure); a filesystem with
 `ERROR` set mounts read-only until `fsck.kfs` clears it.
+
+**An error found while mounted is recorded in the journal superblock, not here.** Block 1 is journaled
+metadata while mounted, so a direct write of it then could carry an uncommitted `orphan_head` home, and
+a later replay of an older journaled copy of block 1 would clear the bit again. Instead the kernel
+**aborts the journal** (the running transaction is discarded, nothing more commits, the filesystem
+becomes read-only) and sets the journal superblock's `error` field (section 14), a direct write of one
+sector that no transaction ever logs. Mount copies a non-zero `error` into `ERROR` after replay (section
+15), so the bit survives any crash. Unmount of an aborted filesystem writes `ERROR` directly once the
+journal is idle.
 
 **Backups.** The backup superblocks (first block of groups 1 and G − 1) and descriptor tables are
 written by `mkfs.kfs` and by any tool that changes a static field (label, features). Their free counts
@@ -792,8 +801,14 @@ Per operation (section 18 says what each writes):
 | `renameat2` (any form) | `4·C_INODE + C_DIR_ADD + C_DIR_DEL + C_SB` = 191 |
 | one write chunk (≤ 8 extents allocated) | `C_INODE + 8·C_ALLOC` = 177 |
 | one truncate step (≤ 16 extents, ≤ 4 nodes freed) | ≤ 64 |
+| one punch step (a truncate step that may split one extent) | ≤ 64 + `C_EXT` + `C_GROUP` = 86 |
 | `setattr` (mode, owner, times, size up) | `C_INODE` = 1 |
 | `setxattr`/`removexattr` | `C_INODE + C_GROUP + 2` = 5 |
+
+**Credits are checked, not trusted.** A handle counts the distinct buffers it adds to the
+transaction; adding one past its credits is a bug in the credit table and stops the kernel (and fails
+the host test) at once, naming the operation. The tests of every stage run with this check, so a
+credit undercount shows up as a failure instead of as a transaction that overflows the log.
 
 `MAX_OP_CREDITS` = 192 bounds every operation that is never split. **Operations whose worst case is
 unbounded** — writing a large buffer, truncating or deleting a large fragmented file, preallocating a
@@ -822,7 +837,7 @@ Sequence numbers are 64-bit and increase by one per transaction; they never wrap
 | 16 | 4 | `journal_blocks` | must equal the superblock's |
 | 20 | 4 | `first` | 1 — the first log block |
 | 24 | 4 | `start` | log block of the oldest transaction not yet checkpointed; **0 = the log is empty** |
-| 28 | 4 | `reserved0` | 0 |
+| 28 | 4 | `error` | 0, or the first error the kernel found while mounted (an `errno` value, e.g. `EIO` 5); section 5 |
 | 32 | 8 | `start_seq` | the sequence at `start`; when empty, the next sequence to use |
 | 40 | 16 | `uuid` | the filesystem's |
 | 56 | 4 | `max_transaction` | must equal the superblock's |
@@ -969,11 +984,17 @@ Mount runs recovery when the journal superblock's `start` is not 0. `fsck.kfs` r
    otherwise read the copy, check the tag's `crc` (a mismatch in a committed transaction is media
    corruption: stop, set `ERROR`, refuse a read-write mount), unescape it, and write it to block `b`.
 5. **Flush.** Then set `start = 0`, `start_seq = end_seq`; write the journal superblock; flush.
-6. **Load** the superblock and descriptors afresh (replay may have rewritten them), recompute the free
-   totals, and **process the orphan list** (section 16) in ordinary transactions.
+6. **Load** the superblock and descriptors afresh (replay may have rewritten them) and recompute the
+   free totals. If the journal superblock's `error` is non-zero, set `ERROR` in the superblock (a direct
+   write, now safe: the log is empty) and clear `error`.
 
 Recovery is **idempotent**: a crash during it leaves the journal superblock unchanged until step 5, and
-replaying a copy twice writes the same bytes twice. A crash during step 6 is an ordinary crash.
+replaying a copy twice writes the same bytes twice.
+
+**Orphan processing is not part of recovery.** Mount runs it after its own direct superblock write
+(section 18, "Mount and unmount"), because it runs in ordinary transactions and direct writes of block 1
+are allowed only while the log is empty. A crash during it is an ordinary crash: the list is still on
+the disk and the next mount resumes it.
 
 ---
 
@@ -1179,7 +1200,11 @@ torn, some sectors of each) — the price of data=ordered over data=journal.
   also sets `size` in the last chunk. **Crash**: a prefix of the chunks; unwritten extents past `size`
   are legal (section 8).
 - **Punch a hole**: zero the partial blocks at the edges (ordered data of the first step), then remove
-  the whole blocks in steps as for truncate. A punch does not use the orphan list: a crash part-way
+  the whole blocks in steps as for truncate. Unlike a truncation, a punch strictly inside one extent
+  splits it in two, which is an insert and may need a new extent-tree node; so a punch step carries
+  `C_EXT` + `C_GROUP` credits on top of a truncate step's, and a punch may answer `ENOSPC` when that
+  node cannot be allocated (Linux's `fallocate` may too). Truncation and delete only ever cut the
+  last extents and never need a new block. A punch does not use the orphan list: a crash part-way
   leaves the range partly freed (reading as zeros) and partly still mapped (reading as the old bytes).
   The filesystem is consistent either way — every step is a transaction — and a call that never
   returned promised nothing about its range.
@@ -1202,9 +1227,12 @@ One transaction each: the inode (and the xattr block). `utimensat` sets `atime`/
 
 ### Mount and unmount
 
-**Mount**: read and check the superblock and descriptors; refuse unknown incompat features; read-only
-for unknown ro_compat features, for `ERROR`, or for a device without flush; recover (section 15);
-recompute totals; clear `CLEAN`, `mount_count` + 1, `mount_time` (direct write, flush).
+**Mount**, in this order: read and check the superblock and descriptors; refuse unknown incompat
+features; recover (section 15: replay, then `error` → `ERROR`); read-only for unknown ro_compat
+features, for `ERROR`, or for a device without flush; recompute totals; clear `CLEAN`, `mount_count`
++ 1, `mount_time` (direct write, flush) — the last direct write before transactions start; then process
+the orphan list (section 16) in ordinary transactions. A read-only mount skips the last two (the orphan
+list waits for a read-write mount or `fsck.kfs`).
 **Unmount**: commit, checkpoint everything (`start = 0`), write the superblock with exact totals and
 `CLEAN` (direct write, flush).
 
@@ -1268,6 +1296,21 @@ whenever no group lock is held, and the superblock is written from them at unmou
 **What a read takes**: `read` takes the inode lock for the extent lookup and the size (a later
 reader-writer lock can make concurrent readers of one file parallel; keel's scheduler has none yet).
 
+**A split operation holds its inode's lock from its first step to its last** — a large `write`, a
+shrinking `truncate`, a punch, a delete — opening and closing one handle per step inside it. Otherwise
+a `write` between two truncation steps could map blocks past the new `size` that the next step then
+frees, or a second truncate could start on an inode already on the orphan list. Holding an inode lock
+across handles is allowed by the order above (inode locks come before handles); the commit thread
+takes no inode lock, so a step waiting for a commit cannot deadlock against it.
+
+**`orphan_next` and `ORPHAN` belong to `orphans.lock`, not to the inode's lock.** Removing an inode
+from the list rewrites its *predecessor's* `orphan_next`, an inode some other core may be changing
+under its own lock at that moment. So both fields live in the in-memory list, not the in-memory inode,
+and whoever serialises an inode into its inode-table block copies them from the list under
+`orphans.lock` (rule 5, before `buffer.lock`); no other code writes them. Without this, an inode
+written back from a stale in-memory copy would silently drop a list link and leak every inode behind
+it.
+
 ---
 
 ## 20. statfs
@@ -1329,8 +1372,9 @@ know. `fsck.kfs` refuses to repair a filesystem with unknown incompat or ro_comp
 | journaled copy | CRC32C with the transaction's sequence, in its tag |
 | file data | **none** |
 
-A checksum failure in the kernel makes the call answer `EIO`, sets `ERROR` in the superblock (a
-direct write) and makes the filesystem read-only. Detection is not correction: only `fsck.kfs` repairs.
+A checksum failure in the kernel makes the call answer `EIO`, aborts the journal, records the error in
+the journal superblock (section 5 says why not in the superblock) and makes the filesystem read-only.
+Detection is not correction: only `fsck.kfs` repairs.
 
 **What remains undetected**: corruption of file data; a stale but valid block written back by a
 misbehaving device to the same owner at the same generation; and simultaneous loss of a structure and
@@ -1468,6 +1512,12 @@ by unwritten extents; sparse files; `fsck`; pedagogical notes.
 | Feature masks compat / ro_compat / incompat | a defined path for every future format change |
 | fsck: duplicate-claim pass, connectivity via `parent`, orphan-list audit, exit codes, a destructive mode kept separate | SFS's fsck was report-mostly |
 | Dropped: the bad-block inode; triple-indirect extent blocks; `SPARSE` | a virtual disk remaps; the B-tree replaces the indirect tiers; holes are absence |
+| An error found while mounted aborts the journal and is recorded in the journal superblock, copied into `ERROR` at the next mount | a direct write of the journaled block 1 could carry uncommitted changes home, and replaying an older copy of block 1 would clear the bit |
+| Orphan processing runs after mount's direct superblock write, not inside recovery | direct writes of block 1 are only safe while the log is empty |
+| A split operation holds its inode lock across all its steps | a write between truncation steps could map blocks the next step frees |
+| `orphan_next`/`ORPHAN` are owned by `orphans.lock` and copied in when an inode is serialised | a predecessor's link is rewritten by whoever removes its successor, possibly while another core writes that predecessor |
+| Handles check their credits | a credit undercount fails a test instead of overflowing the log |
+| A punch step carries split credits and may answer `ENOSPC` | punching inside an extent splits it, which may need a new tree node |
 
 ---
 
@@ -1493,7 +1543,7 @@ by unwritten extents; sparse files; `fsck`; pedagogical notes.
 
 ## 27. Implementation plan
 
-Twelve stages in dependency order. Each is one bounded deliverable, ends with a commit on its own
+Thirteen stages in dependency order. Each is one bounded deliverable, ends with a commit on its own
 branch fast-forwarded into `dev` after `scripts/boot-test.sh` and the host suites are green, and
 leaves the old filesystem working until stage 12 retires it.
 
@@ -1672,19 +1722,28 @@ before its checkpoint, with the files present and the host `fsck.kfs` clean.
 ### Stage 12 — The switch
 
 Builds: keel's file calls (`openat`, `read`/`write`/`pread64`/`readv`/`writev`, `lseek`,
-`newfstatat`/`fstat` with times, `rdev` and `st_blocks`, `getdents64` with positions and all `DT_*`,
-`mkdirat`, `unlinkat`, `renameat` and `renameat2`, `linkat`, `symlinkat`, `readlinkat`, `mknodat`,
+`newfstatat`/`fstat` with times and `st_blocks`, `getdents64` with positions and all `DT_*`,
+`mkdirat`, `unlinkat`, `renameat` and `renameat2`, `linkat`, `symlinkat`, `readlinkat`,
 `truncate`/`ftruncate`, `fallocate`, `fsync`/`fdatasync`/`sync`, `utimensat`, `fchmodat`,
-`fchownat`, `statfs`/`fstatfs`, the xattr calls) on KFS; device nodes routed to a `(major, minor)`
-device table serving null, zero, full, random, urandom, tty and console; the root mounted from KFS;
-`boot-test.sh` building the disk with `mkfs.kfs` (32 MiB, `/dev` from the spec file, some busybox
-applets as symlinks to `/bin/busybox`) and checking it with `fsck.kfs` after each boot; the old
-`kernel/keel/fs/`, `ondisk/` and `tools/mkfs` removed.
+`fchownat`, `statfs`/`fstatfs`, the xattr calls) on KFS, with path resolution following symlinks; the
+root mounted from KFS; `boot-test.sh` building the disk with `mkfs.kfs` (32 MiB) and checking it with
+`fsck.kfs` after each boot; the old `kernel/keel/fs/`, `ondisk/` and `tools/mkfs` removed.
 Tests (boot-test lines, besides every existing line still passing):
 `keel: kfs root mounted, 8192 blocks`; `user: unlinked file still readable` (open, unlink, write,
-read back, the name absent from `ls`); `user: rename replaced an open file`; `echo x > /dev/null`
-and `busybox head -c 4 /dev/zero | busybox od -An -tx1` printing ` 00 00 00 00`; `ls -l /dev/null`
-showing `crw-rw-rw-` and `1, 3`; `busybox ln -s /hello.txt /l` then `cat /l` printing the file and
-`busybox readlink /l` printing `/hello.txt`; an applet run through its symlink (`md5sum /hello.txt`);
+read back, the name absent from `ls`); `user: rename replaced an open file`; `busybox ln -s
+/hello.txt /l` then `cat /l` printing the file and `busybox readlink /l` printing `/hello.txt`;
 `busybox stat -c %Y /hello.txt` printing the format time and a `touch` moving it; on boot 2,
 `user: persisted across reboot` and `keel: kfs orphans 0`; `fsck.kfs: clean` after each boot.
+
+### Stage 13 — Device nodes and `/dev`
+
+Builds: `mknodat` in the kernel; opening a character device routed to a `(major, minor)` device table
+serving null, zero, full, random, urandom, tty and console (the console's descriptor kind, so termios
+and job control work through `/dev/tty`); FIFOs opened by name attached to a pipe keyed by the inode;
+`st_rdev`; `/dev` built by `mkfs.kfs` from the spec file; some busybox applets installed as symlinks to
+`/bin/busybox`.
+Tests (boot-test lines): `echo x > /dev/null`; `busybox head -c 4 /dev/zero | busybox od -An -tx1`
+printing ` 00 00 00 00`; `echo x > /dev/full` failing with `ENOSPC`; `ls -l /dev/null` showing
+`crw-rw-rw-` and `1, 3`; `busybox mkfifo /tmp/f`, a writer in the background and a reader through the
+name; an applet run through its symlink (`md5sum /hello.txt`); a non-root `mknod` of a device refused
+(`EPERM`).
