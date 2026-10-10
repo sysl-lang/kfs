@@ -1,0 +1,38 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+// Helpers the test files share.
+
+import sysl.buf.{Buf, buf}
+
+// A zeroed block on the heap, so it is aligned for any structure.
+new_block() -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for _ in 0..<BLOCK_SIZE
+        b.push(0)
+    b
+
+// The bytes 0, 1, 2, ... n - 1 (mod 256).
+counting(n: usize) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for i in 0..<n
+        b.push(u8(i & 0xFF))
+    b
+
+// A block whose every byte is derived from `salt`, so two blocks differ everywhere.
+filled_block(salt: u32) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    var x: u32 = salt * 2654435761 + 12345
+    for _ in 0..<BLOCK_SIZE
+        x = x * 1664525 + 1013904223
+        b.push(u8((x >> 24) & 0xFF))
+    b
+
+copy_of(src: []const u8) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for x in src
+        b.push(x)
+    b
+
+le16(bytes: []const u8, at: usize) -> u16 = u16(bytes[at]) | (u16(bytes[at + 1]) << 8)

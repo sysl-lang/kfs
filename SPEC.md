@@ -334,6 +334,10 @@ offset `(g % 64) × 64` of table block `g / 64`. The primary table follows the p
 
 Table entries past `group_count` in the last table block are zero and unchecked.
 
+**A bitmap's checksum covers the whole 4096-byte bitmap block**, not just the bits its group uses: every
+bit past the group's last block (block bitmap) or last inode (inode bitmap) is set, so no byte of the
+block is unspecified.
+
 **The descriptor is where the bitmaps' checksums live**, so a bitmap needs no room of its own for one;
 every change to a bitmap changes a free count anyway, so the descriptor is in the same transaction.
 

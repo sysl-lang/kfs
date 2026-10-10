@@ -1,0 +1,60 @@
+module keel.kfs
+
+// SipHash with c compression rounds per message word and d finalization rounds, 64-bit output
+// (Aumasson and Bernstein). KFS uses SipHash-1-3 for directory hashing; the same code run as SipHash-2-4
+// is what the reference vectors of the original paper check, so both parameterisations are tested.
+//
+// The key is two little-endian 64-bit words, k0 = key bytes 0-7 and k1 = bytes 8-15; a message is read
+// as little-endian 64-bit words with the length in the top byte of the last one.
+
+private rotl(x: u64, b: u64) -> u64 = (x << b) | (x >> (64 - b))
+
+// One SipRound over the four state words.
+private round(v: *[4]u64)
+    v[0] += v[1]
+    v[1] = rotl(v[1], 13)
+    v[1] ^= v[0]
+    v[0] = rotl(v[0], 32)
+    v[2] += v[3]
+    v[3] = rotl(v[3], 16)
+    v[3] ^= v[2]
+    v[0] += v[3]
+    v[3] = rotl(v[3], 21)
+    v[3] ^= v[0]
+    v[2] += v[1]
+    v[1] = rotl(v[1], 17)
+    v[1] ^= v[2]
+    v[2] = rotl(v[2], 32)
+
+siphash(c: usize, d: usize, k0: u64, k1: u64, msg: []const u8) -> u64
+    var v: [4]u64 = [
+        k0 ^ 0x736f6d6570736575,
+        k1 ^ 0x646f72616e646f6d,
+        k0 ^ 0x6c7967656e657261,
+        k1 ^ 0x7465646279746573,
+    ]
+    val whole = msg.len - msg.len % 8
+    var i: usize = 0
+    while i < whole
+        var m: u64 = 0
+        for j in 0..<8
+            m |= u64(msg[i + usize(j)]) << u64(8 * j)
+        v[3] ^= m
+        for _ in 0..<c
+            round(&v)
+        v[0] ^= m
+        i += 8
+    var last: u64 = u64(msg.len & 0xFF) << 56
+    for j in 0..<(msg.len - whole)
+        last |= u64(msg[whole + usize(j)]) << u64(8 * j)
+    v[3] ^= last
+    for _ in 0..<c
+        round(&v)
+    v[0] ^= last
+    v[2] ^= 0xFF
+    for _ in 0..<d
+        round(&v)
+    v[0] ^ v[1] ^ v[2] ^ v[3]
+
+siphash13(k0: u64, k1: u64, msg: []const u8) -> u64 = siphash(1, 3, k0, k1, msg)
+siphash24(k0: u64, k1: u64, msg: []const u8) -> u64 = siphash(2, 4, k0, k1, msg)

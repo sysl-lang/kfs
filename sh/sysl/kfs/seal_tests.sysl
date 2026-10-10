@@ -1,0 +1,194 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// For every byte of `bytes`, flip one bit and ask `check` whether the structure still verifies. A byte
+// in `[lo, hi)` is covered by the checksum and a byte in `[crc, crc + 4)` is the checksum itself: both
+// must break verification. Every other byte lies outside the structure's coverage and must not matter.
+private flips_break_exactly(bytes: []u8, lo: usize, hi: usize, crc: usize, check: &Fn([]const u8) -> bool)
+    assert(check(bytes))
+    for i in 0..<bytes.len
+        val was = bytes[i]
+        bytes[i] = was ^ u8(1 << (i % 8))
+        val inside = (i >= lo && i < hi) || (i >= crc && i < crc + 4)
+        assert_eq(check(bytes), !inside)
+        bytes[i] = was
+
+private val SEED: u32 = 0x5EED_1234
+
+// -- the superblock ---------------------------------------------------------------------------------------
+
+@test("a sealed superblock verifies; any bit of bytes 0-507 or of the crc breaks it; bytes past 512 do not")
+superblock_seal()
+    var blk = filled_block(1)
+    seal_superblock(blk.view())
+    flips_break_exactly(blk.view(), 0, 508, 508, (b) -> verify_superblock(b))
+
+@test("the superblock checksum starts from all ones and has no identity or seed")
+superblock_crc_definition()
+    var blk = filled_block(2)
+    seal_superblock(blk.view())
+    assert_eq(le32(blk.view(), 508), crc32c(0xFFFF_FFFF, blk.view()[0..<508]))
+
+@test("an unsealed (zeroed) block is not a valid superblock")
+superblock_rejects_a_bad_block()
+    var blk = new_block()
+    assert(!verify_superblock(blk.view()))
+    var junk = filled_block(4)
+    assert(!verify_superblock(junk.view()))
+
+@test("csum_seed is C(all ones, uuid)")
+csum_seed_definition()
+    val uuid = counting(16)
+    assert_eq(csum_seed_of(uuid.view()), crc32c(0xFFFF_FFFF, uuid.view()))
+
+// -- group descriptors and bitmaps ------------------------------------------------------------------------
+
+@test("a sealed group descriptor verifies; coverage is its bytes 0-59 and crc; the rest of the table block is outside")
+group_desc_seal()
+    var blk = filled_block(5)
+    val at_desc: usize = 3 * 64
+    seal_group_desc(SEED, 3, blk.view()[at_desc ..< at_desc + 64])
+    flips_break_exactly(blk.view(), at_desc, at_desc + 60, at_desc + 60,
+        (b) -> verify_group_desc(SEED, 3, b[at_desc ..< at_desc + 64]))
+
+@test("a group descriptor fails for another group number or another seed")
+group_desc_identity_and_seed()
+    var blk = filled_block(6)
+    seal_group_desc(SEED, 3, blk.view()[0..<64])
+    assert(verify_group_desc(SEED, 3, blk.view()[0..<64]))
+    assert(!verify_group_desc(SEED, 4, blk.view()[0..<64]))
+    assert(!verify_group_desc(SEED, 2, blk.view()[0..<64]))
+    assert(!verify_group_desc(SEED ^ 1, 3, blk.view()[0..<64]))
+    var other = copy_of(blk.view())
+    other.view()[63] = other.view()[63] ^ 0x80
+    assert(!verify_group_desc(SEED, 3, other.view()[0..<64]))
+
+@test("a bitmap checksum covers all 4096 bytes, the group number and the seed")
+bitmap_crc_sensitivity()
+    var bm = filled_block(7)
+    val base = bitmap_crc(SEED, 9, bm.view())
+    assert_eq(base, crc32c(crc32c_u32(SEED, 9), bm.view()))
+    assert(bitmap_crc(SEED, 10, bm.view()) != base)
+    assert(bitmap_crc(SEED ^ 1, 9, bm.view()) != base)
+    for i in 0..<BLOCK_SIZE
+        val was = bm.view()[i]
+        bm.view()[i] = was ^ u8(1 << (i % 8))
+        assert(bitmap_crc(SEED, 9, bm.view()) != base)
+        bm.view()[i] = was
+
+// -- inodes -----------------------------------------------------------------------------------------------
+
+@test("a sealed inode verifies; coverage is bytes 0-251 and crc; the neighbouring inodes are outside")
+inode_seal()
+    var blk = filled_block(8)
+    val at_inode = 5 * INODE_SIZE
+    seal_inode(SEED, 0x1_0000_0007, blk.view()[at_inode ..< at_inode + INODE_SIZE])
+    flips_break_exactly(blk.view(), at_inode, at_inode + 252, at_inode + 252,
+        (b) -> verify_inode(SEED, 0x1_0000_0007, b[at_inode ..< at_inode + INODE_SIZE]))
+
+@test("an inode fails for another inode number (in either half of the u64) or another seed")
+inode_identity_and_seed()
+    var blk = filled_block(9)
+    seal_inode(SEED, 0x1_0000_0007, blk.view()[0..<INODE_SIZE])
+    assert(!verify_inode(SEED, 0x1_0000_0008, blk.view()[0..<INODE_SIZE]))
+    assert(!verify_inode(SEED, 0x0_0000_0007, blk.view()[0..<INODE_SIZE]))
+    assert(!verify_inode(SEED, 0x2_0000_0007, blk.view()[0..<INODE_SIZE]))
+    assert(!verify_inode(SEED ^ 0x8000_0000, 0x1_0000_0007, blk.view()[0..<INODE_SIZE]))
+
+// -- owned metadata blocks --------------------------------------------------------------------------------
+
+@test("a sealed owned block verifies; every byte of the block is covered or is the crc")
+owned_block_seal()
+    var blk = filled_block(10)
+    set_tail(blk.view(), 77, 3)
+    seal_block(SEED, blk.view())
+    flips_break_exactly(blk.view(), 0, 4092, 4092, (b) -> verify_block(SEED, b))
+
+@test("an owned block fails for another seed, and for another owner or generation")
+owned_block_identity()
+    var blk = filled_block(11)
+    set_tail(blk.view(), 77, 3)
+    seal_block(SEED, blk.view())
+    assert(verify_owned_block(SEED, blk.view(), 77, 3))
+    assert(!verify_owned_block(SEED, blk.view(), 78, 3))
+    assert(!verify_owned_block(SEED, blk.view(), 77, 4))
+    assert(!verify_owned_block(SEED ^ 1, blk.view(), 77, 3))
+    assert_eq(le64(blk.view(), TAIL_OFFSET), 77)
+    assert_eq(le32(blk.view(), TAIL_OFFSET + 8), 3)
+
+@test("a valid block from another inode, sealed correctly, is refused by its owner check")
+owned_block_from_another_owner()
+    var blk = filled_block(12)
+    set_tail(blk.view(), 100, 1)
+    seal_block(SEED, blk.view())
+    assert(verify_block(SEED, blk.view()))
+    assert(!verify_owned_block(SEED, blk.view(), 101, 1))
+    assert(!verify_owned_block(SEED, blk.view(), 100, 0))
+
+@test("restamping the tail without resealing breaks the block")
+owned_block_restamp_breaks()
+    var blk = filled_block(13)
+    set_tail(blk.view(), 5, 5)
+    seal_block(SEED, blk.view())
+    set_tail(blk.view(), 6, 5)
+    assert(!verify_block(SEED, blk.view()))
+    seal_block(SEED, blk.view())
+    assert(verify_owned_block(SEED, blk.view(), 6, 5))
+
+// -- the journal ------------------------------------------------------------------------------------------
+
+@test("a sealed journal superblock or commit block verifies; bytes 0-507 and crc matter, the rest of the block does not")
+sector_seal()
+    var blk = filled_block(14)
+    seal_sector(SEED, blk.view())
+    flips_break_exactly(blk.view(), 0, 508, 508, (b) -> verify_sector(SEED, b))
+    assert(!verify_sector(SEED ^ 1, blk.view()))
+
+@test("a sealed descriptor or revoke block verifies; every byte but none outside matters; the seed matters")
+journal_block_seal()
+    var blk = filled_block(15)
+    seal_journal_block(SEED, blk.view())
+    flips_break_exactly(blk.view(), 0, 4092, 4092, (b) -> verify_journal_block(SEED, b))
+    assert(!verify_journal_block(SEED ^ 1, blk.view()))
+    assert(!verify_journal_block(SEED, new_block().view()))
+
+@test("a tag's checksum covers the sequence and the copy as logged, and not the tag's other fields")
+tag_seal()
+    var copy = filled_block(16)
+    var tagblk = new_block()
+    val tag = at[Tag](tagblk.view(), 0)
+    tag.block = 0x1234
+    tag.flags = 0
+    seal_tag(SEED, 9, tag, copy.view())
+    assert(verify_tag(SEED, 9, tag, copy.view()))
+    assert(!verify_tag(SEED, 10, tag, copy.view()))
+    assert(!verify_tag(SEED ^ 1, 9, tag, copy.view()))
+    tag.block = 0x9999
+    tag.flags = TAG_ESCAPED
+    assert(verify_tag(SEED, 9, tag, copy.view()))
+    for i in 0..<BLOCK_SIZE
+        val was = copy.view()[i]
+        copy.view()[i] = was ^ u8(1 << (i % 8))
+        assert(!verify_tag(SEED, 9, tag, copy.view()))
+        copy.view()[i] = was
+
+@test("a copy that begins with the journal magic is logged zeroed and marked, and replay restores it")
+escaping()
+    var plain = filled_block(17)
+    put_le32(plain.view(), 0, JOURNAL_MAGIC)
+    val original = copy_of(plain.view())
+    val flags = escape_copy(plain.view())
+    assert_eq(flags, TAG_ESCAPED)
+    assert_eq(le32(plain.view(), 0), 0)
+    unescape_copy(plain.view(), flags)
+    for i in 0..<BLOCK_SIZE
+        assert_eq(plain.view()[i], original.view()[i])
+    var other = filled_block(18)
+    put_le32(other.view(), 0, 0x1234_5678)
+    assert_eq(escape_copy(other.view()), 0)
+    assert_eq(le32(other.view(), 0), 0x1234_5678)
+    unescape_copy(other.view(), 0)
+    assert_eq(le32(other.view(), 0), 0x1234_5678)

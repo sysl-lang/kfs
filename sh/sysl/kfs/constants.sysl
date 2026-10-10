@@ -1,0 +1,101 @@
+module keel.kfs
+
+// The constants and limits of kfs/SPEC.md section 3, and the magic numbers and flag bits of the
+// structures that follow it.
+//
+// KFS is little-endian on the disk and is read in place through pointers into blocks, which is only
+// meaningful on a little-endian machine. Nothing in a struct can say so, so the build is refused
+// anywhere else (a big-endian port would read every field through byte-swapping accessors instead).
+
+#if aarch64 || x86_64 || riscv64 || riscv32 || thumb || x86 || wasm32
+// every one of these targets is little-endian
+#else
+@assert(false, "KFS reads its structures in place and needs a little-endian target")
+#endif
+
+const SECTOR_SIZE: usize = 512
+const BLOCK_SIZE: usize = 4096
+const SECTORS_PER_BLOCK: usize = 8
+const INODE_SIZE: usize = 256
+const INODES_PER_BLOCK: usize = 16
+const NAME_MAX: usize = 255
+const PATH_MAX: usize = 4096
+const SYMLINK_INLINE_MAX: usize = 128
+const LINK_MAX: u32 = 2_147_483_647
+const BLOCKS_PER_GROUP_MIN: u32 = 2048
+const BLOCKS_PER_GROUP_MAX: u32 = 32768
+const INODES_PER_GROUP_MIN: u32 = 16
+const INODES_PER_GROUP_MAX: u32 = 32768
+const DEFAULT_BYTES_PER_INODE: u32 = 8192
+const FIRST_INO: u64 = 11
+const ROOT_INO: u64 = 2
+const EXTENT_ROOT_SLOTS: usize = 7
+const EXTENT_NODE_SLOTS: usize = 254
+const EXTENT_MAX_DEPTH: usize = 4
+const EXTENT_MAX_LEN: u32 = 32768
+const DIR_MAX_LEVELS: usize = 3
+const DIR_INDEX_SLOTS: usize = 254
+const JOURNAL_MIN_BLOCKS: u32 = 1024
+const JOURNAL_MAX_BLOCKS: u32 = 16384
+const MAX_OP_CREDITS: u32 = 192
+const COMMIT_INTERVAL_SECONDS: u32 = 5
+
+// Where things are inside a block. The tail is the last 16 bytes of every owned metadata block; the
+// journal's descriptor and revoke blocks keep only a 4-byte checksum there.
+const TAIL_OFFSET: usize = 4080
+const BLOCK_CRC_OFFSET: usize = 4092
+const SECTOR_CRC_OFFSET: usize = 508
+
+// Magic numbers: four ASCII bytes read as a little-endian u32.
+const SUPER_MAGIC: u32 = 0x5353_464B            // "KFSS"
+const EXTENT_MAGIC: u32 = 0x5853_464B           // "KFSX"
+const DIR_LEAF_MAGIC: u32 = 0x4453_464B         // "KFSD"
+const DIR_INDEX_MAGIC: u32 = 0x4853_464B        // "KFSH"
+const XATTR_MAGIC: u32 = 0x4153_464B            // "KFSA"
+const JOURNAL_MAGIC: u32 = 0x4A53_464B          // "KFSJ"
+
+const FORMAT_VERSION: u32 = 1
+const HASH_SIPHASH13: u8 = 1
+const CSUM_CRC32C: u8 = 1
+
+// Superblock `state`.
+const STATE_CLEAN: u16 = 1
+const STATE_ERROR: u16 = 2
+
+// Group descriptor `flags`.
+const GROUP_COPY: u32 = 1
+
+// Inode `flags`.
+const INODE_INLINE: u32 = 1
+const INODE_INDEXED: u32 = 2
+const INODE_ORPHAN: u32 = 4
+
+// Extent `flags`.
+const EXTENT_UNWRITTEN: u16 = 1
+
+// Directory `file_type` (Linux's DT_*).
+const DT_UNKNOWN: u8 = 0
+const DT_FIFO: u8 = 1
+const DT_CHR: u8 = 2
+const DT_DIR: u8 = 4
+const DT_BLK: u8 = 6
+const DT_REG: u8 = 8
+const DT_LNK: u8 = 10
+const DT_SOCK: u8 = 12
+
+// Extended attribute namespaces.
+const XATTR_USER: u8 = 1
+const XATTR_TRUSTED: u8 = 2
+const XATTR_SECURITY: u8 = 3
+const XATTR_SYSTEM: u8 = 4
+
+// Journal block types and tag flags.
+const JOURNAL_SUPER: u32 = 1
+const JOURNAL_DESCRIPTOR: u32 = 2
+const JOURNAL_REVOKE: u32 = 3
+const JOURNAL_COMMIT: u32 = 4
+const TAG_ESCAPED: u32 = 1
+
+// How many tags a descriptor block holds, and how many block numbers a revoke block holds.
+const DESCRIPTOR_TAGS: usize = 254
+const REVOKE_ENTRIES: usize = 508

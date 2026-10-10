@@ -1,0 +1,64 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+private text(s: string) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for x in s.bytes
+        b.push(x)
+    b
+
+@test("CRC32C of \"123456789\" is the standard check value")
+crc_check_value()
+    val m = text("123456789")
+    assert_eq(~crc32c(0xFFFF_FFFF, m.view()), 0xE3069283)
+    assert_eq(crc32c_standard(m.view()), 0xE3069283)
+
+@test("the RFC 3720 B.4 iSCSI vectors: 32 zeros, 32 ones, ascending, descending")
+crc_iscsi_vectors()
+    var zeros: Buf[u8] = buf()
+    var ones: Buf[u8] = buf()
+    var up: Buf[u8] = buf()
+    var down: Buf[u8] = buf()
+    for i in 0..<32
+        zeros.push(0)
+        ones.push(0xFF)
+        up.push(u8(i))
+        down.push(u8(31 - i))
+    assert_eq(crc32c_standard(zeros.view()), 0x8A9136AA)
+    assert_eq(crc32c_standard(ones.view()), 0x62A8AB43)
+    assert_eq(crc32c_standard(up.view()), 0x46DD794E)
+    assert_eq(crc32c_standard(down.view()), 0x113FDB5C)
+
+@test("the register update has no final inversion, and chains by composition")
+crc_raw_update_chains()
+    val m = text("123456789")
+    val whole = crc32c(0xFFFF_FFFF, m.view())
+    assert_eq(whole, ~0xE3069283)
+    val head = crc32c(0xFFFF_FFFF, m.view()[0..<4])
+    assert_eq(crc32c(head, m.view()[4..<9]), whole)
+    assert_eq(crc32c(0x1234_5678, m.view()[0..<0]), 0x1234_5678)
+
+@test("feeding an integer is feeding its little-endian bytes")
+crc_integers_are_little_endian()
+    var b4: Buf[u8] = buf()
+    b4.push(0x78)
+    b4.push(0x56)
+    b4.push(0x34)
+    b4.push(0x12)
+    assert_eq(crc32c_u32(0xFFFF_FFFF, 0x1234_5678), crc32c(0xFFFF_FFFF, b4.view()))
+    var b8: Buf[u8] = buf()
+    for i in 0..<8
+        b8.push(u8(0x10 + i))
+    assert_eq(crc32c_u64(7, 0x1716_1514_1312_1110), crc32c(7, b8.view()))
+
+@test("a different seed or a flipped bit changes the checksum")
+crc_is_sensitive()
+    val m = text("123456789")
+    val base = crc32c(0xFFFF_FFFF, m.view())
+    assert(crc32c(0xFFFF_FFFE, m.view()) != base)
+    var flipped = copy_of(m.view())
+    flipped.view()[3] = flipped.view()[3] ^ 4
+    assert(crc32c(0xFFFF_FFFF, flipped.view()) != base)

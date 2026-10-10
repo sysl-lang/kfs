@@ -1,0 +1,392 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+// Every structure is written through a pointer into a block and read back two ways: from the raw
+// little-endian bytes at the offset the spec gives it (which proves its offset and width on the wire),
+// and through a second pointer into a copy of the block (which proves the bytes carry the whole value).
+
+@test("the superblock round-trips through bytes, field by field")
+superblock_round_trip()
+    var blk = new_block()
+    val sb = at[Superblock](blk.view(), 0)
+    sb.magic = SUPER_MAGIC
+    sb.version = 1
+    sb.block_size = 4096
+    sb.state = STATE_CLEAN | STATE_ERROR
+    sb.blocks = 0x1111_2222_3333
+    sb.group_count = 7
+    sb.blocks_per_group = 2048
+    sb.inodes_per_group = 256
+    sb.inode_size = 256
+    sb.first_ino = 11
+    sb.inode_count = 1792
+    sb.free_blocks = 0xAAAA_BBBB_CCCC
+    sb.free_inodes = 0xDDDD
+    sb.reserved_blocks = 99
+    sb.root_ino = 2
+    sb.journal_start = 0x4000
+    sb.journal_blocks = 1024
+    sb.max_transaction = 256
+    sb.orphan_head = 0x5555_6666
+    sb.gdt_blocks = 1
+    sb.hash_algorithm = 1
+    sb.csum_algorithm = 1
+    for i in 0..<16
+        sb.hash_seed[i] = u8(0x40 + i)
+        sb.uuid[i] = u8(0x80 + i)
+    for i in 0..<32
+        sb.label[i] = u8(0x60 + i)
+    sb.feature_compat = 0x01
+    sb.feature_ro_compat = 0x02
+    sb.feature_incompat = 0x04
+    sb.mount_count = 12
+    sb.format_time = -5
+    sb.mount_time = 0x7000_0000_0000
+    sb.write_time = 0x7000_0000_0001
+    sb.check_time = 0x7000_0000_0002
+    sb.csum_seed = 0xCAFE_F00D
+    sb.crc = 0x0BAD_CAFE
+    val v = blk.view()
+    assert_eq(v[0], u8('K'))
+    assert_eq(v[1], u8('F'))
+    assert_eq(v[2], u8('S'))
+    assert_eq(v[3], u8('S'))
+    assert_eq(le32(v, 4), 1)
+    assert_eq(le32(v, 8), 4096)
+    assert_eq(le16(v, 12), 3)
+    assert_eq(le64(v, 16), 0x1111_2222_3333)
+    assert_eq(le32(v, 24), 7)
+    assert_eq(le32(v, 28), 2048)
+    assert_eq(le32(v, 32), 256)
+    assert_eq(le16(v, 36), 256)
+    assert_eq(le16(v, 38), 11)
+    assert_eq(le64(v, 40), 1792)
+    assert_eq(le64(v, 48), 0xAAAA_BBBB_CCCC)
+    assert_eq(le64(v, 56), 0xDDDD)
+    assert_eq(le64(v, 64), 99)
+    assert_eq(le64(v, 72), 2)
+    assert_eq(le64(v, 80), 0x4000)
+    assert_eq(le32(v, 88), 1024)
+    assert_eq(le32(v, 92), 256)
+    assert_eq(le64(v, 96), 0x5555_6666)
+    assert_eq(le32(v, 104), 1)
+    assert_eq(v[108], 1)
+    assert_eq(v[109], 1)
+    assert_eq(v[112], 0x40)
+    assert_eq(v[127], 0x4F)
+    assert_eq(v[128], 0x80)
+    assert_eq(v[143], 0x8F)
+    assert_eq(v[144], 0x60)
+    assert_eq(v[175], 0x7F)
+    assert_eq(le32(v, 176), 1)
+    assert_eq(le32(v, 180), 2)
+    assert_eq(le32(v, 184), 4)
+    assert_eq(le32(v, 188), 12)
+    assert_eq(le64(v, 192), 0xFFFF_FFFF_FFFF_FFFB)
+    assert_eq(le64(v, 200), 0x7000_0000_0000)
+    assert_eq(le64(v, 208), 0x7000_0000_0001)
+    assert_eq(le64(v, 216), 0x7000_0000_0002)
+    assert_eq(le32(v, 224), 0xCAFE_F00D)
+    assert_eq(le32(v, 508), 0x0BAD_CAFE)
+    var copy = copy_of(v)
+    val sb2 = at[Superblock](copy.view(), 0)
+    assert_eq(sb2.blocks, 0x1111_2222_3333)
+    assert_eq(sb2.format_time, -5)
+    assert_eq(sb2.hash_seed[15], 0x4F)
+    assert_eq(sb2.label[31], 0x7F)
+    assert_eq(sb2.crc, 0x0BAD_CAFE)
+
+@test("a group descriptor round-trips through bytes")
+group_desc_round_trip()
+    var blk = new_block()
+    val g = at[GroupDesc](blk.view(), 64)
+    g.block_bitmap = 0x10_0000_0001
+    g.inode_bitmap = 0x10_0000_0002
+    g.inode_table = 0x10_0000_0003
+    g.free_blocks = 11
+    g.free_inodes = 12
+    g.directories = 13
+    g.flags = GROUP_COPY
+    g.block_bitmap_crc = 0xAABB_CCDD
+    g.inode_bitmap_crc = 0x1122_3344
+    g.crc = 0x5566_7788
+    val v = blk.view()
+    assert_eq(le64(v, 64), 0x10_0000_0001)
+    assert_eq(le64(v, 72), 0x10_0000_0002)
+    assert_eq(le64(v, 80), 0x10_0000_0003)
+    assert_eq(le32(v, 88), 11)
+    assert_eq(le32(v, 92), 12)
+    assert_eq(le32(v, 96), 13)
+    assert_eq(le32(v, 100), 1)
+    assert_eq(le32(v, 104), 0xAABB_CCDD)
+    assert_eq(le32(v, 108), 0x1122_3344)
+    assert_eq(le32(v, 124), 0x5566_7788)
+    var copy = copy_of(v)
+    val g2 = at[GroupDesc](copy.view(), 64)
+    assert_eq(g2.inode_table, 0x10_0000_0003)
+    assert_eq(g2.directories, 13)
+
+@test("an inode round-trips through bytes, and its data field is 128 bytes at 112")
+inode_round_trip()
+    var blk = new_block()
+    val n = at[Inode](blk.view(), 3 * INODE_SIZE)
+    n.mode = 0o100644
+    n.links = 3
+    n.uid = 1000
+    n.gid = 100
+    n.flags = INODE_INDEXED | INODE_ORPHAN
+    n.generation = 9
+    n.size = 0x1_0000_0001
+    n.blocks = 77
+    n.atime_sec = -1
+    n.mtime_sec = 2
+    n.ctime_sec = 3
+    n.crtime_sec = 4
+    n.atime_nsec = 999_999_999
+    n.mtime_nsec = 6
+    n.ctime_nsec = 7
+    n.crtime_nsec = 8
+    n.orphan_next = 0x99
+    n.xattr_block = 0x98
+    n.parent = 0x97
+    n.data[0] = 0xD0
+    n.data[127] = 0xD7
+    n.crc = 0x0102_0304
+    val base = 3 * INODE_SIZE
+    val v = blk.view()
+    assert_eq(le16(v, base), 0o100644)
+    assert_eq(le32(v, base + 4), 3)
+    assert_eq(le32(v, base + 8), 1000)
+    assert_eq(le32(v, base + 12), 100)
+    assert_eq(le32(v, base + 16), 6)
+    assert_eq(le32(v, base + 20), 9)
+    assert_eq(le64(v, base + 24), 0x1_0000_0001)
+    assert_eq(le64(v, base + 32), 77)
+    assert_eq(le64(v, base + 40), 0xFFFF_FFFF_FFFF_FFFF)
+    assert_eq(le64(v, base + 48), 2)
+    assert_eq(le64(v, base + 56), 3)
+    assert_eq(le64(v, base + 64), 4)
+    assert_eq(le32(v, base + 72), 999_999_999)
+    assert_eq(le32(v, base + 76), 6)
+    assert_eq(le32(v, base + 80), 7)
+    assert_eq(le32(v, base + 84), 8)
+    assert_eq(le64(v, base + 88), 0x99)
+    assert_eq(le64(v, base + 96), 0x98)
+    assert_eq(le64(v, base + 104), 0x97)
+    assert_eq(v[base + 112], 0xD0)
+    assert_eq(v[base + 239], 0xD7)
+    assert_eq(le32(v, base + 252), 0x0102_0304)
+    var copy = copy_of(v)
+    val n2 = at[Inode](copy.view(), base)
+    assert_eq(n2.size, 0x1_0000_0001)
+    assert_eq(n2.atime_sec, -1)
+    assert_eq(n2.data[127], 0xD7)
+
+@test("extent entries, the node header and the block tail round-trip, and the tail is the block's last 16 bytes")
+extent_round_trip()
+    var blk = new_block()
+    val h = at[NodeHeader](blk.view(), 0)
+    h.magic = EXTENT_MAGIC
+    h.count = 2
+    h.max = 254
+    h.depth = 1
+    val leaf = at[ExtentLeaf](blk.view(), 16)
+    leaf.logical = 0x1000
+    leaf.len = 32768
+    leaf.flags = EXTENT_UNWRITTEN
+    leaf.physical = 0x20_0000_0000
+    val idx = at[ExtentIndex](blk.view(), 32)
+    idx.logical = 0x2000
+    idx.child = 0x30_0000_0000
+    val t = at[BlockTail](blk.view(), TAIL_OFFSET)
+    t.owner = 0x1234_5678_9ABC
+    t.generation = 5
+    t.crc = 0xFEED_FACE
+    val v = blk.view()
+    assert_eq(le32(v, 0), 0x5853_464B)
+    assert_eq(v[0], u8('K'))
+    assert_eq(v[3], u8('X'))
+    assert_eq(le16(v, 4), 2)
+    assert_eq(le16(v, 6), 254)
+    assert_eq(le16(v, 8), 1)
+    assert_eq(le32(v, 16), 0x1000)
+    assert_eq(le16(v, 20), 32768)
+    assert_eq(le16(v, 22), 1)
+    assert_eq(le64(v, 24), 0x20_0000_0000)
+    assert_eq(le32(v, 32), 0x2000)
+    assert_eq(le64(v, 40), 0x30_0000_0000)
+    assert_eq(le64(v, 4080), 0x1234_5678_9ABC)
+    assert_eq(le32(v, 4088), 5)
+    assert_eq(le32(v, 4092), 0xFEED_FACE)
+    var copy = copy_of(v)
+    assert_eq(at[ExtentLeaf](copy.view(), 16).physical, 0x20_0000_0000)
+    assert_eq(at[ExtentIndex](copy.view(), 32).child, 0x30_0000_0000)
+    assert_eq(at[BlockTail](copy.view(), TAIL_OFFSET).owner, 0x1234_5678_9ABC)
+
+@test("a directory leaf: header, and a packed record whose name begins at offset 12")
+dir_leaf_round_trip()
+    var blk = new_block()
+    val h = at[DirLeafHeader](blk.view(), 0)
+    h.magic = DIR_LEAF_MAGIC
+    h.count = 1
+    val r = at[DirRecordHeader](blk.view(), 8)
+    r.ino = 0x1_0000_0002
+    r.rec_len = 4072
+    r.name_len = 3
+    r.file_type = DT_DIR
+    val v = blk.view()
+    assert_eq(v[3], u8('D'))
+    assert_eq(le16(v, 4), 1)
+    assert_eq(le64(v, 8), 0x1_0000_0002)
+    assert_eq(le16(v, 16), 4072)
+    assert_eq(v[18], 3)
+    assert_eq(v[19], 4)
+    var copy = copy_of(v)
+    val r2 = at[DirRecordHeader](copy.view(), 8)
+    assert_eq(r2.ino, 0x1_0000_0002)
+    assert_eq(r2.rec_len, 4072)
+    assert_eq(r2.file_type, DT_DIR)
+
+@test("an index block: header and entries")
+dir_index_round_trip()
+    var blk = new_block()
+    val h = at[IndexHeader](blk.view(), 0)
+    h.magic = DIR_INDEX_MAGIC
+    h.count = 2
+    h.max = 254
+    h.level = 2
+    val e = at[IndexEntry](blk.view(), 16)
+    e.key = 0
+    e.child = 1
+    val f = at[IndexEntry](blk.view(), 32)
+    f.key = 0x8000_0000_0000_0001
+    f.child = 0xFFFF_FFFF
+    val v = blk.view()
+    assert_eq(v[3], u8('H'))
+    assert_eq(le16(v, 4), 2)
+    assert_eq(le16(v, 6), 254)
+    assert_eq(v[8], 2)
+    assert_eq(le64(v, 32), 0x8000_0000_0000_0001)
+    assert_eq(le32(v, 40), 0xFFFF_FFFF)
+    var copy = copy_of(v)
+    assert_eq(at[IndexEntry](copy.view(), 32).key, 0x8000_0000_0000_0001)
+    assert_eq(at[IndexHeader](copy.view(), 0).level, 2)
+
+@test("an xattr block header and record header round-trip")
+xattr_round_trip()
+    var blk = new_block()
+    val h = at[XattrHeader](blk.view(), 0)
+    h.magic = XATTR_MAGIC
+    h.count = 1
+    h.used = 12
+    val r = at[XattrRecordHeader](blk.view(), 8)
+    r.namespace = XATTR_SECURITY
+    r.name_len = 5
+    r.value_len = 300
+    val v = blk.view()
+    assert_eq(v[3], u8('A'))
+    assert_eq(le16(v, 4), 1)
+    assert_eq(le16(v, 6), 12)
+    assert_eq(v[8], 3)
+    assert_eq(v[9], 5)
+    assert_eq(le16(v, 10), 300)
+    var copy = copy_of(v)
+    assert_eq(at[XattrRecordHeader](copy.view(), 8).value_len, 300)
+
+@test("the journal superblock round-trips through bytes")
+journal_super_round_trip()
+    var blk = new_block()
+    val j = at[JournalSuper](blk.view(), 0)
+    j.header.magic = JOURNAL_MAGIC
+    j.header.kind = JOURNAL_SUPER
+    j.header.sequence = 0
+    j.journal_blocks = 1024
+    j.first = 1
+    j.start = 17
+    j.error = 5
+    j.start_seq = 0x1_0000_0000
+    for i in 0..<16
+        j.uuid[i] = u8(0xA0 + i)
+    j.max_transaction = 256
+    j.features = 0
+    j.crc = 0x1357_9BDF
+    val v = blk.view()
+    assert_eq(v[3], u8('J'))
+    assert_eq(le32(v, 4), 1)
+    assert_eq(le32(v, 16), 1024)
+    assert_eq(le32(v, 20), 1)
+    assert_eq(le32(v, 24), 17)
+    assert_eq(le32(v, 28), 5)
+    assert_eq(le64(v, 32), 0x1_0000_0000)
+    assert_eq(v[40], 0xA0)
+    assert_eq(v[55], 0xAF)
+    assert_eq(le32(v, 56), 256)
+    assert_eq(le32(v, 508), 0x1357_9BDF)
+    var copy = copy_of(v)
+    assert_eq(at[JournalSuper](copy.view(), 0).start_seq, 0x1_0000_0000)
+    assert_eq(at[JournalSuper](copy.view(), 0).header.kind, JOURNAL_SUPER)
+
+@test("descriptor and revoke blocks: headers, tags, revoked numbers and the trailing checksum")
+descriptor_revoke_round_trip()
+    var blk = new_block()
+    val d = at[DescriptorHeader](blk.view(), 0)
+    d.header.magic = JOURNAL_MAGIC
+    d.header.kind = JOURNAL_DESCRIPTOR
+    d.header.sequence = 42
+    d.count = 2
+    val t0 = at[Tag](blk.view(), 24)
+    t0.block = 0x77
+    t0.flags = TAG_ESCAPED
+    t0.crc = 0xAAAA_0001
+    val t1 = at[Tag](blk.view(), 24 + 16)
+    t1.block = 0x78
+    t1.flags = 0
+    t1.crc = 0xAAAA_0002
+    val v = blk.view()
+    assert_eq(le32(v, 4), 2)
+    assert_eq(le64(v, 8), 42)
+    assert_eq(le32(v, 16), 2)
+    assert_eq(le64(v, 24), 0x77)
+    assert_eq(le32(v, 32), 1)
+    assert_eq(le32(v, 36), 0xAAAA_0001)
+    assert_eq(le64(v, 40), 0x78)
+    assert_eq(le32(v, 52), 0xAAAA_0002)
+    var rb = new_block()
+    val r = at[RevokeHeader](rb.view(), 0)
+    r.header.magic = JOURNAL_MAGIC
+    r.header.kind = JOURNAL_REVOKE
+    r.header.sequence = 43
+    r.count = 508
+    put_le64(rb.view(), 24, 0x55)
+    put_le64(rb.view(), 24 + 507 * 8, 0x56)
+    assert_eq(le32(rb.view(), 4), 3)
+    assert_eq(le32(rb.view(), 16), 508)
+    assert_eq(le64(rb.view(), 4080), 0x56)
+
+@test("a commit block round-trips through bytes")
+commit_round_trip()
+    var blk = new_block()
+    val c = at[Commit](blk.view(), 0)
+    c.header.magic = JOURNAL_MAGIC
+    c.header.kind = JOURNAL_COMMIT
+    c.header.sequence = 7
+    c.commit_sec = 0x6000_0000
+    c.commit_nsec = 123_456_789
+    c.blocks = 31
+    c.crc = 0x2468_ACE0
+    val v = blk.view()
+    assert_eq(le32(v, 4), 4)
+    assert_eq(le64(v, 8), 7)
+    assert_eq(le64(v, 16), 0x6000_0000)
+    assert_eq(le32(v, 24), 123_456_789)
+    assert_eq(le32(v, 28), 31)
+    assert_eq(le32(v, 508), 0x2468_ACE0)
+    var copy = copy_of(v)
+    assert_eq(at[Commit](copy.view(), 0).commit_nsec, 123_456_789)
+
+@test("reading a structure past the end of its block is refused", should_trap: "past the end")
+at_past_the_end_traps()
+    var blk = new_block()
+    val bad = at[Inode](blk.view(), BLOCK_SIZE - 16)
+    assert(bad != null)

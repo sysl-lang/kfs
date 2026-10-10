@@ -1,0 +1,63 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+@test("the clamp: even, at least 8, at most 2^64 - 4, at the edges of the raw value")
+hash_clamp_edges()
+    force_raw_hash(0)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 8)
+    force_raw_hash(1)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 8)
+    force_raw_hash(7)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 8)
+    force_raw_hash(9)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 8)
+    force_raw_hash(10)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 10)
+    force_raw_hash(11)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 10)
+    force_raw_hash(0xFFFF_FFFF_FFFF_FFFF)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 0xFFFF_FFFF_FFFF_FFFC)
+    force_raw_hash(0xFFFF_FFFF_FFFF_FFFD)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 0xFFFF_FFFF_FFFF_FFFC)
+    force_raw_hash(0xFFFF_FFFF_FFFF_FFFC)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 0xFFFF_FFFF_FFFF_FFFC)
+    force_raw_hash(0xFFFF_FFFF_FFFF_FFFA)
+    assert_eq(dir_hash(counting(16).view(), counting(3).view()), 0xFFFF_FFFF_FFFF_FFFA)
+    clear_raw_hash()
+
+@test("the hook makes different names collide, and clearing it restores the keyed hash")
+hash_hook_forces_and_clears()
+    val seed = counting(16)
+    val a = counting(5)
+    val b = counting(6)
+    val natural_a = dir_hash(seed.view(), a.view())
+    assert(natural_a != dir_hash(seed.view(), b.view()))
+    force_raw_hash(4242)
+    assert_eq(dir_hash(seed.view(), a.view()), dir_hash(seed.view(), b.view()))
+    clear_raw_hash()
+    assert_eq(dir_hash(seed.view(), a.view()), natural_a)
+
+@test("the hash is SipHash-1-3 keyed by the seed's two little-endian words, clamped")
+hash_is_keyed_siphash13()
+    val seed = counting(16)
+    val name = counting(11)
+    assert_eq(seed_k0(seed.view()), 0x0706_0504_0302_0100)
+    assert_eq(seed_k1(seed.view()), 0x0F0E_0D0C_0B0A_0908)
+    assert_eq(dir_hash(seed.view(), name.view()),
+        hash_of_raw(siphash13(0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908, name.view())))
+    var other = copy_of(seed.view())
+    other.view()[15] = 0xAA
+    assert(dir_hash(other.view(), name.view()) != dir_hash(seed.view(), name.view()))
+
+@test("over many names the hash is never odd and never outside [8, 2^64 - 4]")
+hash_range_over_many_names()
+    val seed = filled_block(3)
+    val names = filled_block(9)
+    for n in 1..<256
+        val h = dir_hash(seed.view()[0..<16], names.view()[0..<n])
+        assert(h & 1 == 0)
+        assert(h >= 8)
+        assert(h <= 0xFFFF_FFFF_FFFF_FFFC)

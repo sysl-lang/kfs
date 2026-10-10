@@ -1,0 +1,83 @@
+module keel.kfs
+
+// A block device over a heap buffer: the fixture every filesystem test stands on. It models the device
+// of kfs/SPEC.md section 2 as far as a flat buffer can, and records what a crash harness needs: it counts
+// reads, writes and flushes, and logs every write, in order, with the data written and the number of
+// flushes that had completed before it (its epoch). A later wrapper replays the log to lose, tear or
+// reorder writes.
+//
+// Block `b` is bytes `b * BLOCK_SIZE ..< (b + 1) * BLOCK_SIZE`. A read or write is one whole block.
+
+import sysl.buf.{Buf, buf}
+
+enum DeviceError
+    OutOfRange
+    BadLength
+
+struct RamDevice
+    private image: Buf[u8]
+    private count: u64
+    private reads_n: u64
+    private writes_n: u64
+    private flushes_n: u64
+    private log_blocks: Buf[u64]
+    private log_epochs: Buf[u64]
+    private log_bytes: Buf[u8]
+
+    // How many blocks the device has.
+    blocks(self) -> u64 = self.count
+
+    reads(self) -> u64 = self.reads_n
+    writes(self) -> u64 = self.writes_n
+    flushes(self) -> u64 = self.flushes_n
+
+    // Copy block `b` into `out`, which is exactly one block.
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
+        if out.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        if b >= self.count then return Err(DeviceError.OutOfRange)
+        val base = usize(b) * BLOCK_SIZE
+        for i in 0..<BLOCK_SIZE
+            out[i] = self.image[base + i]
+        self.reads_n += 1
+        Ok(())
+
+    // Write block `b` from `data`, which is exactly one block, and log it.
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+        if data.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        if b >= self.count then return Err(DeviceError.OutOfRange)
+        val base = usize(b) * BLOCK_SIZE
+        for i in 0..<BLOCK_SIZE
+            self.image[base + i] = data[i]
+            self.log_bytes.push(data[i])
+        self.log_blocks.push(b)
+        self.log_epochs.push(self.flushes_n)
+        self.writes_n += 1
+        Ok(())
+
+    // Everything written before this is durable. (A flat buffer is always durable; the count and the
+    // epoch are what a crash model reads.)
+    flush(*self)
+        self.flushes_n += 1
+
+    // The write log: how many writes, and for write `i` the block, the flush epoch it was issued in, and
+    // the bytes written.
+    log_len(self) -> usize = self.log_blocks.len()
+    log_block(self, i: usize) -> u64 = self.log_blocks[i]
+    log_epoch(self, i: usize) -> u64 = self.log_epochs[i]
+    log_data(self, i: usize) -> []const u8 = self.log_bytes.view()[i * BLOCK_SIZE ..< (i + 1) * BLOCK_SIZE]
+
+    // Forget the counters and the log, keeping the contents: a test measures one operation at a time.
+    reset_counters(*self)
+        self.reads_n = 0
+        self.writes_n = 0
+        self.flushes_n = 0
+        self.log_blocks.clear()
+        self.log_epochs.clear()
+        self.log_bytes.clear()
+
+// A zeroed device of `blocks` blocks.
+ram_device(blocks: u64) -> RamDevice
+    var image: Buf[u8] = buf()
+    for _ in 0..<(usize(blocks) * BLOCK_SIZE)
+        image.push(0)
+    RamDevice(image, blocks, 0, 0, 0, buf(), buf(), buf())

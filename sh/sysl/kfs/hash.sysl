@@ -1,0 +1,60 @@
+module keel.kfs
+
+// The directory hash (kfs/SPEC.md section 10): `hash(name) = clamp(S(name) & ~1, 8, 2^64 - 4)` where S
+// is SipHash-1-3 keyed by the superblock's `hash_seed` (k0 = bytes 0-7, k1 = bytes 8-15, little-endian).
+//
+// Every hash is even, so bit 0 is free for the index's continuation mark, and lies in [8, 2^64 - 4], so
+// the directory positions 0-3 and 2^63 - 1 are never a hash.
+
+const HASH_MIN: u64 = 8
+const HASH_MAX: u64 = 0xFFFF_FFFF_FFFF_FFFC
+
+// The clamp, on a raw SipHash value.
+hash_of_raw(raw: u64) -> u64
+    val even = raw & ~u64(1)
+    if even < HASH_MIN then return HASH_MIN
+    if even > HASH_MAX then return HASH_MAX
+    even
+
+// The test hook: while set, `dir_hash` ignores the name and the key and treats `forced_raw` as the raw
+// SipHash value, which is how a test reaches the clamp's edges and makes two different names collide.
+// Tests set it and clear it again; nothing else does.
+private var forced: bool = false
+private var forced_raw: u64 = 0
+
+force_raw_hash(raw: u64)
+    forced_raw = raw
+    forced = true
+
+clear_raw_hash()
+    forced = false
+
+// The 16-byte seed's two key words.
+seed_k0(seed: []const u8) -> u64 = le64(seed, 0)
+seed_k1(seed: []const u8) -> u64 = le64(seed, 8)
+
+// `hash(name)` under the filesystem's `hash_seed`.
+dir_hash(seed: []const u8, name: []const u8) -> u64
+    if forced then return hash_of_raw(forced_raw)
+    hash_of_raw(siphash13(seed_k0(seed), seed_k1(seed), name))
+
+// A little-endian integer at `at` in `bytes`.
+le64(bytes: []const u8, at: usize) -> u64
+    var v: u64 = 0
+    for j in 0..<8
+        v |= u64(bytes[at + usize(j)]) << u64(8 * j)
+    v
+
+le32(bytes: []const u8, at: usize) -> u32
+    var v: u32 = 0
+    for j in 0..<4
+        v |= u32(bytes[at + usize(j)]) << u32(8 * j)
+    v
+
+put_le32(bytes: []u8, at: usize, v: u32)
+    for j in 0..<4
+        bytes[at + usize(j)] = u8((v >> u32(8 * j)) & 0xFF)
+
+put_le64(bytes: []u8, at: usize, v: u64)
+    for j in 0..<8
+        bytes[at + usize(j)] = u8((v >> u64(8 * j)) & 0xFF)

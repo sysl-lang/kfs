@@ -1,0 +1,8 @@
+// KFS, keel's filesystem (kfs/SPEC.md): the format and every algorithm over it. The same source is
+// compiled for aarch64-freestanding inside the kernel and for the host inside the tools and the tests,
+// so nothing here may need an operating system, a float, or an allocator beyond `Buf`.
+
+package {
+  name    = "kfs"
+  version = "0.0.1"
+}

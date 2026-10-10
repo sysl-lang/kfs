@@ -1,0 +1,378 @@
+module keel.kfs
+
+import sysl.slices.as_mut_ptr
+
+// Every on-disk structure of kfs/SPEC.md sections 5-14, as a struct whose size and every field's offset
+// is pinned by an `@assert`. Each is read and written in place through a pointer into a block's bytes
+// (`at[T]`); the block buffer must be 8-aligned, which every heap block and every `RamDevice` block is.
+// The little-endian assertion in constants.sysl is what makes that meaningful.
+
+// A struct inside a block's bytes: `T` at `offset`. The caller keeps the bytes alive and aligned for
+// `T`; the bounds are checked here.
+at[T](bytes: []u8, offset: usize) -> *T
+    if offset + sizeof(T) > bytes.len then panic("keel.kfs: a structure past the end of its block")
+    ptr_cast(usize(as_mut_ptr(bytes)) + offset)
+
+// The capacities of the blocks that hold arrays of entries, against where each block's tail or checksum
+// begins.
+@assert(sizeof(NodeHeader) + EXTENT_NODE_SLOTS * sizeof(ExtentLeaf) == TAIL_OFFSET, "an extent node fills its block up to the tail")
+@assert(sizeof(IndexHeader) + DIR_INDEX_SLOTS * sizeof(IndexEntry) == TAIL_OFFSET, "an index block fills its block up to the tail")
+@assert(8 + 4072 == TAIL_OFFSET, "a directory leaf's records fill its block up to the tail")
+@assert(sizeof(DescriptorHeader) + DESCRIPTOR_TAGS * sizeof(Tag) <= BLOCK_CRC_OFFSET, "a descriptor's tags fit before its checksum")
+@assert(sizeof(RevokeHeader) + REVOKE_ENTRIES * 8 <= BLOCK_CRC_OFFSET, "a revoke block's entries fit before its checksum")
+@assert(sizeof(NodeHeader) + EXTENT_ROOT_SLOTS * sizeof(ExtentLeaf) == 128, "an inode's extent root is its 128-byte data field")
+
+// -- Superblock (section 5): block 1, meaningful bytes in the first sector ------------------------------
+
+struct Superblock
+    magic: u32
+    version: u32
+    block_size: u32
+    state: u16
+    reserved0: u16
+    blocks: u64
+    group_count: u32
+    blocks_per_group: u32
+    inodes_per_group: u32
+    inode_size: u16
+    first_ino: u16
+    inode_count: u64
+    free_blocks: u64
+    free_inodes: u64
+    reserved_blocks: u64
+    root_ino: u64
+    journal_start: u64
+    journal_blocks: u32
+    max_transaction: u32
+    orphan_head: u64
+    gdt_blocks: u32
+    hash_algorithm: u8
+    csum_algorithm: u8
+    reserved1: u16
+    hash_seed: [16]u8
+    uuid: [16]u8
+    label: [32]u8
+    feature_compat: u32
+    feature_ro_compat: u32
+    feature_incompat: u32
+    mount_count: u32
+    format_time: i64
+    mount_time: i64
+    write_time: i64
+    check_time: i64
+    csum_seed: u32
+    reserved2: [280]u8
+    crc: u32
+
+@assert(sizeof(Superblock) == 512, "the superblock is 512 bytes")
+@assert(offsetof(Superblock, state) == 12, "Superblock.state is at 12")
+@assert(offsetof(Superblock, blocks) == 16, "Superblock.blocks is at 16")
+@assert(offsetof(Superblock, group_count) == 24, "Superblock.group_count is at 24")
+@assert(offsetof(Superblock, blocks_per_group) == 28, "Superblock.blocks_per_group is at 28")
+@assert(offsetof(Superblock, inodes_per_group) == 32, "Superblock.inodes_per_group is at 32")
+@assert(offsetof(Superblock, inode_size) == 36, "Superblock.inode_size is at 36")
+@assert(offsetof(Superblock, first_ino) == 38, "Superblock.first_ino is at 38")
+@assert(offsetof(Superblock, inode_count) == 40, "Superblock.inode_count is at 40")
+@assert(offsetof(Superblock, free_blocks) == 48, "Superblock.free_blocks is at 48")
+@assert(offsetof(Superblock, free_inodes) == 56, "Superblock.free_inodes is at 56")
+@assert(offsetof(Superblock, reserved_blocks) == 64, "Superblock.reserved_blocks is at 64")
+@assert(offsetof(Superblock, root_ino) == 72, "Superblock.root_ino is at 72")
+@assert(offsetof(Superblock, journal_start) == 80, "Superblock.journal_start is at 80")
+@assert(offsetof(Superblock, journal_blocks) == 88, "Superblock.journal_blocks is at 88")
+@assert(offsetof(Superblock, max_transaction) == 92, "Superblock.max_transaction is at 92")
+@assert(offsetof(Superblock, orphan_head) == 96, "Superblock.orphan_head is at 96")
+@assert(offsetof(Superblock, gdt_blocks) == 104, "Superblock.gdt_blocks is at 104")
+@assert(offsetof(Superblock, hash_algorithm) == 108, "Superblock.hash_algorithm is at 108")
+@assert(offsetof(Superblock, csum_algorithm) == 109, "Superblock.csum_algorithm is at 109")
+@assert(offsetof(Superblock, reserved1) == 110, "Superblock.reserved1 is at 110")
+@assert(offsetof(Superblock, hash_seed) == 112, "Superblock.hash_seed is at 112")
+@assert(offsetof(Superblock, uuid) == 128, "Superblock.uuid is at 128")
+@assert(offsetof(Superblock, label) == 144, "Superblock.label is at 144")
+@assert(offsetof(Superblock, feature_compat) == 176, "Superblock.feature_compat is at 176")
+@assert(offsetof(Superblock, feature_ro_compat) == 180, "Superblock.feature_ro_compat is at 180")
+@assert(offsetof(Superblock, feature_incompat) == 184, "Superblock.feature_incompat is at 184")
+@assert(offsetof(Superblock, mount_count) == 188, "Superblock.mount_count is at 188")
+@assert(offsetof(Superblock, format_time) == 192, "Superblock.format_time is at 192")
+@assert(offsetof(Superblock, mount_time) == 200, "Superblock.mount_time is at 200")
+@assert(offsetof(Superblock, write_time) == 208, "Superblock.write_time is at 208")
+@assert(offsetof(Superblock, check_time) == 216, "Superblock.check_time is at 216")
+@assert(offsetof(Superblock, csum_seed) == 224, "Superblock.csum_seed is at 224")
+@assert(offsetof(Superblock, reserved2) == 228, "Superblock.reserved2 is at 228")
+@assert(offsetof(Superblock, crc) == 508, "Superblock.crc is at 508")
+
+// -- Group descriptor (section 6): 64 bytes, 64 to a table block ----------------------------------------
+
+struct GroupDesc
+    block_bitmap: u64
+    inode_bitmap: u64
+    inode_table: u64
+    free_blocks: u32
+    free_inodes: u32
+    directories: u32
+    flags: u32
+    block_bitmap_crc: u32
+    inode_bitmap_crc: u32
+    reserved: [12]u8
+    crc: u32
+
+@assert(sizeof(GroupDesc) == 64, "a group descriptor is 64 bytes")
+@assert(offsetof(GroupDesc, inode_bitmap) == 8, "GroupDesc.inode_bitmap is at 8")
+@assert(offsetof(GroupDesc, inode_table) == 16, "GroupDesc.inode_table is at 16")
+@assert(offsetof(GroupDesc, free_blocks) == 24, "GroupDesc.free_blocks is at 24")
+@assert(offsetof(GroupDesc, free_inodes) == 28, "GroupDesc.free_inodes is at 28")
+@assert(offsetof(GroupDesc, directories) == 32, "GroupDesc.directories is at 32")
+@assert(offsetof(GroupDesc, flags) == 36, "GroupDesc.flags is at 36")
+@assert(offsetof(GroupDesc, block_bitmap_crc) == 40, "GroupDesc.block_bitmap_crc is at 40")
+@assert(offsetof(GroupDesc, inode_bitmap_crc) == 44, "GroupDesc.inode_bitmap_crc is at 44")
+@assert(offsetof(GroupDesc, reserved) == 48, "GroupDesc.reserved is at 48")
+@assert(offsetof(GroupDesc, crc) == 60, "GroupDesc.crc is at 60")
+
+// -- Inode (section 8): 256 bytes, 16 to a block ---------------------------------------------------------
+
+struct Inode
+    mode: u16
+    reserved0: u16
+    links: u32
+    uid: u32
+    gid: u32
+    flags: u32
+    generation: u32
+    size: u64
+    blocks: u64
+    atime_sec: i64
+    mtime_sec: i64
+    ctime_sec: i64
+    crtime_sec: i64
+    atime_nsec: u32
+    mtime_nsec: u32
+    ctime_nsec: u32
+    crtime_nsec: u32
+    orphan_next: u64
+    xattr_block: u64
+    parent: u64
+    data: [128]u8
+    reserved1: [12]u8
+    crc: u32
+
+@assert(sizeof(Inode) == 256, "an inode is 256 bytes")
+@assert(offsetof(Inode, links) == 4, "Inode.links is at 4")
+@assert(offsetof(Inode, uid) == 8, "Inode.uid is at 8")
+@assert(offsetof(Inode, gid) == 12, "Inode.gid is at 12")
+@assert(offsetof(Inode, flags) == 16, "Inode.flags is at 16")
+@assert(offsetof(Inode, generation) == 20, "Inode.generation is at 20")
+@assert(offsetof(Inode, size) == 24, "Inode.size is at 24")
+@assert(offsetof(Inode, blocks) == 32, "Inode.blocks is at 32")
+@assert(offsetof(Inode, atime_sec) == 40, "Inode.atime_sec is at 40")
+@assert(offsetof(Inode, mtime_sec) == 48, "Inode.mtime_sec is at 48")
+@assert(offsetof(Inode, ctime_sec) == 56, "Inode.ctime_sec is at 56")
+@assert(offsetof(Inode, crtime_sec) == 64, "Inode.crtime_sec is at 64")
+@assert(offsetof(Inode, atime_nsec) == 72, "Inode.atime_nsec is at 72")
+@assert(offsetof(Inode, mtime_nsec) == 76, "Inode.mtime_nsec is at 76")
+@assert(offsetof(Inode, ctime_nsec) == 80, "Inode.ctime_nsec is at 80")
+@assert(offsetof(Inode, crtime_nsec) == 84, "Inode.crtime_nsec is at 84")
+@assert(offsetof(Inode, orphan_next) == 88, "Inode.orphan_next is at 88")
+@assert(offsetof(Inode, xattr_block) == 96, "Inode.xattr_block is at 96")
+@assert(offsetof(Inode, parent) == 104, "Inode.parent is at 104")
+@assert(offsetof(Inode, data) == 112, "Inode.data is at 112")
+@assert(offsetof(Inode, reserved1) == 240, "Inode.reserved1 is at 240")
+@assert(offsetof(Inode, crc) == 252, "Inode.crc is at 252")
+
+// -- The extent tree (section 9) -------------------------------------------------------------------------
+
+// A leaf entry: an extent.
+struct ExtentLeaf
+    logical: u32
+    len: u16
+    flags: u16
+    physical: u64
+
+@assert(sizeof(ExtentLeaf) == 16, "an extent leaf entry is 16 bytes")
+@assert(offsetof(ExtentLeaf, len) == 4, "ExtentLeaf.len is at 4")
+@assert(offsetof(ExtentLeaf, flags) == 6, "ExtentLeaf.flags is at 6")
+@assert(offsetof(ExtentLeaf, physical) == 8, "ExtentLeaf.physical is at 8")
+
+// An index entry: a pointer to a child node.
+struct ExtentIndex
+    logical: u32
+    reserved: u32
+    child: u64
+
+@assert(sizeof(ExtentIndex) == 16, "an extent index entry is 16 bytes")
+@assert(offsetof(ExtentIndex, child) == 8, "ExtentIndex.child is at 8")
+
+// The header of an extent node: at the start of an inode's `data` and of every node block.
+struct NodeHeader
+    magic: u32
+    count: u16
+    max: u16
+    depth: u16
+    reserved: [6]u8
+
+@assert(sizeof(NodeHeader) == 16, "an extent node header is 16 bytes")
+@assert(offsetof(NodeHeader, count) == 4, "NodeHeader.count is at 4")
+@assert(offsetof(NodeHeader, max) == 6, "NodeHeader.max is at 6")
+@assert(offsetof(NodeHeader, depth) == 8, "NodeHeader.depth is at 8")
+@assert(offsetof(NodeHeader, reserved) == 10, "NodeHeader.reserved is at 10")
+
+// The last 16 bytes of every owned metadata block (extent nodes, directory blocks, xattr blocks).
+struct BlockTail
+    owner: u64
+    generation: u32
+    crc: u32
+
+@assert(sizeof(BlockTail) == 16, "a block tail is 16 bytes")
+@assert(offsetof(BlockTail, generation) == 8, "BlockTail.generation is at 8")
+@assert(offsetof(BlockTail, crc) == 12, "BlockTail.crc is at 12")
+
+// -- Directories (section 10) ----------------------------------------------------------------------------
+
+struct DirLeafHeader
+    magic: u32
+    count: u16
+    reserved: u16
+
+@assert(sizeof(DirLeafHeader) == 8, "a directory leaf header is 8 bytes")
+@assert(offsetof(DirLeafHeader, count) == 4, "DirLeafHeader.count is at 4")
+
+// A record's fixed part; the name follows at offset 12. Packed, because its 8-byte `ino` would otherwise
+// pad the 12 bytes to 16 and push the name to the wrong offset.
+@packed
+struct DirRecordHeader
+    ino: u64
+    rec_len: u16
+    name_len: u8
+    file_type: u8
+
+@assert(sizeof(DirRecordHeader) == 12, "a directory record header is 12 bytes")
+@assert(offsetof(DirRecordHeader, rec_len) == 8, "DirRecordHeader.rec_len is at 8")
+@assert(offsetof(DirRecordHeader, name_len) == 10, "DirRecordHeader.name_len is at 10")
+@assert(offsetof(DirRecordHeader, file_type) == 11, "DirRecordHeader.file_type is at 11")
+
+// The header of an index block, root or interior.
+struct IndexHeader
+    magic: u32
+    count: u16
+    max: u16
+    level: u8
+    reserved: [7]u8
+
+@assert(sizeof(IndexHeader) == 16, "an index block header is 16 bytes")
+@assert(offsetof(IndexHeader, count) == 4, "IndexHeader.count is at 4")
+@assert(offsetof(IndexHeader, max) == 6, "IndexHeader.max is at 6")
+@assert(offsetof(IndexHeader, level) == 8, "IndexHeader.level is at 8")
+@assert(offsetof(IndexHeader, reserved) == 9, "IndexHeader.reserved is at 9")
+
+struct IndexEntry
+    key: u64
+    child: u32
+    reserved: u32
+
+@assert(sizeof(IndexEntry) == 16, "an index entry is 16 bytes")
+@assert(offsetof(IndexEntry, child) == 8, "IndexEntry.child is at 8")
+@assert(offsetof(IndexEntry, reserved) == 12, "IndexEntry.reserved is at 12")
+
+// -- Extended attributes (section 13) --------------------------------------------------------------------
+
+struct XattrHeader
+    magic: u32
+    count: u16
+    used: u16
+
+@assert(sizeof(XattrHeader) == 8, "an xattr block header is 8 bytes")
+@assert(offsetof(XattrHeader, count) == 4, "XattrHeader.count is at 4")
+@assert(offsetof(XattrHeader, used) == 6, "XattrHeader.used is at 6")
+
+// A record's fixed part; the name follows, then the value, the whole padded to 4 bytes.
+struct XattrRecordHeader
+    namespace: u8
+    name_len: u8
+    value_len: u16
+
+@assert(sizeof(XattrRecordHeader) == 4, "an xattr record header is 4 bytes")
+@assert(offsetof(XattrRecordHeader, name_len) == 1, "XattrRecordHeader.name_len is at 1")
+@assert(offsetof(XattrRecordHeader, value_len) == 2, "XattrRecordHeader.value_len is at 2")
+
+// -- The journal (section 14) ----------------------------------------------------------------------------
+
+// Begins every journal block that is not a copy of a home block.
+struct JournalHeader
+    magic: u32
+    kind: u32
+    sequence: u64
+
+@assert(sizeof(JournalHeader) == 16, "a journal header is 16 bytes")
+@assert(offsetof(JournalHeader, kind) == 4, "JournalHeader.kind is at 4")
+@assert(offsetof(JournalHeader, sequence) == 8, "JournalHeader.sequence is at 8")
+
+// Journal block 0; meaningful bytes in its first sector.
+struct JournalSuper
+    header: JournalHeader
+    journal_blocks: u32
+    first: u32
+    start: u32
+    error: u32
+    start_seq: u64
+    uuid: [16]u8
+    max_transaction: u32
+    features: u32
+    reserved1: [444]u8
+    crc: u32
+
+@assert(sizeof(JournalSuper) == 512, "the journal superblock is 512 bytes")
+@assert(offsetof(JournalSuper, journal_blocks) == 16, "JournalSuper.journal_blocks is at 16")
+@assert(offsetof(JournalSuper, first) == 20, "JournalSuper.first is at 20")
+@assert(offsetof(JournalSuper, start) == 24, "JournalSuper.start is at 24")
+@assert(offsetof(JournalSuper, error) == 28, "JournalSuper.error is at 28")
+@assert(offsetof(JournalSuper, start_seq) == 32, "JournalSuper.start_seq is at 32")
+@assert(offsetof(JournalSuper, uuid) == 40, "JournalSuper.uuid is at 40")
+@assert(offsetof(JournalSuper, max_transaction) == 56, "JournalSuper.max_transaction is at 56")
+@assert(offsetof(JournalSuper, features) == 60, "JournalSuper.features is at 60")
+@assert(offsetof(JournalSuper, reserved1) == 64, "JournalSuper.reserved1 is at 64")
+@assert(offsetof(JournalSuper, crc) == 508, "JournalSuper.crc is at 508")
+
+// A descriptor block's fixed part; `count` tags follow at offset 24, and the block's crc is its last
+// four bytes.
+struct DescriptorHeader
+    header: JournalHeader
+    count: u32
+    reserved: u32
+
+@assert(sizeof(DescriptorHeader) == 24, "a descriptor header is 24 bytes")
+@assert(offsetof(DescriptorHeader, count) == 16, "DescriptorHeader.count is at 16")
+@assert(offsetof(DescriptorHeader, reserved) == 20, "DescriptorHeader.reserved is at 20")
+
+// Describes the copy that follows the descriptor in the same position as the tag.
+struct Tag
+    block: u64
+    flags: u32
+    crc: u32
+
+@assert(sizeof(Tag) == 16, "a descriptor tag is 16 bytes")
+@assert(offsetof(Tag, flags) == 8, "Tag.flags is at 8")
+@assert(offsetof(Tag, crc) == 12, "Tag.crc is at 12")
+
+// A revoke block's fixed part; `count` block numbers follow at offset 24.
+struct RevokeHeader
+    header: JournalHeader
+    count: u32
+    reserved: u32
+
+@assert(sizeof(RevokeHeader) == 24, "a revoke header is 24 bytes")
+@assert(offsetof(RevokeHeader, count) == 16, "RevokeHeader.count is at 16")
+@assert(offsetof(RevokeHeader, reserved) == 20, "RevokeHeader.reserved is at 20")
+
+// The commit block; meaningful bytes in its first sector.
+struct Commit
+    header: JournalHeader
+    commit_sec: i64
+    commit_nsec: u32
+    blocks: u32
+    reserved: [476]u8
+    crc: u32
+
+@assert(sizeof(Commit) == 512, "a commit block is 512 bytes")
+@assert(offsetof(Commit, commit_sec) == 16, "Commit.commit_sec is at 16")
+@assert(offsetof(Commit, commit_nsec) == 24, "Commit.commit_nsec is at 24")
+@assert(offsetof(Commit, blocks) == 28, "Commit.blocks is at 28")
+@assert(offsetof(Commit, reserved) == 32, "Commit.reserved is at 32")
+@assert(offsetof(Commit, crc) == 508, "Commit.crc is at 508")

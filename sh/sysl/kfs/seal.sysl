@@ -1,0 +1,114 @@
+module keel.kfs
+
+// Seal and verify: every checksum of kfs/SPEC.md, over the bytes exactly as the spec gives them.
+//
+// `*_crc` computes a checksum, `seal_*` stores it in the structure's checksum field, `verify_*` answers
+// whether the stored one is right. A checksum field is never part of the bytes it covers, and an
+// identity (an inode number, a group number, a sequence) is fed first, so a structure written to the
+// wrong place or left over from another owner fails. Each takes the bytes of one structure: a whole
+// block, or the slice of a block that holds a descriptor or an inode.
+//
+// A verify says only that the checksum agrees. Whether the structure is otherwise one the code can use
+// (magic, version, ranges) is the caller's next question.
+
+// The filesystem's seed, `C(0xFFFF_FFFF, uuid)`, kept in the superblock.
+csum_seed_of(uuid: []const u8) -> u32 = crc32c(0xFFFF_FFFF, uuid)
+
+private stored(bytes: []const u8, at: usize) -> u32 = le32(bytes, at)
+
+// -- The superblock: seed all ones, no identity, bytes 0..507, crc at 508 ---------------------------------
+
+superblock_crc(block: []const u8) -> u32 = crc32c(0xFFFF_FFFF, block[0..<SECTOR_CRC_OFFSET])
+
+seal_superblock(block: []u8)
+    put_le32(block, SECTOR_CRC_OFFSET, superblock_crc(block))
+
+verify_superblock(block: []const u8) -> bool = superblock_crc(block) == stored(block, SECTOR_CRC_OFFSET)
+
+// -- A group descriptor (64 bytes): csum_seed, the group as u32, bytes 0..59, crc at 60 -------------------
+
+group_desc_crc(seed: u32, group: u32, desc: []const u8) -> u32
+    crc32c(crc32c_u32(seed, group), desc[0..<60])
+
+seal_group_desc(seed: u32, group: u32, desc: []u8)
+    put_le32(desc, 60, group_desc_crc(seed, group, desc))
+
+verify_group_desc(seed: u32, group: u32, desc: []const u8) -> bool
+    group_desc_crc(seed, group, desc) == stored(desc, 60)
+
+// A bitmap's checksum lives in its group's descriptor: csum_seed, the group as u32, the whole 4096-byte
+// bitmap block. The inode bitmap's is the same function over the inode bitmap block.
+bitmap_crc(seed: u32, group: u32, bitmap: []const u8) -> u32
+    crc32c(crc32c_u32(seed, group), bitmap[0..<BLOCK_SIZE])
+
+// -- An inode (256 bytes): csum_seed, the inode number as u64, bytes 0..251, crc at 252 -------------------
+
+inode_crc(seed: u32, ino: u64, inode: []const u8) -> u32
+    crc32c(crc32c_u64(seed, ino), inode[0..<252])
+
+seal_inode(seed: u32, ino: u64, inode: []u8)
+    put_le32(inode, 252, inode_crc(seed, ino, inode))
+
+verify_inode(seed: u32, ino: u64, inode: []const u8) -> bool
+    inode_crc(seed, ino, inode) == stored(inode, 252)
+
+// -- An owned metadata block (extent node, directory leaf or index, xattr block) ---------------------------
+// csum_seed, bytes 0..4091, crc at 4092. The block's `owner` and `generation` (its tail) are among the
+// covered bytes, which is what binds the block to its inode.
+
+block_crc(seed: u32, block: []const u8) -> u32 = crc32c(seed, block[0..<BLOCK_CRC_OFFSET])
+
+seal_block(seed: u32, block: []u8)
+    put_le32(block, BLOCK_CRC_OFFSET, block_crc(seed, block))
+
+verify_block(seed: u32, block: []const u8) -> bool
+    block_crc(seed, block) == stored(block, BLOCK_CRC_OFFSET)
+
+// Stamp the tail's identity into a block before sealing it.
+set_tail(block: []u8, owner: u64, generation: u32)
+    put_le64(block, TAIL_OFFSET, owner)
+    put_le32(block, TAIL_OFFSET + 8, generation)
+
+// An owned block is good when its checksum agrees AND it belongs to inode `owner` at `generation`.
+verify_owned_block(seed: u32, block: []const u8, owner: u64, generation: u32) -> bool
+    verify_block(seed, block) && le64(block, TAIL_OFFSET) == owner && le32(block, TAIL_OFFSET + 8) == generation
+
+// -- The journal superblock and the commit block: csum_seed, bytes 0..507, crc at 508 ----------------------
+
+sector_crc(seed: u32, block: []const u8) -> u32 = crc32c(seed, block[0..<SECTOR_CRC_OFFSET])
+
+seal_sector(seed: u32, block: []u8)
+    put_le32(block, SECTOR_CRC_OFFSET, sector_crc(seed, block))
+
+verify_sector(seed: u32, block: []const u8) -> bool
+    sector_crc(seed, block) == stored(block, SECTOR_CRC_OFFSET)
+
+// -- A descriptor or revoke block: csum_seed, bytes 0..4091, crc at 4092. The same bytes and seed as an
+// owned block's checksum; a journal block has a header where an owned block has a tail.
+
+seal_journal_block(seed: u32, block: []u8) = seal_block(seed, block)
+
+verify_journal_block(seed: u32, block: []const u8) -> bool = verify_block(seed, block)
+
+// -- A tag: csum_seed, the transaction's sequence as u64, the copy exactly as logged (escaped) -------------
+
+tag_crc(seed: u32, sequence: u64, copy: []const u8) -> u32
+    crc32c(crc32c_u64(seed, sequence), copy[0..<BLOCK_SIZE])
+
+seal_tag(seed: u32, sequence: u64, tag: *Tag, copy: []const u8)
+    tag.crc = tag_crc(seed, sequence, copy)
+
+verify_tag(seed: u32, sequence: u64, tag: *Tag, copy: []const u8) -> bool
+    tag.crc == tag_crc(seed, sequence, copy)
+
+// The escaping of section 14: a copy whose first four bytes are the journal magic is logged with them
+// zeroed and its tag marked. `escape_copy` does it to the bytes about to be logged and answers the tag
+// flags; `unescape_copy` restores the magic on replay.
+escape_copy(copy: []u8) -> u32
+    if le32(copy, 0) == JOURNAL_MAGIC
+        put_le32(copy, 0, 0)
+        return TAG_ESCAPED
+    0
+
+unescape_copy(copy: []u8, flags: u32)
+    if flags & TAG_ESCAPED != 0 then put_le32(copy, 0, JOURNAL_MAGIC)
