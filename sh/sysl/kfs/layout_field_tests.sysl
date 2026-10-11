@@ -1,0 +1,485 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+// Every field of every on-disk structure, one at a time, set to its maximum (all ones) in a zeroed block:
+// exactly the bytes the spec gives that field must become 0xFF and every other byte must stay zero. That
+// pins both the offset and the width of each field on the wire, which a round trip of ordinary values
+// cannot (a u32 where the spec says u64 round-trips any value under 2^32). Signed fields are checked
+// sign-extended at their extremes.
+
+// After a field was set to all ones: bytes `lo ..< lo + n` are 0xFF and every other byte of the block is
+// zero. Then the block is zeroed for the next field.
+private alone(v: []u8, lo: usize, n: usize)
+    for i in 0..<v.len
+        val inside = i >= lo && i < lo + n
+        assert_eq(v[i], if inside then u8(0xFF) else u8(0))
+    for i in 0..<v.len
+        v[i] = 0
+
+@test("every superblock field is all ones at exactly its offset and width, and nowhere else")
+superblock_fields_alone()
+    var blk = new_block()
+    val v = blk.view()
+    val sb = at[Superblock](v, 0)
+    sb.magic = 0xFFFF_FFFF
+    alone(v, 0, 4)
+    sb.version = 0xFFFF_FFFF
+    alone(v, 4, 4)
+    sb.block_size = 0xFFFF_FFFF
+    alone(v, 8, 4)
+    sb.state = 0xFFFF
+    alone(v, 12, 2)
+    sb.reserved0 = 0xFFFF
+    alone(v, 14, 2)
+    sb.blocks = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 16, 8)
+    sb.group_count = 0xFFFF_FFFF
+    alone(v, 24, 4)
+    sb.blocks_per_group = 0xFFFF_FFFF
+    alone(v, 28, 4)
+    sb.inodes_per_group = 0xFFFF_FFFF
+    alone(v, 32, 4)
+    sb.inode_size = 0xFFFF
+    alone(v, 36, 2)
+    sb.first_ino = 0xFFFF
+    alone(v, 38, 2)
+    sb.inode_count = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 40, 8)
+    sb.free_blocks = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 48, 8)
+    sb.free_inodes = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 56, 8)
+    sb.reserved_blocks = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 64, 8)
+    sb.root_ino = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 72, 8)
+    sb.journal_start = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 80, 8)
+    sb.journal_blocks = 0xFFFF_FFFF
+    alone(v, 88, 4)
+    sb.max_transaction = 0xFFFF_FFFF
+    alone(v, 92, 4)
+    sb.orphan_head = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 96, 8)
+    sb.gdt_blocks = 0xFFFF_FFFF
+    alone(v, 104, 4)
+    sb.hash_algorithm = 0xFF
+    alone(v, 108, 1)
+    sb.csum_algorithm = 0xFF
+    alone(v, 109, 1)
+    sb.reserved1 = 0xFFFF
+    alone(v, 110, 2)
+    for i in 0..<16
+        sb.hash_seed[i] = 0xFF
+    alone(v, 112, 16)
+    for i in 0..<16
+        sb.uuid[i] = 0xFF
+    alone(v, 128, 16)
+    for i in 0..<32
+        sb.label[i] = 0xFF
+    alone(v, 144, 32)
+    sb.feature_compat = 0xFFFF_FFFF
+    alone(v, 176, 4)
+    sb.feature_ro_compat = 0xFFFF_FFFF
+    alone(v, 180, 4)
+    sb.feature_incompat = 0xFFFF_FFFF
+    alone(v, 184, 4)
+    sb.mount_count = 0xFFFF_FFFF
+    alone(v, 188, 4)
+    sb.format_time = -1
+    alone(v, 192, 8)
+    sb.mount_time = -1
+    alone(v, 200, 8)
+    sb.write_time = -1
+    alone(v, 208, 8)
+    sb.check_time = -1
+    alone(v, 216, 8)
+    sb.csum_seed = 0xFFFF_FFFF
+    alone(v, 224, 4)
+    for i in 0..<280
+        sb.reserved2[i] = 0xFF
+    alone(v, 228, 280)
+    sb.crc = 0xFFFF_FFFF
+    alone(v, 508, 4)
+
+@test("the superblock's times are signed 64-bit: the most negative and most positive values survive the bytes")
+superblock_signed_times()
+    var blk = new_block()
+    val sb = at[Superblock](blk.view(), 0)
+    sb.format_time = -0x8000_0000_0000_0000
+    sb.mount_time = 0x7FFF_FFFF_FFFF_FFFF
+    sb.write_time = -1
+    sb.check_time = 0
+    assert_eq(le64(blk.view(), 192), 0x8000_0000_0000_0000)
+    assert_eq(le64(blk.view(), 200), 0x7FFF_FFFF_FFFF_FFFF)
+    assert_eq(le64(blk.view(), 208), 0xFFFF_FFFF_FFFF_FFFF)
+    var copy = copy_of(blk.view())
+    val back = at[Superblock](copy.view(), 0)
+    assert_eq(back.format_time, -0x8000_0000_0000_0000)
+    assert_eq(back.mount_time, 0x7FFF_FFFF_FFFF_FFFF)
+    assert_eq(back.write_time, -1)
+    assert(back.format_time < back.check_time)
+
+@test("every group descriptor field is all ones at exactly its offset and width, the 64th descriptor too")
+group_desc_fields_alone()
+    var blk = new_block()
+    val v = blk.view()
+    for base in [0, 63 * 64]
+        val b = usize(base)
+        val d = at[GroupDesc](v, b)
+        d.block_bitmap = 0xFFFF_FFFF_FFFF_FFFF
+        alone(v, b + 0, 8)
+        d.inode_bitmap = 0xFFFF_FFFF_FFFF_FFFF
+        alone(v, b + 8, 8)
+        d.inode_table = 0xFFFF_FFFF_FFFF_FFFF
+        alone(v, b + 16, 8)
+        d.free_blocks = 0xFFFF_FFFF
+        alone(v, b + 24, 4)
+        d.free_inodes = 0xFFFF_FFFF
+        alone(v, b + 28, 4)
+        d.directories = 0xFFFF_FFFF
+        alone(v, b + 32, 4)
+        d.flags = 0xFFFF_FFFF
+        alone(v, b + 36, 4)
+        d.block_bitmap_crc = 0xFFFF_FFFF
+        alone(v, b + 40, 4)
+        d.inode_bitmap_crc = 0xFFFF_FFFF
+        alone(v, b + 44, 4)
+        for i in 0..<12
+            d.reserved[i] = 0xFF
+        alone(v, b + 48, 12)
+        d.crc = 0xFFFF_FFFF
+        alone(v, b + 60, 4)
+
+@test("every inode field is all ones at exactly its offset and width, the 16th inode of a block too")
+inode_fields_alone()
+    var blk = new_block()
+    val v = blk.view()
+    for base in [0, 15 * 256]
+        val b = usize(base)
+        val n = at[Inode](v, b)
+        n.mode = 0xFFFF
+        alone(v, b + 0, 2)
+        n.reserved0 = 0xFFFF
+        alone(v, b + 2, 2)
+        n.links = 0xFFFF_FFFF
+        alone(v, b + 4, 4)
+        n.uid = 0xFFFF_FFFF
+        alone(v, b + 8, 4)
+        n.gid = 0xFFFF_FFFF
+        alone(v, b + 12, 4)
+        n.flags = 0xFFFF_FFFF
+        alone(v, b + 16, 4)
+        n.generation = 0xFFFF_FFFF
+        alone(v, b + 20, 4)
+        n.size = 0xFFFF_FFFF_FFFF_FFFF
+        alone(v, b + 24, 8)
+        n.blocks = 0xFFFF_FFFF_FFFF_FFFF
+        alone(v, b + 32, 8)
+        n.atime_sec = -1
+        alone(v, b + 40, 8)
+        n.mtime_sec = -1
+        alone(v, b + 48, 8)
+        n.ctime_sec = -1
+        alone(v, b + 56, 8)
+        n.crtime_sec = -1
+        alone(v, b + 64, 8)
+        n.atime_nsec = 0xFFFF_FFFF
+        alone(v, b + 72, 4)
+        n.mtime_nsec = 0xFFFF_FFFF
+        alone(v, b + 76, 4)
+        n.ctime_nsec = 0xFFFF_FFFF
+        alone(v, b + 80, 4)
+        n.crtime_nsec = 0xFFFF_FFFF
+        alone(v, b + 84, 4)
+        n.orphan_next = 0xFFFF_FFFF_FFFF_FFFF
+        alone(v, b + 88, 8)
+        n.xattr_block = 0xFFFF_FFFF_FFFF_FFFF
+        alone(v, b + 96, 8)
+        n.parent = 0xFFFF_FFFF_FFFF_FFFF
+        alone(v, b + 104, 8)
+        for i in 0..<128
+            n.data[i] = 0xFF
+        alone(v, b + 112, 128)
+        for i in 0..<12
+            n.reserved1[i] = 0xFF
+        alone(v, b + 240, 12)
+        n.crc = 0xFFFF_FFFF
+        alone(v, b + 252, 4)
+
+@test("an inode's times: before 1970 is a negative _sec with a non-negative _nsec; nsec 0 and 999,999,999 survive")
+inode_signed_times()
+    var blk = new_block()
+    val n = at[Inode](blk.view(), 256)
+    n.atime_sec = -1
+    n.atime_nsec = 999_999_999
+    n.mtime_sec = -0x8000_0000_0000_0000
+    n.mtime_nsec = 0
+    n.ctime_sec = 0x7FFF_FFFF_FFFF_FFFF
+    n.ctime_nsec = 999_999_999
+    n.crtime_sec = -2_208_988_800
+    n.crtime_nsec = 1
+    assert_eq(le64(blk.view(), 256 + 40), 0xFFFF_FFFF_FFFF_FFFF)
+    assert_eq(le32(blk.view(), 256 + 72), 999_999_999)
+    assert_eq(le64(blk.view(), 256 + 48), 0x8000_0000_0000_0000)
+    assert_eq(le32(blk.view(), 256 + 76), 0)
+    assert_eq(le64(blk.view(), 256 + 56), 0x7FFF_FFFF_FFFF_FFFF)
+    assert_eq(le64(blk.view(), 256 + 64), u64(0) - 2_208_988_800)
+    var copy = copy_of(blk.view())
+    val back = at[Inode](copy.view(), 256)
+    assert_eq(back.atime_sec, -1)
+    assert_eq(back.atime_nsec, 999_999_999)
+    assert_eq(back.mtime_sec, -0x8000_0000_0000_0000)
+    assert_eq(back.mtime_nsec, 0)
+    assert_eq(back.ctime_sec, 0x7FFF_FFFF_FFFF_FFFF)
+    assert_eq(back.crtime_sec, -2_208_988_800)
+    assert(back.crtime_sec < 0 && back.crtime_sec < back.atime_sec)
+
+@test("extent entries, the node header and the block tail: every field alone at its offset and width")
+extent_fields_alone()
+    var blk = new_block()
+    val v = blk.view()
+    val e = at[ExtentLeaf](v, 16)
+    e.logical = 0xFFFF_FFFF
+    alone(v, 16, 4)
+    e.len = 0xFFFF
+    alone(v, 20, 2)
+    e.flags = 0xFFFF
+    alone(v, 22, 2)
+    e.physical = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 24, 8)
+    val x = at[ExtentIndex](v, 4064)
+    x.logical = 0xFFFF_FFFF
+    alone(v, 4064, 4)
+    x.reserved = 0xFFFF_FFFF
+    alone(v, 4068, 4)
+    x.child = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 4072, 8)
+    val h = at[NodeHeader](v, 0)
+    h.magic = 0xFFFF_FFFF
+    alone(v, 0, 4)
+    h.count = 0xFFFF
+    alone(v, 4, 2)
+    h.max = 0xFFFF
+    alone(v, 6, 2)
+    h.depth = 0xFFFF
+    alone(v, 8, 2)
+    for i in 0..<6
+        h.reserved[i] = 0xFF
+    alone(v, 10, 6)
+    val t = at[BlockTail](v, TAIL_OFFSET)
+    t.owner = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 4080, 8)
+    t.generation = 0xFFFF_FFFF
+    alone(v, 4088, 4)
+    t.crc = 0xFFFF_FFFF
+    alone(v, 4092, 4)
+
+@test("directory leaf and record headers, index headers and entries: every field alone at its offset and width")
+directory_fields_alone()
+    var blk = new_block()
+    val v = blk.view()
+    val lh = at[DirLeafHeader](v, 0)
+    lh.magic = 0xFFFF_FFFF
+    alone(v, 0, 4)
+    lh.count = 0xFFFF
+    alone(v, 4, 2)
+    lh.reserved = 0xFFFF
+    alone(v, 6, 2)
+    // A record at an offset that is a multiple of 8, as every record's is.
+    val r = at[DirRecordHeader](v, 4064)
+    r.ino = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 4064, 8)
+    r.rec_len = 0xFFFF
+    alone(v, 4072, 2)
+    r.name_len = 0xFF
+    alone(v, 4074, 1)
+    r.file_type = 0xFF
+    alone(v, 4075, 1)
+    val ih = at[IndexHeader](v, 0)
+    ih.magic = 0xFFFF_FFFF
+    alone(v, 0, 4)
+    ih.count = 0xFFFF
+    alone(v, 4, 2)
+    ih.max = 0xFFFF
+    alone(v, 6, 2)
+    ih.level = 0xFF
+    alone(v, 8, 1)
+    for i in 0..<7
+        ih.reserved[i] = 0xFF
+    alone(v, 9, 7)
+    // The last of the 254 index entries ends where the tail begins.
+    val ie = at[IndexEntry](v, 16 + 253 * 16)
+    ie.key = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 4064, 8)
+    ie.child = 0xFFFF_FFFF
+    alone(v, 4072, 4)
+    ie.reserved = 0xFFFF_FFFF
+    alone(v, 4076, 4)
+
+@test("the xattr block header and record header: every field alone at its offset and width")
+xattr_fields_alone()
+    var blk = new_block()
+    val v = blk.view()
+    val h = at[XattrHeader](v, 0)
+    h.magic = 0xFFFF_FFFF
+    alone(v, 0, 4)
+    h.count = 0xFFFF
+    alone(v, 4, 2)
+    h.used = 0xFFFF
+    alone(v, 6, 2)
+    val r = at[XattrRecordHeader](v, 8)
+    r.namespace = 0xFF
+    alone(v, 8, 1)
+    r.name_len = 0xFF
+    alone(v, 9, 1)
+    r.value_len = 0xFFFF
+    alone(v, 10, 2)
+    assert_eq(XATTR_MAGIC, 0x4153_464B)
+    assert_eq(XATTR_USER, 1)
+    assert_eq(XATTR_TRUSTED, 2)
+    assert_eq(XATTR_SECURITY, 3)
+    assert_eq(XATTR_SYSTEM, 4)
+
+@test("the journal header, superblock, descriptor, tag, revoke and commit: every field alone at its offset and width")
+journal_fields_alone()
+    var blk = new_block()
+    val v = blk.view()
+    val js = at[JournalSuper](v, 0)
+    js.header.magic = 0xFFFF_FFFF
+    alone(v, 0, 4)
+    js.header.kind = 0xFFFF_FFFF
+    alone(v, 4, 4)
+    js.header.sequence = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 8, 8)
+    js.journal_blocks = 0xFFFF_FFFF
+    alone(v, 16, 4)
+    js.first = 0xFFFF_FFFF
+    alone(v, 20, 4)
+    js.start = 0xFFFF_FFFF
+    alone(v, 24, 4)
+    js.error = 0xFFFF_FFFF
+    alone(v, 28, 4)
+    js.start_seq = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 32, 8)
+    for i in 0..<16
+        js.uuid[i] = 0xFF
+    alone(v, 40, 16)
+    js.max_transaction = 0xFFFF_FFFF
+    alone(v, 56, 4)
+    js.features = 0xFFFF_FFFF
+    alone(v, 60, 4)
+    for i in 0..<444
+        js.reserved1[i] = 0xFF
+    alone(v, 64, 444)
+    js.crc = 0xFFFF_FFFF
+    alone(v, 508, 4)
+
+    val d = at[DescriptorHeader](v, 0)
+    d.count = 0xFFFF_FFFF
+    alone(v, 16, 4)
+    d.reserved = 0xFFFF_FFFF
+    alone(v, 20, 4)
+    // The 254th tag ends at 24 + 254 * 16 = 4088, before the block's checksum.
+    val t = at[Tag](v, 24 + 253 * 16)
+    t.block = 0xFFFF_FFFF_FFFF_FFFF
+    alone(v, 4072, 8)
+    t.flags = 0xFFFF_FFFF
+    alone(v, 4080, 4)
+    t.crc = 0xFFFF_FFFF
+    alone(v, 4084, 4)
+
+    val r = at[RevokeHeader](v, 0)
+    r.count = 0xFFFF_FFFF
+    alone(v, 16, 4)
+    r.reserved = 0xFFFF_FFFF
+    alone(v, 20, 4)
+    // The 508th revoked number ends at 24 + 508 * 8 = 4088.
+    assert_eq(24 + REVOKE_ENTRIES * 8, 4088)
+    assert_eq(24 + DESCRIPTOR_TAGS * 16, 4088)
+
+    val c = at[Commit](v, 0)
+    c.commit_sec = -1
+    alone(v, 16, 8)
+    c.commit_nsec = 0xFFFF_FFFF
+    alone(v, 24, 4)
+    c.blocks = 0xFFFF_FFFF
+    alone(v, 28, 4)
+    for i in 0..<476
+        c.reserved[i] = 0xFF
+    alone(v, 32, 476)
+    c.crc = 0xFFFF_FFFF
+    alone(v, 508, 4)
+
+@test("a commit's time is signed: the most negative second and nsec 999,999,999 survive the bytes")
+commit_signed_time()
+    var blk = new_block()
+    val c = at[Commit](blk.view(), 0)
+    c.commit_sec = -0x8000_0000_0000_0000
+    c.commit_nsec = 999_999_999
+    assert_eq(le64(blk.view(), 16), 0x8000_0000_0000_0000)
+    var copy = copy_of(blk.view())
+    val back = at[Commit](copy.view(), 0)
+    assert_eq(back.commit_sec, -0x8000_0000_0000_0000)
+    assert_eq(back.commit_nsec, 999_999_999)
+
+@test("the magic numbers read as their four ASCII bytes, and the flag and type values are the spec's")
+magic_bytes_and_flags()
+    var blk = new_block()
+    val magics: [6]u32 = [SUPER_MAGIC, EXTENT_MAGIC, DIR_LEAF_MAGIC, DIR_INDEX_MAGIC, XATTR_MAGIC, JOURNAL_MAGIC]
+    val fourth: [6]u8 = [u8('S'), u8('X'), u8('D'), u8('H'), u8('A'), u8('J')]
+    for i in 0..<usize(6)
+        put_le32(blk.view(), 0, magics[i])
+        assert_eq(blk.view()[0], u8('K'))
+        assert_eq(blk.view()[1], u8('F'))
+        assert_eq(blk.view()[2], u8('S'))
+        assert_eq(blk.view()[3], fourth[i])
+    assert_eq(STATE_CLEAN, 1)
+    assert_eq(STATE_ERROR, 2)
+    assert_eq(GROUP_COPY, 1)
+    assert_eq(INODE_INLINE, 1)
+    assert_eq(INODE_INDEXED, 2)
+    assert_eq(INODE_ORPHAN, 4)
+    assert_eq(EXTENT_UNWRITTEN, 1)
+    assert_eq(TAG_ESCAPED, 1)
+    assert_eq(JOURNAL_SUPER, 1)
+    assert_eq(JOURNAL_DESCRIPTOR, 2)
+    assert_eq(JOURNAL_REVOKE, 3)
+    assert_eq(JOURNAL_COMMIT, 4)
+    val dts: [8]u8 = [DT_UNKNOWN, DT_FIFO, DT_CHR, DT_DIR, DT_BLK, DT_REG, DT_LNK, DT_SOCK]
+    val want: [8]u8 = [0, 1, 2, 4, 6, 8, 10, 12]
+    for i in 0..<usize(8)
+        assert_eq(dts[i], want[i])
+
+@test("the limits of section 3 are the spec's numbers")
+section_three_limits()
+    assert_eq(SECTOR_SIZE, 512)
+    assert_eq(BLOCK_SIZE, 4096)
+    assert_eq(SECTORS_PER_BLOCK * SECTOR_SIZE, BLOCK_SIZE)
+    assert_eq(INODE_SIZE, 256)
+    assert_eq(INODES_PER_BLOCK * INODE_SIZE, BLOCK_SIZE)
+    assert_eq(NAME_MAX, 255)
+    assert_eq(PATH_MAX, 4096)
+    assert_eq(SYMLINK_INLINE_MAX, 128)
+    assert_eq(LINK_MAX, 2_147_483_647)
+    assert_eq(BLOCKS_PER_GROUP_MIN, 2048)
+    assert_eq(BLOCKS_PER_GROUP_MAX, 32768)
+    assert_eq(INODES_PER_GROUP_MIN, 16)
+    assert_eq(INODES_PER_GROUP_MAX, 32768)
+    assert_eq(DEFAULT_BYTES_PER_INODE, 8192)
+    assert_eq(FIRST_INO, 11)
+    assert_eq(ROOT_INO, 2)
+    assert_eq(EXTENT_ROOT_SLOTS, 7)
+    assert_eq(EXTENT_NODE_SLOTS, 254)
+    assert_eq(EXTENT_MAX_DEPTH, 4)
+    assert_eq(EXTENT_MAX_LEN, 32768)
+    assert_eq(DIR_MAX_LEVELS, 3)
+    assert_eq(DIR_INDEX_SLOTS, 254)
+    assert_eq(JOURNAL_MIN_BLOCKS, 1024)
+    assert_eq(JOURNAL_MAX_BLOCKS, 16384)
+    assert_eq(MAX_OP_CREDITS, 192)
+    assert_eq(COMMIT_INTERVAL_SECONDS, 5)
+    // One bitmap block's bits bound a group.
+    assert_eq(usize(BLOCKS_PER_GROUP_MAX), BLOCK_SIZE * 8)
+    assert_eq(usize(INODES_PER_GROUP_MAX), BLOCK_SIZE * 8)

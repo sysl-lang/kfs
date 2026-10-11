@@ -234,6 +234,10 @@ journal fits in group `G / 2`'s data area (the `2 × journal_blocks` rule only g
 `reserved_blocks` is the percentage of all groups' data-area blocks, the journal not counted. `mkfs.kfs`
 gives the root exactly one directory leaf, at the first data block of group 0, holding the single entry
 `lost+found` (inode 11, which itself is empty and has no blocks); root has `links` 3 and `lost+found` 2.
+Every copy group carries the whole descriptor table, so `mkfs.kfs` also refuses a size whose table would
+leave a full copy group fewer than 64 data blocks: with the defaults that is past 2,027,328 groups of 32768
+(about 247 TiB), well short of section 3's 512 PiB, which the group count alone would allow. Mount checks
+the same arithmetic, the last-group rule included, so a corrupt count is refused rather than wrapped.
 
 **Pedagogical notes.** The layout is ext2's, minus thirty years. Groups exist for three reasons that
 are all visible here: a bitmap block covers exactly one group, so allocation inside a group touches one
@@ -316,7 +320,10 @@ journal is idle.
 written by `mkfs.kfs` and by any tool that changes a static field (label, features). Their free counts
 and times are stale by design; only their static fields are used. If block 1 fails its check,
 `fsck.kfs` finds a backup by trying block `1 + b` for each allowed `blocks_per_group` `b` (2048, 4096,
-…, 32768) and taking the first that passes; the kernel refuses to mount (it does not guess).
+…, 32768) and taking the first that passes; the kernel refuses to mount (it does not guess). "Passes" is
+its checksum, its magic, and sitting where its own geometry keeps a copy (`b` a whole number of its
+groups, that group being 1 or G − 1), so group G − 1's copy is found too when it lies at one of those
+blocks (3, 5, 9 or 17 groups).
 
 ---
 

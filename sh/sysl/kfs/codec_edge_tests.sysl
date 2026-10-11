@@ -1,0 +1,370 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+// The codecs at their edges: CRC32C against a bit-at-a-time reference, the clamp of the directory hash at
+// both bounds, the bitmap's first and last bits, the single-entry directory leaf at the name lengths that
+// matter, the exact bytes every checksum covers, and the journal's escaping when the magic is nearly there.
+
+import sysl.buf.{Buf, buf}
+
+// CRC32C one bit at a time, straight from the reflected polynomial: an oracle that shares nothing with
+// the table.
+private crc_bitwise(seed: u32, bytes: []const u8) -> u32
+    var c = seed
+    for b in bytes
+        c ^= u32(b)
+        for _ in 0..<8
+            c = if c & 1 != 0 then (c >> 1) ^ 0x82F63B78 else c >> 1
+    c
+
+private bytes_of(xs: []const u8) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for x in xs
+        b.push(x)
+    b
+
+private le_bytes(v: u64, n: usize) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for i in 0..<n
+        b.push(u8((v >> u64(8 * i)) & 0xFF))
+    b
+
+// `a` followed by `b`, as one buffer.
+private joined(a: []const u8, b: []const u8) -> Buf[u8]
+    var out = bytes_of(a)
+    for x in b
+        out.push(x)
+    out
+
+// -- CRC32C -------------------------------------------------------------------------------------------------
+
+@test("CRC32C of nothing leaves the register unchanged, so the standard CRC of the empty message is 0")
+crc_of_nothing()
+    var none: Buf[u8] = buf()
+    assert_eq(crc32c(0xFFFF_FFFF, none.view()), 0xFFFF_FFFF)
+    assert_eq(crc32c(0, none.view()), 0)
+    assert_eq(crc32c(0x8000_0001, none.view()), 0x8000_0001)
+    assert_eq(crc32c_standard(none.view()), 0)
+
+@test("every one of the 256 table entries is the bitwise CRC of its index from a zero register")
+crc_every_table_entry()
+    var one: Buf[u8] = buf()
+    one.push(0)
+    for i in 0..<256
+        one.view()[0] = u8(i)
+        assert_eq(crc32c(0, one.view()), crc_bitwise(0, one.view()))
+    // The entries the reflected polynomial pins by hand: 0, 128 (the polynomial itself) and 1.
+    one.view()[0] = 0
+    assert_eq(crc32c(0, one.view()), 0)
+    one.view()[0] = 128
+    assert_eq(crc32c(0, one.view()), 0x82F63B78)
+    one.view()[0] = 1
+    assert_eq(crc32c(0, one.view()), 0xF26B8303)
+
+@test("a single byte: the standard CRC32C of \"a\" is 0xC1D04330, and of 0x00 and 0xFF their reference values")
+crc_one_byte()
+    var one: Buf[u8] = buf()
+    one.push(u8('a'))
+    assert_eq(crc32c_standard(one.view()), 0xC1D04330)
+    one.view()[0] = 0
+    assert_eq(crc32c_standard(one.view()), ~crc_bitwise(0xFFFF_FFFF, one.view()))
+    assert_eq(crc32c_standard(one.view()), 0x527D5351)
+    one.view()[0] = 0xFF
+    assert_eq(crc32c_standard(one.view()), ~crc_bitwise(0xFFFF_FFFF, one.view()))
+
+@test("every length from 1 to 64, at every starting offset 0 to 7, under four seeds, agrees with the bitwise CRC")
+crc_lengths_and_alignments()
+    val data = filled_block(21)
+    val seeds: [4]u32 = [0xFFFF_FFFF, 0, 0x1234_5678, 0x8000_0001]
+    for s in seeds
+        for off in 0..<usize(8)
+            for n in 1..<usize(65)
+                val m = data.view()[off..<off + n]
+                assert_eq(crc32c(s, m), crc_bitwise(s, m))
+
+@test("a seed other than all ones: C(seed, m) is the bitwise update from that seed, and chains")
+crc_other_seed()
+    val m = counting(37)
+    assert_eq(crc32c(0xDEAD_BEEF, m.view()), crc_bitwise(0xDEAD_BEEF, m.view()))
+    assert(crc32c(0xDEAD_BEEF, m.view()) != crc32c(0xFFFF_FFFF, m.view()))
+    val head = crc32c(0xDEAD_BEEF, m.view()[0..<13])
+    assert_eq(crc32c(head, m.view()[13..<37]), crc32c(0xDEAD_BEEF, m.view()))
+
+@test("an integer fed as an identity is its little-endian bytes, at 0, at the maximum and with the top bit alone")
+crc_integer_edges()
+    val values32: [4]u32 = [0, 0xFFFF_FFFF, 0x8000_0000, 1]
+    for v in values32
+        val b = le_bytes(u64(v), 4)
+        assert_eq(crc32c_u32(0x5EED_0001, v), crc_bitwise(0x5EED_0001, b.view()))
+    val values64: [4]u64 = [0, 0xFFFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0000, 0x1_0000_0000]
+    for v in values64
+        val b = le_bytes(v, 8)
+        assert_eq(crc32c_u64(0x5EED_0002, v), crc_bitwise(0x5EED_0002, b.view()))
+
+@test("the iSCSI and \"123456789\" vectors hold against the bitwise reference too")
+crc_vectors_against_reference()
+    var zeros: Buf[u8] = buf()
+    for _ in 0..<32
+        zeros.push(0)
+    assert_eq(~crc_bitwise(0xFFFF_FFFF, zeros.view()), 0x8A9136AA)
+    assert_eq(crc32c_standard(zeros.view()), 0x8A9136AA)
+    val digits = bytes_of("123456789".bytes)
+    assert_eq(~crc_bitwise(0xFFFF_FFFF, digits.view()), 0xE3069283)
+
+// -- the clamp ----------------------------------------------------------------------------------------------
+
+@test("the clamp at its lower bound: raw 7, 8 and 9 give 8; 6 and below give 8; 10 and 11 give 10")
+hash_clamp_lower_bound()
+    assert_eq(hash_of_raw(0), 8)
+    assert_eq(hash_of_raw(6), 8)
+    assert_eq(hash_of_raw(7), 8)
+    assert_eq(hash_of_raw(8), 8)
+    assert_eq(hash_of_raw(9), 8)
+    assert_eq(hash_of_raw(10), 10)
+    assert_eq(hash_of_raw(11), 10)
+
+@test("the clamp at its upper bound: raw 2^64-5 gives 2^64-6, 2^64-4 and above give 2^64-4")
+hash_clamp_upper_bound()
+    assert_eq(hash_of_raw(0xFFFF_FFFF_FFFF_FFFA), 0xFFFF_FFFF_FFFF_FFFA)
+    assert_eq(hash_of_raw(0xFFFF_FFFF_FFFF_FFFB), 0xFFFF_FFFF_FFFF_FFFA)
+    assert_eq(hash_of_raw(0xFFFF_FFFF_FFFF_FFFC), 0xFFFF_FFFF_FFFF_FFFC)
+    assert_eq(hash_of_raw(0xFFFF_FFFF_FFFF_FFFD), 0xFFFF_FFFF_FFFF_FFFC)
+    assert_eq(hash_of_raw(0xFFFF_FFFF_FFFF_FFFE), 0xFFFF_FFFF_FFFF_FFFC)
+    assert_eq(hash_of_raw(0xFFFF_FFFF_FFFF_FFFF), 0xFFFF_FFFF_FFFF_FFFC)
+
+@test("an odd raw value inside the range loses only bit 0, and an even one is itself; 2^63 - 1 is never a hash")
+hash_clamp_odd_values()
+    assert_eq(hash_of_raw(0x1234_5679), 0x1234_5678)
+    assert_eq(hash_of_raw(0x1234_5678), 0x1234_5678)
+    assert_eq(hash_of_raw(0x7FFF_FFFF_FFFF_FFFF), 0x7FFF_FFFF_FFFF_FFFE)
+    assert_eq(hash_of_raw(0x8000_0000_0000_0001), 0x8000_0000_0000_0000)
+    for r in 0..<u64(64)
+        val raw = 0x0123_4567_89AB_CDEF ^ (r * 0x9E37_79B9_7F4A_7C15)
+        val h = hash_of_raw(raw | 1)
+        assert_eq(h, hash_of_raw(raw & ~u64(1)))
+        assert(h & 1 == 0)
+
+@test("through the hook, dir_hash applies the same clamp at all six edge values")
+hash_hook_edges()
+    val seed = counting(16)
+    val name = counting(4)
+    val raws: [6]u64 = [7, 8, 9, 0xFFFF_FFFF_FFFF_FFFB, 0xFFFF_FFFF_FFFF_FFFC, 0xFFFF_FFFF_FFFF_FFFD]
+    for raw in raws
+        force_raw_hash(raw)
+        assert_eq(dir_hash(seed.view(), name.view()), hash_of_raw(raw))
+    clear_raw_hash()
+
+// -- bitmaps ------------------------------------------------------------------------------------------------
+
+@test("a bitmap's first, byte-crossing and last bits: 0, 7, 8 and 32767 are bit i % 8 of byte i / 8")
+bitmap_edge_bits()
+    var b = new_block()
+    for i in [0, 7, 8, 32767]
+        bit_set(b.view(), usize(i))
+        assert(bit_test(b.view(), usize(i)))
+        assert_eq(b.view()[usize(i) / 8], u8(1) << u8(usize(i) % 8))
+        assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), u32(BLOCK_SIZE * 8 - 1))
+        bit_clear(b.view(), usize(i))
+        assert(!bit_test(b.view(), usize(i)))
+        assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), u32(BLOCK_SIZE * 8))
+
+@test("an empty range sets nothing, a range of one sets one bit, and count_clear of no bits is 0")
+bitmap_empty_ranges()
+    var b = new_block()
+    bit_set_range(b.view(), 100, 100)
+    assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), u32(BLOCK_SIZE * 8))
+    assert_eq(count_clear(b.view(), 0), 0)
+    bit_set_range(b.view(), 100, 101)
+    assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), u32(BLOCK_SIZE * 8 - 1))
+    assert(bit_test(b.view(), 100) && !bit_test(b.view(), 99) && !bit_test(b.view(), 101))
+    bit_set_range(b.view(), 0, BLOCK_SIZE * 8)
+    assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), 0)
+    for x in b.view()
+        assert_eq(x, 0xFF)
+
+@test("clearing a bit leaves its seven neighbours in the byte set")
+bitmap_clear_one_of_eight()
+    var b = new_block()
+    bit_set_range(b.view(), 8, 16)
+    bit_clear(b.view(), 13)
+    assert_eq(b.view()[1], 0xDF)
+    assert_eq(b.view()[0], 0)
+    assert_eq(b.view()[2], 0)
+
+// -- the single-entry leaf ----------------------------------------------------------------------------------
+
+@test("a record's live bytes are 12 plus the name rounded up to 8: 16 for 1 to 4 bytes, 24 for 5, 272 for 255")
+dirleaf_live_bytes()
+    assert_eq(record_live_bytes(1), 16)
+    assert_eq(record_live_bytes(4), 16)
+    assert_eq(record_live_bytes(5), 24)
+    assert_eq(record_live_bytes(12), 24)
+    assert_eq(record_live_bytes(13), 32)
+    assert_eq(record_live_bytes(NAME_MAX), 272)
+
+private leaf_holding(name: []const u8, ino: u64, file_type: u8) -> Buf[u8]
+    var blk = new_block()
+    single_entry_leaf(blk.view(), 0x5EED_0003, 0x1_0000_0002, 7, ino, file_type, name)
+    blk
+
+@test("a single-entry leaf with a one-byte name and with a 255-byte name: header, record, name, zero slack, tail")
+dirleaf_name_lengths()
+    val long_name = filled_block(23)
+    for n in [1, 255]
+        val name = long_name.view()[0..<usize(n)]
+        val blk = leaf_holding(name, 0xFFFF_FFFF_FFFF_FFFF, DT_REG)
+        val v = blk.view()
+        assert_eq(le32(v, 0), DIR_LEAF_MAGIC)
+        assert_eq(le16(v, 4), 1)
+        assert_eq(le16(v, 6), 0)
+        assert_eq(le64(v, 8), 0xFFFF_FFFF_FFFF_FFFF)
+        assert_eq(le16(v, 16), 4072)
+        assert_eq(v[18], u8(n))
+        assert_eq(v[19], DT_REG)
+        for i in 0..<usize(n)
+            assert_eq(v[20 + i], name[i])
+        for i in (20 + usize(n))..<TAIL_OFFSET
+            assert_eq(v[i], 0)
+        assert_eq(le64(v, TAIL_OFFSET), 0x1_0000_0002)
+        assert_eq(le32(v, TAIL_OFFSET + 8), 7)
+        assert(verify_owned_block(0x5EED_0003, v, 0x1_0000_0002, 7))
+        assert(!verify_owned_block(0x5EED_0003, v, 2, 7))
+
+@test("the single record tiles the leaf exactly: it starts at 8 and its rec_len ends it at the tail")
+dirleaf_tiles_exactly()
+    val blk = leaf_holding("x".bytes, 11, DT_DIR)
+    assert_eq(8 + usize(le16(blk.view(), 16)), TAIL_OFFSET)
+    assert_eq(usize(le16(blk.view(), 16)) % 8, 0)
+
+// -- exactly what each checksum covers ----------------------------------------------------------------------
+
+@test("each checksum is C(seed, identity as little-endian bytes ‖ covered bytes), built here from raw bytes")
+checksum_definitions()
+    val seed: u32 = 0x5EED_0004
+    var blk = filled_block(24)
+    // A group descriptor: the group as 4 bytes, then bytes 0..59.
+    val g = le_bytes(0x0102_0304, 4)
+    assert_eq(group_desc_crc(seed, 0x0102_0304, blk.view()[0..<64]),
+        crc_bitwise(seed, joined(g.view(), blk.view()[0..<60]).view()))
+    // A bitmap: the group as 4 bytes, then all 4096 bytes.
+    assert_eq(bitmap_crc(seed, 0x0102_0304, blk.view()), crc_bitwise(seed, joined(g.view(), blk.view()).view()))
+    // An inode: the number as 8 bytes, then bytes 0..251.
+    val n = le_bytes(0x0A0B_0C0D_0E0F_1011, 8)
+    assert_eq(inode_crc(seed, 0x0A0B_0C0D_0E0F_1011, blk.view()[0..<256]),
+        crc_bitwise(seed, joined(n.view(), blk.view()[0..<252]).view()))
+    // An owned block and a descriptor or revoke block: no identity, bytes 0..4091.
+    assert_eq(block_crc(seed, blk.view()), crc_bitwise(seed, blk.view()[0..<4092]))
+    // The journal superblock and the commit block: no identity, bytes 0..507.
+    assert_eq(sector_crc(seed, blk.view()), crc_bitwise(seed, blk.view()[0..<508]))
+    // The superblock: all ones, no identity, bytes 0..507.
+    assert_eq(superblock_crc(blk.view()), crc_bitwise(0xFFFF_FFFF, blk.view()[0..<508]))
+    // A tag: the sequence as 8 bytes, then the whole copy.
+    val s = le_bytes(0x0000_0001_0000_0002, 8)
+    assert_eq(tag_crc(seed, 0x0000_0001_0000_0002, blk.view()), crc_bitwise(seed, joined(s.view(), blk.view()).view()))
+
+@test("the last covered byte of each checksum matters and the first uncovered one does not")
+checksum_coverage_boundaries()
+    val seed: u32 = 0x5EED_0005
+    var blk = filled_block(25)
+    // The superblock: 507 covered, 512 outside (508..511 is the crc).
+    seal_superblock(blk.view())
+    blk.view()[507] ^= 0x80
+    assert(!verify_superblock(blk.view()))
+    blk.view()[507] ^= 0x80
+    blk.view()[512] ^= 0x80
+    assert(verify_superblock(blk.view()))
+    // A sector-sealed journal block: the same boundaries under csum_seed.
+    seal_sector(seed, blk.view())
+    blk.view()[507] ^= 1
+    assert(!verify_sector(seed, blk.view()))
+    blk.view()[507] ^= 1
+    blk.view()[512] ^= 1
+    assert(verify_sector(seed, blk.view()))
+    // A descriptor at 64 in its table block: 64 + 59 covered, 64 + 64 belongs to the next descriptor.
+    seal_group_desc(seed, 1, blk.view()[64..<128])
+    blk.view()[64 + 59] ^= 1
+    assert(!verify_group_desc(seed, 1, blk.view()[64..<128]))
+    blk.view()[64 + 59] ^= 1
+    blk.view()[128] ^= 1
+    blk.view()[63] ^= 1
+    assert(verify_group_desc(seed, 1, blk.view()[64..<128]))
+    // An inode at 256: 256 + 251 covered, 512 is the next inode.
+    seal_inode(seed, 2, blk.view()[256..<512])
+    blk.view()[256 + 251] ^= 1
+    assert(!verify_inode(seed, 2, blk.view()[256..<512]))
+    blk.view()[256 + 251] ^= 1
+    blk.view()[512] ^= 1
+    blk.view()[255] ^= 1
+    assert(verify_inode(seed, 2, blk.view()[256..<512]))
+    // An owned block: 4091 is the generation's last byte, covered; there is nothing outside.
+    set_tail(blk.view(), 9, 9)
+    seal_block(seed, blk.view())
+    blk.view()[4091] ^= 1
+    assert(!verify_block(seed, blk.view()))
+
+@test("a structure sealed with one seed fails under the seed of a filesystem with another uuid")
+checksum_seed_from_uuid()
+    var a = counting(16)
+    var b = counting(16)
+    b.view()[0] = 0xFF
+    val sa = csum_seed_of(a.view())
+    val sb = csum_seed_of(b.view())
+    assert(sa != sb)
+    var blk = filled_block(26)
+    seal_inode(sa, 11, blk.view()[0..<256])
+    assert(verify_inode(sa, 11, blk.view()[0..<256]))
+    assert(!verify_inode(sb, 11, blk.view()[0..<256]))
+
+// -- escaping -----------------------------------------------------------------------------------------------
+
+@test("a copy whose first three bytes are the magic's but whose fourth is not is logged as it is")
+escape_three_of_four()
+    var copy = filled_block(27)
+    put_le32(copy.view(), 0, JOURNAL_MAGIC)
+    copy.view()[3] = copy.view()[3] ^ 0x01
+    val before = copy_of(copy.view())
+    assert_eq(escape_copy(copy.view()), 0)
+    for i in 0..<BLOCK_SIZE
+        assert_eq(copy.view()[i], before.view()[i])
+    // And one whose last three bytes are the magic's but whose first is not.
+    put_le32(copy.view(), 0, JOURNAL_MAGIC ^ 0xFF)
+    assert_eq(escape_copy(copy.view()), 0)
+    assert_eq(le32(copy.view(), 0), JOURNAL_MAGIC ^ 0xFF)
+
+@test("the magic anywhere but at byte 0 is not escaped")
+escape_only_at_the_start()
+    var copy = new_block()
+    put_le32(copy.view(), 4, JOURNAL_MAGIC)
+    put_le32(copy.view(), 4092, JOURNAL_MAGIC)
+    assert_eq(escape_copy(copy.view()), 0)
+    assert_eq(le32(copy.view(), 4), JOURNAL_MAGIC)
+    assert_eq(le32(copy.view(), 0), 0)
+
+@test("escape, tag over the copy as logged, unescape: the round trip restores every byte and the tag verifies the logged form")
+escape_round_trip_with_tag()
+    val seed: u32 = 0x5EED_0006
+    var copy = filled_block(28)
+    put_le32(copy.view(), 0, JOURNAL_MAGIC)
+    val original = copy_of(copy.view())
+    var tagblk = new_block()
+    val tag = at[Tag](tagblk.view(), 24)
+    tag.block = 77
+    tag.flags = escape_copy(copy.view())
+    assert_eq(tag.flags, TAG_ESCAPED)
+    assert_eq(le32(copy.view(), 0), 0)
+    for i in 4..<BLOCK_SIZE
+        assert_eq(copy.view()[i], original.view()[i])
+    seal_tag(seed, 5, tag, copy.view())
+    // The tag covers the logged (zeroed) bytes, not the home bytes.
+    assert(verify_tag(seed, 5, tag, copy.view()))
+    assert(!verify_tag(seed, 5, tag, original.view()))
+    unescape_copy(copy.view(), tag.flags)
+    for i in 0..<BLOCK_SIZE
+        assert_eq(copy.view()[i], original.view()[i])
+    // A copy logged unescaped is left alone on replay, whatever its first word is.
+    var plain = new_block()
+    unescape_copy(plain.view(), 0)
+    assert_eq(le32(plain.view(), 0), 0)
+    unescape_copy(plain.view(), 0xFFFF_FFFE)
+    assert_eq(le32(plain.view(), 0), 0)

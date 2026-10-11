@@ -1,0 +1,105 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+// The RAM device at its edges: the first and the last block, one past the end, buffers one byte short and
+// one byte long, and exactly which error each refusal answers.
+
+private is_out_of_range(r: Result[unit, DeviceError]) -> bool
+    r match
+        Err(DeviceError.OutOfRange) -> true
+        _ -> false
+
+private is_bad_length(r: Result[unit, DeviceError]) -> bool
+    r match
+        Err(DeviceError.BadLength) -> true
+        _ -> false
+
+@test("block 0 and the last block are read and written whole; neither write reaches its neighbour")
+ramdev_first_and_last_block()
+    var dev = ram_device(5)
+    val first = filled_block(31)
+    val last = filled_block(32)
+    assert(dev.write(0, first.view()).is_ok())
+    assert(dev.write(4, last.view()).is_ok())
+    var out = new_block()
+    assert(dev.read(0, out.view()).is_ok())
+    for i in 0..<BLOCK_SIZE
+        assert_eq(out.view()[i], first.view()[i])
+    assert(dev.read(4, out.view()).is_ok())
+    for i in 0..<BLOCK_SIZE
+        assert_eq(out.view()[i], last.view()[i])
+    for b in [1, 3]
+        assert(dev.read(u64(b), out.view()).is_ok())
+        for x in out.view()
+            assert_eq(x, 0)
+
+@test("one past the end is OutOfRange for a read and a write, and so is the largest block number")
+ramdev_out_of_range()
+    var dev = ram_device(5)
+    var out = new_block()
+    val data = filled_block(33)
+    assert(is_out_of_range(dev.read(5, out.view())))
+    assert(is_out_of_range(dev.write(5, data.view())))
+    assert(is_out_of_range(dev.read(0xFFFF_FFFF_FFFF_FFFF, out.view())))
+    assert(is_out_of_range(dev.write(0xFFFF_FFFF_FFFF_FFFF, data.view())))
+    assert(is_out_of_range(dev.read(0x1_0000_0000, out.view())))
+    assert_eq(dev.reads(), 0)
+    assert_eq(dev.writes(), 0)
+    assert_eq(dev.log_len(), 0)
+
+@test("a buffer one byte short, one byte long or empty is BadLength, checked before the range")
+ramdev_bad_lengths()
+    var dev = ram_device(2)
+    var big = filled_block(34)
+    big.push(0)
+    for n in [0, 1, BLOCK_SIZE - 1, BLOCK_SIZE + 1]
+        val len = usize(n)
+        assert(is_bad_length(dev.read(0, big.view()[0..<len])))
+        assert(is_bad_length(dev.write(0, big.view()[0..<len])))
+        // Out of range and wrongly sized at once: the length is what is wrong first.
+        assert(is_bad_length(dev.write(9, big.view()[0..<len])))
+    assert_eq(dev.reads(), 0)
+    assert_eq(dev.writes(), 0)
+
+@test("a refused write leaves the device's contents exactly as they were")
+ramdev_refused_write_changes_nothing()
+    var dev = ram_device(2)
+    val before = filled_block(35)
+    assert(dev.write(1, before.view()).is_ok())
+    val other = filled_block(36)
+    assert(dev.write(1, other.view()[0..<BLOCK_SIZE - 1]).is_err())
+    assert(dev.write(2, other.view()).is_err())
+    var out = new_block()
+    assert(dev.read(1, out.view()).is_ok())
+    for i in 0..<BLOCK_SIZE
+        assert_eq(out.view()[i], before.view()[i])
+    assert_eq(dev.writes(), 1)
+    assert_eq(dev.log_len(), 1)
+
+@test("every flush is counted, writes between flushes carry the epoch, and a flush with nothing written still counts")
+ramdev_flush_epochs()
+    var dev = ram_device(3)
+    val d = filled_block(37)
+    assert(dev.flush().is_ok())
+    assert(dev.flush().is_ok())
+    assert(dev.write(0, d.view()).is_ok())
+    assert(dev.flush().is_ok())
+    assert(dev.write(1, d.view()).is_ok())
+    assert(dev.write(2, d.view()).is_ok())
+    assert_eq(dev.flushes(), 3)
+    assert_eq(dev.log_epoch(0), 2)
+    assert_eq(dev.log_epoch(1), 3)
+    assert_eq(dev.log_epoch(2), 3)
+    assert_eq(dev.writes(), 3)
+    assert_eq(dev.reads(), 0)
+
+@test("a device of no blocks refuses everything as out of range, and a one-block device has only block 0")
+ramdev_tiny_devices()
+    var none = ram_device(0)
+    assert_eq(none.blocks(), 0)
+    var out = new_block()
+    assert(is_out_of_range(none.read(0, out.view())))
+    var one = ram_device(1)
+    assert(one.read(0, out.view()).is_ok())
+    assert(is_out_of_range(one.read(1, out.view())))

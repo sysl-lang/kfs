@@ -2,7 +2,7 @@ module keel.kfshost
 @requires(os)
 
 import kfs.keel.kfs.{BlockDevice, FormatError, GeometryError, Mounted, OpenError, Options, RESERVED_DEFAULT, default_options}
-import kfs.keel.kfs.{find_backup, format, open}
+import kfs.keel.kfs.{find_backup, format, geometry, open}
 import sysl.buf.{Buf, buf}
 
 // The programs `mkfs.kfs` and `kfsdump` as functions of their arguments, so the tests run exactly what the
@@ -28,6 +28,11 @@ private option_value(args: []string, at: usize, flag: string) -> Result[u32, str
     if v > 0xFFFF_FFFE then return Err(s"mkfs.kfs: ${args[at]} is too large for ${flag}")
     Ok(u32(v))
 
+// An option value that may not be zero, since zero would mean "choose".
+private given(v: u32, refusal: GeometryError) -> Result[u32, string]
+    if v == 0 then return Err(s"mkfs.kfs: ${geometry_message(refusal)}")
+    Ok(v)
+
 geometry_message(e: GeometryError) -> string
     e match
         TooSmall -> "the filesystem would have fewer than two groups (the smallest is 3205 blocks with the defaults)"
@@ -36,6 +41,7 @@ geometry_message(e: GeometryError) -> string
         BadBytesPerInode -> "bytes per inode must be at least 4096"
         BadReservedPercent -> "the reserved percentage must be at most 100"
         BadJournalBlocks -> "the journal must be 1024 to 16384 blocks"
+        TooLarge -> "the filesystem is too large: its descriptor table would not leave a copy group 64 data blocks"
 
 format_message(e: FormatError) -> string
     e match
@@ -64,12 +70,19 @@ run_mkfs(args: []string, entropy: []const u8, now: i64) -> Result[string, string
     var i: usize = 2
     while i < args.len
         val flag = args[i]
-        if flag == "-i" then o.bytes_per_inode = option_value(args, i + 1, flag)?
+        // A zero in `Options` means "choose", so a zero typed for -i, -g or -j is refused here rather than
+        // silently taken as the default.
+        if flag == "-i" then o.bytes_per_inode = given(option_value(args, i + 1, flag)?, GeometryError.BadBytesPerInode)?
         elif flag == "-m" then o.reserved_percent = option_value(args, i + 1, flag)?
-        elif flag == "-g" then o.blocks_per_group = option_value(args, i + 1, flag)?
-        elif flag == "-j" then o.journal_blocks = option_value(args, i + 1, flag)?
+        elif flag == "-g" then o.blocks_per_group = given(option_value(args, i + 1, flag)?, GeometryError.BadBlocksPerGroup)?
+        elif flag == "-j" then o.journal_blocks = given(option_value(args, i + 1, flag)?, GeometryError.BadJournalBlocks)?
         else return Err(s"mkfs.kfs: unknown option '${flag}'\n${MKFS_USAGE}")
         i += 2
+
+    // The shape is settled before the image is touched, so a refused size leaves an existing file alone.
+    geometry(blocks, o) match
+        Ok(_) -> ()
+        Err(e) -> return Err(s"mkfs.kfs: ${geometry_message(e)}")
 
     var dev = create_image(path, blocks) match
         Ok(d) -> d

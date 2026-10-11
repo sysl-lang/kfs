@@ -78,6 +78,15 @@ check_superblock(sb: *Superblock, device_blocks: u64) -> Result[unit, OpenError]
     if sb.inode_count != u64(groups) * u64(ipg) || sb.root_ino != ROOT_INO || sb.first_ino != u16(FIRST_INO)
         return Err(OpenError.BadGeometry)
     if sb.journal_blocks < 2 || sb.max_transaction != sb.journal_blocks / 4 then return Err(OpenError.BadGeometry)
+    // The layout has to hold together before any group's data area is computed, or a corrupt count wraps
+    // it: a full copy group keeps a data area of 64 blocks, and so does a shorter last group, besides the
+    // journal when it is the journal's (section 4's last-group rule, as the formatter applies it).
+    if !copy_group_fits(u64(groups), bpg, ipg) then return Err(OpenError.BadGeometry)
+    val last_len = sb.blocks - (1 + u64(groups - 1) * u64(bpg))
+    if last_len < u64(bpg)
+        val journal_here: u64 = if groups / 2 == groups - 1 then u64(sb.journal_blocks) else 0
+        if last_len < copy_meta_blocks(u64(groups), ipg) + u64(LAST_GROUP_MIN_DATA) + journal_here
+            return Err(OpenError.BadGeometry)
     val g = geometry_of(sb)
     val jg = g.journal_group()
     if sb.journal_start != g.data_start(jg) || g.data_blocks(jg) < sb.journal_blocks then return Err(OpenError.BadGeometry)
@@ -108,8 +117,10 @@ open[D: BlockDevice](dev: *D) -> Result[Mounted, OpenError]
     Ok(Mounted(*sb, g, seed, descs))
 
 // The backup superblock of section 5: try block `1 + b` for each allowed `blocks_per_group` `b` (2048,
-// 4096, ... 32768) and take the first that passes its checksum, carries the magic and says it is group 1's
-// copy for that `b`.
+// 4096, ... 32768) and take the first that passes its checksum, carries the magic and sits where its own
+// geometry puts a copy. That is group 1's copy when `b` is its group size, and group G - 1's when `b` is
+// G - 1 of its groups, so a filesystem of 3, 5, 9 or 17 groups still has a backup to find after group 1's
+// is lost too.
 find_backup[D: BlockDevice](dev: *D) -> Option[Backup]
     var blk = block_buf()
     var b = BLOCKS_PER_GROUP_MIN
@@ -117,7 +128,15 @@ find_backup[D: BlockDevice](dev: *D) -> Option[Backup]
         val at_block = 1 + u64(b)
         if at_block < dev.blocks() && dev.read(at_block, blk.view()).is_ok()
             val sb: *Superblock = at(blk.view(), 0)
-            if verify_superblock(blk.view()) && sb.magic == SUPER_MAGIC && sb.blocks_per_group == b
+            if verify_superblock(blk.view()) && sb.magic == SUPER_MAGIC && copy_at(sb, b)
                 return Some(Backup(at_block, *sb))
         b = b * 2
     None
+
+// Whether a superblock found at `1 + b` is where its own geometry keeps a copy: `b` is a whole number of
+// its groups, and that group is 1 or the last.
+private copy_at(sb: *Superblock, b: u32) -> bool
+    val bpg = sb.blocks_per_group
+    if bpg == 0 || b % bpg != 0 then return false
+    val g = b / bpg
+    g == 1 || g + 1 == sb.group_count

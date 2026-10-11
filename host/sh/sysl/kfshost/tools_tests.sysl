@@ -72,7 +72,8 @@ mkfs_refusals()
     assert(mkfs_failure([path, "8192", "-i", "many"]).contains("'many' is not a number"))
     assert(mkfs_failure([path, "lots"]).contains("'lots' is not a number of blocks"))
     assert(mkfs_failure([path]).contains("usage: mkfs.kfs"))
-    assert(fs.remove_file(path).is_ok())
+    // Every refusal came before the image was made.
+    assert(!fs.exists(path))
 
 @test("kfsdump prints the superblock and the descriptors, and each on its own")
 dump_superblock_and_groups()
