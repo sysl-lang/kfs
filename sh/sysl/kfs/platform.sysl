@@ -1,0 +1,69 @@
+module keel.kfs
+
+// The platform: what KFS needs from whoever runs it, besides a block device (kfs/SPEC.md section 27,
+// "Where things live"). Three things, kept as small as the algorithms allow:
+//
+// - **Locks**, named by `LockId` rather than held as objects, so the package never stores a lock and
+//   the same code runs over the kernel's sleeping `Mutex`es and spinning `IrqLock`s and over the host's
+//   no-ops. Which kind each one is, and the order they are taken in, is section 19's table; `rank`
+//   below is that order, and the host implementation checks it on every acquisition.
+// - **A clock**, for the times an allocation stamps on a new inode.
+// - **The committer hook**: asked to commit the running transaction, the platform either wakes its
+//   commit thread (the kernel's `kfs-commit`) or answers that there is none, and the caller commits
+//   inline (the host).
+//
+// Plus one exit for a bug in KFS itself (`fatal`): the kernel stops, a host test fails.
+
+// Every lock of section 19 that the package takes. An inode's lock and the rename lock are taken by
+// the code above the package, so they have no names here yet.
+enum LockId
+    // `orphans.lock`: the orphan list (sleeping).
+    Orphans
+    // `group[g].lock`: group g's bitmaps, descriptor fields, pending frees and cursor (sleeping).
+    // Never two at once.
+    Group(g: u32)
+    // `buffer.lock`: one metadata buffer's bytes and journal state (sleeping). The buffer is named by
+    // the block it holds.
+    Buffer(block: u64)
+    // `journal.lock`: the running and committing transactions' records (spinning, a leaf).
+    Journal
+    // `cache.lock`: the buffer cache's index (spinning, a leaf).
+    Cache
+
+// Where a lock sits in section 19's order: a lock may be taken only while every lock held ranks
+// strictly lower. Rules 1-3 (the rename and inode locks) and rule 4 (opening a handle) are above
+// everything here; the leaves share rank 8 and none may be held while taking another.
+rank(l: LockId) -> u32
+    l match
+        LockId.Orphans -> 5
+        LockId.Group(_) -> 6
+        LockId.Buffer(_) -> 7
+        LockId.Journal -> 8
+        LockId.Cache -> 8
+
+// A moment, as an inode stores one: signed seconds since the epoch and nanoseconds.
+struct Time
+    sec: i64
+    nsec: u32
+
+// A bug in KFS, reported to the platform before the call that found it fails.
+enum Fatal
+    // Operation `op` added more buffers to its handle than the `credits` it opened with (section 14,
+    // "Credits are checked, not trusted").
+    CreditOverrun(op: string, credits: u32)
+
+trait Platform
+    // Take and release a lock. Taking may sleep for a sleeping lock and spins for a leaf.
+    lock(*self, l: LockId)
+    unlock(*self, l: LockId)
+
+    // The time now.
+    now(*self) -> Time
+
+    // Ask for the running transaction to be committed. True when there is no commit thread and the
+    // caller must commit it itself, now; false when a commit thread was woken and will do it.
+    wake_committer(*self) -> bool
+
+    // A bug in KFS. The kernel stops here; a host test fails here unless it is the test of this very
+    // failure, in which case the call returns and the operation answers `FsError.Bug`.
+    fatal(*self, f: Fatal)
