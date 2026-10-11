@@ -31,13 +31,13 @@ const FIRST_INO: u64 = 11
 const ROOT_INO: u64 = 2
 const EXTENT_ROOT_SLOTS: usize = 7
 const EXTENT_NODE_SLOTS: usize = 254
-const EXTENT_MAX_DEPTH: usize = 4
+const EXTENT_MAX_DEPTH: usize = 5
 const EXTENT_MAX_LEN: u32 = 32768
 const DIR_MAX_LEVELS: usize = 3
 const DIR_INDEX_SLOTS: usize = 254
 const JOURNAL_MIN_BLOCKS: u32 = 1024
 const JOURNAL_MAX_BLOCKS: u32 = 16384
-const MAX_OP_CREDITS: u32 = 192
+const MAX_OP_CREDITS: u32 = 224
 const COMMIT_INTERVAL_SECONDS: u32 = 5
 
 // A file's logical blocks are 32-bit: block numbers 0 ... 2^32 - 1 (section 3, "Maximum sizes").

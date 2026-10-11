@@ -147,13 +147,13 @@ the blocks it commits.
 | `ROOT_INO` | 2 | |
 | `EXTENT_ROOT_SLOTS` | 7 | extent entries in the inode |
 | `EXTENT_NODE_SLOTS` | 254 | entries in an extent-tree block |
-| `EXTENT_MAX_DEPTH` | 4 | levels of extent blocks below the inode |
+| `EXTENT_MAX_DEPTH` | 5 | levels of extent blocks below the inode |
 | `EXTENT_MAX_LEN` | 32768 | blocks in one extent (never more than a group's data area) |
 | `DIR_MAX_LEVELS` | 3 | index levels in a hashed directory, the root included |
 | `DIR_INDEX_SLOTS` | 254 | entries in a directory index block |
 | `JOURNAL_MIN_BLOCKS` | 1024 | 4 MiB |
 | `JOURNAL_MAX_BLOCKS` | 16384 | 64 MiB |
-| `MAX_OP_CREDITS` | 192 | the largest operation that is never split (section 14) |
+| `MAX_OP_CREDITS` | 224 | the largest operation that is never split (section 14) |
 | `COMMIT_INTERVAL` | 5 s | the longest a running transaction stays open |
 
 **Maximum sizes.** Block numbers are 64-bit everywhere, so the volume's limit is the group count
@@ -523,10 +523,13 @@ this one — fails its check.
 - Every entry of the child of index entry *i* maps logical blocks in `[logical_i, logical_{i+1})` (the
   last entry's range is open above).
 - All leaves are at the same depth; the root's `depth` is the tree's height, at most
-  `EXTENT_MAX_DEPTH`. A tree of depth 4 with full nodes maps 7 × 254⁴ ≈ 2.9 × 10¹⁰ extents, more than
-  the 2³² blocks a file can have, so no file can outgrow it.
+  `EXTENT_MAX_DEPTH`. A tree of depth 5 with full nodes maps 7 × 254⁵ ≈ 7.4 × 10¹² extents, and one
+  whose nodes are all half full (the least a split leaves: ≥ 127 entries per block, ≥ 3 in the root)
+  maps 3 × 127⁵ ≈ 1.0 × 10¹¹ extents — each more than the 2³² ≈ 4.3 × 10⁹ blocks a file can have, so no
+  file can outgrow it. (At depth 4 the half-full figure is 3 × 127⁴ ≈ 7.8 × 10⁸, below 2³², which is
+  why the limit is 5, as ext4's is.)
 - **`max` may be smaller than the capacity.** Implementations write the capacity; the host tests
-  format trees with small `max` so that depth-4 trees are exercised on a RAM disk. `fsck.kfs` accepts
+  format trees with small `max` so that depth-5 trees are exercised on a RAM disk. `fsck.kfs` accepts
   any `max` from 1 to the capacity.
 - Adjacent extents that are contiguous both logically and physically, with equal flags, may be merged;
   the format does not require it.
@@ -567,12 +570,12 @@ this one — fails its check.
   capacity, or a test's smaller value; the root keeps the `max` its inode was created with. Every new
   node is allocated with section 17's node goal (the inode's group) before anything changes, so a
   refusal leaves the tree as it was.
-- **A fifth level is refused, not assumed impossible.** The figure above counts *full* nodes; nodes
-  that split into halves can be half full, and a tree whose nodes are all half full holds about
-  7 × 127⁴ ≈ 1.8 × 10⁹ extents at depth 4 — fewer than the 2³¹ one-block extents a pathologically
-  fragmented 16 TiB file could have. An insert (or a punch's split, or a conversion) whose splits would
-  reach a full root at depth 4 answers `EFBIG` and changes nothing. With the small `max` of the host
-  tests it is easily reached, and is tested.
+- **A sixth level is refused, not assumed impossible.** Nodes that split into halves can be half
+  full, but even a depth-5 tree of them (3 × 127⁵ ≈ 1.0 × 10¹¹ extents) holds more than the 2³²
+  one-block extents a pathologically fragmented 16 TiB file could have, so a real file never needs one.
+  An insert (or a punch's split, or a conversion) whose splits would reach a full root at depth 5
+  answers `EFBIG` and changes nothing. With the small `max` of the host tests it is easily reached, and
+  is tested.
 - **`EXTENT_MAX_LEN` is never the binding limit.** A group's data area is at most
   `blocks_per_group − 3` < 32768 blocks, and an extent lies in one data area, so the data area bounds
   every extent first; `EXTENT_MAX_LEN` is what the 16-bit field can carry. Merging is bounded by both.
@@ -839,30 +842,30 @@ some committed transaction, and no metadata points at a block whose data was nev
 
 ### Credits
 
-The unit costs, with `D_X = EXTENT_MAX_DEPTH = 4` and `D_H = DIR_MAX_LEVELS = 3`:
+The unit costs, with `D_X = EXTENT_MAX_DEPTH = 5` and `D_H = DIR_MAX_LEVELS = 3`:
 
 | name | blocks | what it covers |
 |---|---|---|
 | `C_INODE` | 1 | one inode-table block |
 | `C_GROUP` | 2 | one group's bitmap and its descriptor-table block |
-| `C_EXT` | 4 × (D_X + 1) = 20 | one extent insertion or split, with every node it may split or add and their groups |
-| `C_ALLOC` | `C_GROUP + C_EXT` = 22 | allocate one physical run and map it |
-| `C_DIR_ADD` | D_H + 1 + (D_H + 1) × `C_ALLOC` = 92 | insert a name: index path, leaf, and up to D_H + 1 new blocks |
-| `C_DIR_DEL` | D_H + 2 + (D_H + 1) × (`C_GROUP` + `C_EXT`) + 1 = 94 | remove a name, with merges and freed blocks and their revoke |
+| `C_EXT` | 4 × (D_X + 1) = 24 | one extent insertion or split, with every node it may split or add and their groups |
+| `C_ALLOC` | `C_GROUP + C_EXT` = 26 | allocate one physical run and map it |
+| `C_DIR_ADD` | D_H + 1 + (D_H + 1) × `C_ALLOC` = 108 | insert a name: index path, leaf, and up to D_H + 1 new blocks |
+| `C_DIR_DEL` | D_H + 2 + (D_H + 1) × (`C_GROUP` + `C_EXT`) + 1 = 110 | remove a name, with merges and freed blocks and their revoke |
 | `C_SB` | 1 | the superblock (orphan list head) |
 
 Per operation (section 18 says what each writes):
 
 | operation | credits |
 |---|---|
-| create, `mknodat`, `mkdirat`, inline `symlinkat` | `C_GROUP + 2·C_INODE + C_DIR_ADD` = 96 |
-| `symlinkat` with a block | 96 + `C_ALLOC` = 118 |
-| `linkat` | `2·C_INODE + C_DIR_ADD` = 94 |
-| `unlinkat`, `rmdir` | `3·C_INODE + C_DIR_DEL + C_SB` = 98 |
-| `renameat2` (any form) | `4·C_INODE + C_DIR_ADD + C_DIR_DEL + C_SB` = 191 |
-| one write chunk (≤ 8 extents allocated) | `C_INODE + 8·C_ALLOC` = 177 |
+| create, `mknodat`, `mkdirat`, inline `symlinkat` | `C_GROUP + 2·C_INODE + C_DIR_ADD` = 112 |
+| `symlinkat` with a block | 112 + `C_ALLOC` = 138 |
+| `linkat` | `2·C_INODE + C_DIR_ADD` = 110 |
+| `unlinkat`, `rmdir` | `3·C_INODE + C_DIR_DEL + C_SB` = 114 |
+| `renameat2` (any form) | `4·C_INODE + C_DIR_ADD + C_DIR_DEL + C_SB` = 223 |
+| one write chunk (≤ 8 extents allocated) | `C_INODE + 8·C_ALLOC` = 209 |
 | one truncate step (≤ 16 extents, ≤ 4 nodes freed) | ≤ 64 |
-| one punch step (a truncate step that may split one extent) | ≤ 64 + `C_EXT` + `C_GROUP` = 86 |
+| one punch step (a truncate step that may split one extent) | ≤ 64 + `C_EXT` + `C_GROUP` = 90 |
 | `setattr` (mode, owner, times, size up) | `C_INODE` = 1 |
 | `setxattr`/`removexattr` | `C_INODE + C_GROUP + 2` = 5 |
 
@@ -875,7 +878,10 @@ every run rather than the unlucky one. A handle declares a buffer (`write_access
 lock and before any byte of it changes, which is where step 3's frozen copy is taken. The tests of every stage run with this check, so a
 credit undercount shows up as a failure instead of as a transaction that overflows the log.
 
-`MAX_OP_CREDITS` = 192 bounds every operation that is never split. **Operations whose worst case is
+`MAX_OP_CREDITS` = 224 bounds every operation that is never split; the largest, `renameat2`, needs 223.
+The minimum journal's `max_transaction` is 1024 / 4 = 256, which holds 224 credits plus the overhead of
+a transaction that size — one descriptor block (254 tags), one revoke block (508 entries) and the commit
+block, 3 in all — with 29 to spare. **Operations whose worst case is
 unbounded** — writing a large buffer, truncating or deleting a large fragmented file, preallocating a
 large range — are split into steps of bounded credits, each its own handle; section 18 says how each is
 made crash-safe across its steps.
@@ -1735,7 +1741,7 @@ the commit callback; counts and bitmap checksums always agree with the bitmaps.
 Builds: lookup, insert with splits and growth, range removal with splits, shrink and root collapse,
 unwritten conversion, optional merging.
 Tests: a model-based property test — random inserts, removals and conversions against a reference map
-from logical to physical blocks, with node `max` set small (2–4) so trees reach depth 4; holes read as
+from logical to physical blocks, with node `max` set small (2–4) so trees reach depth 5; holes read as
 unmapped; the 2³² limit; node checksums, owner and generation verified on every read (a node from
 another inode, or from a previous generation, is refused); every node's entries sorted and inside its
 parent's range after every step.

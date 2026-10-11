@@ -472,14 +472,42 @@ section_three_limits()
     assert_eq(ROOT_INO, 2)
     assert_eq(EXTENT_ROOT_SLOTS, 7)
     assert_eq(EXTENT_NODE_SLOTS, 254)
-    assert_eq(EXTENT_MAX_DEPTH, 4)
+    assert_eq(EXTENT_MAX_DEPTH, 5)
     assert_eq(EXTENT_MAX_LEN, 32768)
     assert_eq(DIR_MAX_LEVELS, 3)
     assert_eq(DIR_INDEX_SLOTS, 254)
     assert_eq(JOURNAL_MIN_BLOCKS, 1024)
     assert_eq(JOURNAL_MAX_BLOCKS, 16384)
-    assert_eq(MAX_OP_CREDITS, 192)
+    assert_eq(MAX_OP_CREDITS, 224)
     assert_eq(COMMIT_INTERVAL_SECONDS, 5)
     // One bitmap block's bits bound a group.
     assert_eq(usize(BLOCKS_PER_GROUP_MAX), BLOCK_SIZE * 8)
     assert_eq(usize(INODES_PER_GROUP_MAX), BLOCK_SIZE * 8)
+
+@test("the credit costs of section 14 follow from the extent depth, and the largest operation fits a transaction")
+section_fourteen_credits()
+    val d_x = u32(EXTENT_MAX_DEPTH)
+    val d_h = u32(DIR_MAX_LEVELS)
+    assert_eq(C_EXT, 24)
+    assert_eq(C_EXT, 4 * (d_x + 1))
+    assert_eq(C_ALLOC, 26)
+    val dir_add = d_h + 1 + (d_h + 1) * C_ALLOC
+    val dir_del = d_h + 2 + (d_h + 1) * (C_GROUP + C_EXT) + 1
+    assert_eq(dir_add, 108)
+    assert_eq(dir_del, 110)
+    assert_eq(C_GROUP + 2 * C_INODE + dir_add, 112)
+    assert_eq(2 * C_INODE + dir_add, 110)
+    assert_eq(3 * C_INODE + dir_del + 1, 114)
+    val rename = 4 * C_INODE + dir_add + dir_del + 1
+    assert_eq(rename, 223)
+    assert_eq(C_INODE + 8 * C_ALLOC, 209)
+    assert_eq(64 + C_EXT + C_GROUP, 90)
+    // Every operation that is never split fits MAX_OP_CREDITS, and the largest is rename.
+    assert(rename <= MAX_OP_CREDITS)
+    assert(C_INODE + 8 * C_ALLOC <= MAX_OP_CREDITS)
+    assert(C_GROUP + 2 * C_INODE + dir_add + C_ALLOC <= MAX_OP_CREDITS)
+    // A transaction is a quarter of the minimum journal; it holds MAX_OP_CREDITS plus one descriptor
+    // block, one revoke block and the commit block.
+    val max_transaction = JOURNAL_MIN_BLOCKS / 4
+    assert_eq(max_transaction, 256)
+    assert(MAX_OP_CREDITS + 3 <= max_transaction)

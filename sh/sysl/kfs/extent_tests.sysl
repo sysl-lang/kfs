@@ -415,8 +415,8 @@ leaf_split()
     assert_eq(entry(rb, loc.offset + 112, 1).logical, 6)
     assert_eq(inode_of(&fs, ino).blocks, 5 + 2)
 
-@test("splits reach every level up to depth 4, each within C_EXT credits, and a fifth level is refused")
-splits_to_depth_four()
+@test("splits reach every level up to depth 5, each within C_EXT credits, and a sixth level is refused")
+splits_to_depth_five()
     var dev = standard_device()
     var fs = mounted_fs(&dev)
     val ino = file_inode(&fs)
@@ -438,7 +438,7 @@ splits_to_depth_four()
             val after = walk(&fs, ino)
             assert_eq(after.extents.len(), before.extents.len())
             assert_eq(after.nodes.len(), before.nodes.len())
-            assert_eq(after.depth, 4)
+            assert_eq(after.depth, 5)
             assert_eq(used_blocks(&fs), used)
             assert_eq(fs.plat.held(), 0)
             give_back(&fs, r)
@@ -449,11 +449,11 @@ splits_to_depth_four()
             reached.push(d)
             depth = d
         i += 1
-    assert_eq(reached.len(), 4)
+    assert_eq(reached.len(), 5)
     for k in 0..<reached.len()
         assert_eq(reached[k], u16(k) + 1)
-    // Depth 3 holds at most 2 x 2^3 extents; depth 4 was needed for more, and held them all.
-    assert(i > 16)
+    // Depth 4 holds at most 2 x 2^4 extents; depth 5 was needed for more, and held them all.
+    assert(i > 32)
     assert(most <= C_EXT)
     val s = walk(&fs, ino)
     assert_eq(u64(s.extents.len()), i)
@@ -754,6 +754,34 @@ collapse_from_depth_four()
     assert_eq(s.nodes.len(), 0)
     assert_eq(inode_of(&fs, ino).blocks, 2)
     assert(!is_hole(ok_map(lookup(&fs, ino, 2))))
+
+@test("removing back down from depth 5 frees every emptied node and collapses to an inline root")
+collapse_from_depth_five()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val baseline = used_blocks(&fs)
+    val t = small_tree(&fs, ino, 2, 2)
+    var count: u64 = 0
+    while ok_depth(depth_of(&fs, ino)) < 5
+        fill(&fs, t, 2 * count, 1)
+        count += 1
+    assert_eq(ok_depth(depth_of(&fs, ino)), 5)
+    var last: u16 = 5
+    var k = count - 1
+    while k >= 2
+        assert_eq(ok_u64(unmap(&fs, t, 2 * k, 2 * k + 1)), 2 * k)
+        val s = walk(&fs, ino)
+        assert(s.depth <= last)
+        last = s.depth
+        assert_eq(inode_of(&fs, ino).blocks, k + u64(s.nodes.len()))
+        assert_eq(used_blocks(&fs), baseline + k + u64(s.nodes.len()))
+        k -= 1
+    val s = walk(&fs, ino)
+    assert_eq(s.depth, 0)
+    assert_eq(s.root_count, 2)
+    assert_eq(s.nodes.len(), 0)
+    assert_eq(inode_of(&fs, ino).blocks, 2)
 
 @test("with real node sizes, eight extents back to seven moves them back into the inode")
 collapse_real_sizes()
@@ -1086,7 +1114,7 @@ private le_bytes(v: u64, n: usize) -> Buf[u8]
 refused_root()
     var dev = standard_device()
     val built = build(&dev)
-    rewrite_inode(&dev, built.ino, 112 + 8, le_bytes(5, 2).view())
+    rewrite_inode(&dev, built.ino, 112 + 8, le_bytes(u64(EXTENT_MAX_DEPTH) + 1, 2).view())
     var fs = mounted_fs(&dev)
     val deep = lookup(&fs, built.ino, 2)
     assert_eq(failure(deep), 100 + 5)
@@ -1376,11 +1404,11 @@ private run_model(seed: u64, root_max: u16, node_max: u16, low: u64, high: u64, 
         panic("the extent tree disagrees with the model after a remount")
     out
 
-@test("model: nodes of 2 under a root of 2, the fixed seed — depth 4 reached, the fifth level refused")
+@test("model: nodes of 2 under a root of 2, the fixed seed — depth 5 reached, the sixth level refused")
 model_nodes_of_two()
-    val o = run_model(0x4B46_5334, 2, 2, 72, 16, 4000)
+    val o = run_model(0x4B46_5334, 2, 2, 120, 16, 6000)
     stats(o)
-    assert_eq(o.deepest, 4)
+    assert_eq(o.deepest, 5)
     assert(o.refused > 0)
     assert(o.inserts > 300)
     assert(o.removes > 300)
@@ -1392,16 +1420,16 @@ model_nodes_of_three()
     for seed in [1u64, 0xDEAD_BEEF]
         val o = run_model(seed, 3, 3, 300, 32, 3000)
         stats(o)
-        assert_eq(o.deepest, 4)
+        assert_eq(o.deepest, 5)
         assert(o.inserts > 500)
         assert(o.converts > 100)
 
 @test("model: nodes of 4 under a root of 2, two seeds")
 model_nodes_of_four()
     for seed in [7u64, 0x5EED_0004]
-        val o = run_model(seed, 2, 4, 400, 32, 3000)
+        val o = run_model(seed, 2, 4, 1200, 32, 6000)
         stats(o)
-        assert(o.deepest >= 3)
+        assert_eq(o.deepest, 5)
         assert(o.inserts > 500)
 
 @test("model: real node sizes, a root of 7, one seed")
