@@ -976,7 +976,12 @@ left the log. Replay writes T1's copy of the directory block over the file's dat
 replay skips every copy of *b* in a transaction no newer than T2.
 
 - **Journaling a block cancels its revoke in the same transaction** (a block freed and reused as
-  metadata in one transaction is logged, not revoked).
+  metadata in one transaction is logged, not revoked). The other order — a block journaled and then
+  freed in one transaction — drops the copy: the transaction revokes the block and does not log it.
+- A freed block's buffer is pinned until the revoking transaction commits and is then dropped unwritten:
+  written home after the block was reallocated as file data, it would overwrite the data, and dropped
+  before the revoke is durable, a crash would bring back a state in which the block is live but stale
+  at home.
 - A revoke record is only needed while some committed transaction still in the log holds a copy of
   the block; an implementation may simply revoke every freed metadata block.
 - A revoke lives in a transaction newer than every copy it cancels, and the log is checkpointed oldest
@@ -996,12 +1001,25 @@ replay skips every copy of *b* in a transaction no newer than T2.
    otherwise) and revoke blocks to the log; wait for completion.
 5. **Flush.**
 6. Write the commit block; wait; **flush**.
-7. T is committed: blocks T freed become allocatable (section 17); T's buffers join T's checkpoint list
-   unless a newer transaction has modified them since (then they join that one's, when it commits).
+7. T is committed: blocks T freed become allocatable (section 17); T's buffers join T's checkpoint list,
+   leaving any older transaction's (T's copy is the newest committed one). A buffer a newer transaction
+   has modified since still joins T's list, but stays pinned: checkpointing T then commits that
+   transaction first (below), after which the buffer has moved on to its list. (It may not simply skip
+   T's list: T could then leave the log while the buffer's committed bytes were nowhere but in T.) A
+   buffer T freed is dropped from the cache unwritten and from every checkpoint list.
 
 The flush in step 5 is what makes the commit block a promise: without it the device could make the
 commit durable before the descriptors and data it vouches for. The flush in step 6 makes the commit
 itself durable before `fsync` returns.
+
+**When the log is empty on the disk** (`start = 0`), step 4 also writes the journal superblock with
+`start` = T's first block and `start_seq` = T's sequence, so the step-5 flush makes it durable with the
+descriptors; otherwise recovery would never look at T. Transactions follow each other in consecutive log
+blocks, so once `start` names the oldest, the scan finds every later one.
+
+**A transaction that logs nothing** — no copies and no revokes, at most ordered data — takes no sequence
+number: its commit is steps 2 and a flush, and the next transaction keeps the number. The sequences in the
+log therefore never have a gap, which recovery's scan treats as the end.
 
 ### Checkpoint
 
@@ -1024,6 +1042,18 @@ it must write home is held by it (that commit needs no new space: it was reserve
 waits for space, and nothing in the cycle "commit needs a checkpoint needs a commit" can close. A
 transaction never exceeds `max_transaction`, a quarter of the log, so checkpointing every older
 transaction always makes room. Unmount commits, checkpoints everything, and leaves `start = 0`.
+
+**The reservation, exactly.** A transaction of `B` copies and `R` revoke records takes
+`blocks(B, R) = B + ⌈B / 254⌉ + ⌈R / 508⌉ + 1` log blocks (0 for an empty one). The running
+transaction's reservation is `blocks(B, R)` with `B` = the buffers it holds plus the credits its open
+handles have not yet spent on new buffers, and `R` = its revoke records plus the credits its open
+handles have not yet spent on revokes — a handle may revoke at most as many blocks as its credits,
+checked as credits are (more is a bug, fatal at once). Closing a handle gives its
+unspent credits back. A handle of `c` credits joins only if `blocks(B + c, R + c) ≤ max_transaction`
+(otherwise the running transaction closes and the handle waits for the next) and the log's committed
+blocks, the committing transaction's `blocks` and that reservation together fit in the log. A handle
+asking for more than any transaction can hold — more than 253 credits in the smallest journal, where
+`blocks(253, 253) = 256` — is refused (`EINVAL`, a bug in the credit table).
 
 **The buffer-cache rule that follows**: a metadata buffer modified by a transaction that has not
 committed is **pinned** — it may not be written to its home block or evicted. A committed,
@@ -1048,7 +1078,10 @@ Mount runs recovery when the journal superblock's `start` is not 0. `fsck.kfs` r
    valid checksum, continue; if a commit block of `seq` with a valid checksum and `blocks` equal to the
    blocks seen since the transaction began, transaction `seq` is complete — `seq += 1`. Anything else
    ends the scan. Positions advance modulo the log (block `journal_blocks − 1` is followed by block 1).
-   The last complete transaction is `end_seq − 1`; an incomplete one after it is ignored.
+   The last complete transaction is `end_seq − 1`; an incomplete one after it is ignored. The scan reads
+   at most one lap of the log. A descriptor, revoke or commit block that fails its checksum ends the
+   scan like any other non-matching block: the device model cannot tear one inside a committed
+   transaction, so it is treated as the tail of a crash, not as corruption.
 3. **Revoke pass.** For every revoke record in transactions `start_seq … end_seq − 1`, record
    `revoked[b] = max(revoked[b], seq)`.
 4. **Replay pass.** For every transaction in order, for every tag: if `revoked[b] ≥ seq`, skip it;
@@ -1061,6 +1094,19 @@ Mount runs recovery when the journal superblock's `start` is not 0. `fsck.kfs` r
 
 Recovery is **idempotent**: a crash during it leaves the journal superblock unchanged until step 5, and
 replaying a copy twice writes the same bytes twice.
+
+**A bad copy, exactly.** Every copy of a transaction is checked against its tag — and its home block
+against the filesystem: not block 0, not past the end, not in the journal — before any of it is written,
+so a transaction is replayed whole or not at all. At the first transaction that fails, replay stops:
+the transactions before it are replayed, it and every later one are not, and revokes are taken only
+from the transactions replayed (a later revoke must not cancel a copy whose replacement is never
+written). Step 5 then flushes but leaves `start` and `start_seq` as they were — the log stays for
+`fsck.kfs` — and records `EIO` in `error`. `ERROR` itself cannot be written yet (the log is not empty,
+section 5), so the mount is read-only on the strength of the recovery's answer; every later mount finds
+the same log, stops at the same place and is read-only too.
+
+After recovery the log is empty and the next transaction is written from block 1, with `start_seq`. Older
+blocks further on carry smaller sequences, so a scan never mistakes them for the next transaction.
 
 **Orphan processing is not part of recovery.** Mount runs it after its own direct superblock write
 (section 18, "Mount and unmount"), because it runs in ordinary transactions and direct writes of block 1
@@ -1344,7 +1390,8 @@ One transaction each: the inode (and the xattr block). `utimensat` sets `atime`/
 
 **Mount**, in this order: read and check the superblock and descriptors; refuse unknown incompat
 features; recover (section 15: replay, then `error` → `ERROR`); read-only for unknown ro_compat
-features, for `ERROR`, or for a device without flush; recompute totals; clear `CLEAN`, `mount_count`
+features, for `ERROR`, for a log recovery had to stop in (section 15, "A bad copy"), or for a device
+without flush; recompute totals; clear `CLEAN`, `mount_count`
 + 1, `mount_time` (direct write, flush) — the last direct write before transactions start; then process
 the orphan list (section 16) in ordinary transactions. A read-only mount skips the last two (the orphan
 list waits for a read-write mount or `fsck.kfs`).
@@ -1492,6 +1539,9 @@ know. `fsck.kfs` refuses to repair a filesystem with unknown incompat or ro_comp
 
 A checksum failure in the kernel makes the call answer `EIO`, aborts the journal, records the error in
 the journal superblock (section 5 says why not in the superblock) and makes the filesystem read-only.
+So does every other impossible structure the code finds — a bitmap that disagrees with its descriptor,
+a free of a block or inode already free, an extent outside the data area, an inode number out of range —
+and a write or flush the journal needed that the device failed.
 Detection is not correction: only `fsck.kfs` repairs.
 
 **What remains undetected**: corruption of file data; a stale but valid block written back by a
@@ -1545,7 +1595,9 @@ name goes to `/lost+found`; one with `links = 0` not on the orphan list is put o
 
 **Pass 5 — bitmaps, counts, orphans.** Rebuild both bitmaps from pass 1 (metadata, journal, claimed
 blocks, allocated inodes) and compare: report every leaked block and every claimed-but-free block, every
-inode bit wrong; compare `free_blocks`, `free_inodes`, `directories`, both bitmap checksums, and the
+inode bit wrong (the allocated inodes being those whose bit pass 1 found set, an inode bit is wrong when a
+reserved inode's or a past-the-end bit is clear; a set bit on a bad slot is pass 1's problem and a mode
+in a clear one its warning, each reported once); compare `free_blocks`, `free_inodes`, `directories`, both bitmap checksums, and the
 superblock's totals. Walk the orphan list: no cycle, every member allocated with `ORPHAN` set, no
 `ORPHAN` outside the list. With `-y`: rewrite bitmaps, counts and checksums; process the orphan list
 as mount would.
@@ -1696,7 +1748,13 @@ leaves the old filesystem working until stage 12 retires it.
 - **The every-write loop**: for an operation, count its writes W on a clean run; then for N = 1 … W,
   and for each mode, crash at N, recover, check clean, and check the visible state is exactly the
   state before the operation or exactly the state after it (for a split operation: before, after, or
-  a documented intermediate state with the orphan list finishing it).
+  a documented intermediate state with the orphan list finishing it). The **visible state** is what a
+  reader of the filesystem can see: the superblock but for the fields every mount writes directly
+  (`state`, the free totals, `mount_count`, the times, the checksum), the descriptor table, every bitmap
+  and inode-table block, and every block an inode claims. Free blocks and the log are not part of it.
+  Counting starts after the test's own preparation (a mount, the transactions that build the state
+  before), so every crash point is inside the operation; the tear mode is run with sector 0 alone, with
+  every sector but 0, and with a seeded mask, and the reorder mode with two seeds.
 
 ### Stage 1 — Codecs and structures
 
@@ -1765,6 +1823,14 @@ write log shows ordered data before the descriptors, a flush, then the commit, t
 buffer is never written home before its commit; a buffer changed by T + 1 while T commits is logged
 in T with T's bytes only (the frozen copy); a log kept nearly full by a stream of handles never
 deadlocks (handles wait, checkpoints run, every handle finishes).
+On the host, where one thread runs everything and the committer runs inline, the last test tells the
+host platform there is a commit thread and plays it: a seeded schedule interleaves the steps of several
+simulated operations (open a handle with `try_start`, retrying while it answers "wait"; declare and
+change one buffer per step; stop) with single steps of the committer (`journal_step`: finish a commit,
+begin one, or checkpoint for a waiter), so handles stay open across commits and checkpoints and frozen
+copies are taken. A deadlock is every unfinished operation waiting, none able to join on a retry, and
+the committer unable to move; the test then crashes and checks the image holds exactly the committed
+changes.
 
 ### Stage 6 — Files: I/O, truncation, the orphan list
 

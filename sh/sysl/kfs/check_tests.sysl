@@ -1,0 +1,271 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The checker (`check`, fsck's read-only half): clean on every image the package writes, and for each
+// rule of passes 0, 1 and 5 an image that breaks exactly that rule, written straight onto the device.
+
+private has(rep: Report, want: Problem) -> bool
+    for p in rep.problems.view()
+        if describe(p) == describe(want) then return true
+    false
+
+// The descriptor of group `g` on the device, through `edit`, resealed.
+private edit_desc(dev: *RamDevice, g: u32, free_delta: i64, directories: Option[u32], bitmap: Option[Buf[u8]])
+    val sb = super_of(dev)
+    val tb = 2 + u64(g / 64)
+    var blk = raw(dev, tb)
+    val off = usize(g % 64) * 64
+    val d: *GroupDesc = at(blk.view(), off)
+    d.free_blocks = u32(i64(d.free_blocks) + free_delta)
+    directories match
+        Some(n) -> d.directories = n
+        None -> ()
+    bitmap match
+        Some(bm) -> d.block_bitmap_crc = bitmap_crc(sb.csum_seed, g, bm.view())
+        None -> ()
+    seal_group_desc(sb.csum_seed, g, blk.view()[off..<off + 64])
+    raw_put(dev, tb, blk.view())
+
+// Set or clear block `b`'s bit in group 0's block bitmap, keeping the descriptor's count and checksum
+// in step, so the only thing wrong is the bit itself.
+private flip_block_bit(dev: *RamDevice, b: u64, set: bool)
+    var sb = super_of(dev)
+    val g = geometry_of(&sb)
+    var bm = raw(dev, g.block_bitmap(0))
+    val i = usize(b - g.group_first(0))
+    if set then bit_set(bm.view(), i) else bit_clear(bm.view(), i)
+    raw_put(dev, g.block_bitmap(0), bm.view())
+    edit_desc(dev, 0, if set then -1 else 1, None, Some(bm))
+
+// Write `width` bytes of `v`, little-endian, at `at_byte` of inode `ino`'s slot (group 0), resealing
+// the inode unless `seal` is false.
+private edit_inode(dev: *RamDevice, ino: u64, at_byte: usize, v: u64, width: usize, seal: bool)
+    var sb = super_of(dev)
+    val g = geometry_of(&sb)
+    val b = g.inode_table(0) + (ino - 1) / 16
+    var blk = raw(dev, b)
+    val off = usize((ino - 1) % 16) * INODE_SIZE
+    for i in 0..<width
+        blk[off + at_byte + i] = u8((v >> u64(8 * i)) & 0xFF)
+    if seal then seal_inode(sb.csum_seed, ino, blk.view()[off..<off + INODE_SIZE])
+    raw_put(dev, b, blk.view())
+
+private root_leaf(dev: *RamDevice) -> u64
+    var sb = super_of(dev)
+    geometry_of(&sb).data_start(0)
+
+@test("a freshly formatted image, the same mounted and unmounted, and one with files in it are clean")
+clean_images()
+    var dev = small_device()
+    val rep = checked_clean(&dev)
+    // The root (2) and lost+found (11); the root claims its one leaf.
+    assert_eq(rep.inodes, 2)
+    assert_eq(rep.claimed.len(), 1)
+    assert_eq(rep.claimed[0], root_leaf(&dev))
+    var fs = mounted(&dev)
+    var h = fs.start("create", 3 + C_ALLOC)
+    val ino = alloc_inode(&fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)) match
+        Ok(i) -> i
+        Err(_) -> panic("no inode")
+    val run = alloc_blocks(&fs, &h, 0, 5, 0) match
+        Ok(r) -> r
+        Err(_) -> panic("no blocks")
+    must(insert(&fs, &h, extent_tree(ino, 0), Extent(0, run.len, run.first, false)))
+    fs.stop(&h)
+    must(fs.unmount())
+    val after = checked_clean(&dev)
+    assert_eq(after.inodes, 3)
+    assert_eq(after.claimed.len(), 6)
+
+@test("pass 0: ERROR, an error in the journal, a log that needs recovery, a broken journal superblock")
+pass0_problems()
+    var a = small_device()
+    edit_super(&a, STATE_ERROR, 0, 0)
+    assert(has(check(&a), Problem.ErrorState))
+    var b = small_device()
+    var st = journal_of(&b)
+    st.error = 5
+    assert(write_journal_super(&b, super_of(&b), st).is_ok())
+    assert(has(check(&b), Problem.JournalError(5)))
+    var c = small_device()
+    var jb = raw(&c, super_of(&c).journal_start)
+    jb[40] = jb[40] ^ 1
+    raw_put(&c, super_of(&c).journal_start, jb.view())
+    assert(has(check(&c), Problem.Journal(OpenError.BadJournal)))
+    var d = small_device()
+    edit_super(&d, 0, 2, 0)
+    assert(has(check(&d), Problem.Features))
+    var e = small_device()
+    var sbb = raw(&e, 1)
+    sbb[200] = sbb[200] ^ 1
+    raw_put(&e, 1, sbb.view())
+    assert(has(check(&e), Problem.Super(OpenError.BadChecksum)))
+
+@test("pass 0's log audit: a committed log needs recovery and audits clean; a copy left beginning with the magic, or failing its tag, is reported")
+log_audit()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    var blocks: Buf[u64] = buf()
+    for k in 0..<3u64
+        blocks.push(scratch(&fs, k))
+    stamp_all(&fs, blocks, 5)
+    val rep = check(&dev)
+    assert_eq(rep.problems.len(), 1)
+    assert(has(rep, Problem.NeedsRecovery))
+    // Forge the second copy so it begins with the magic: an unescaped header where the scan expects data.
+    val log = log_contents(&dev)
+    val cp = log.copies[1]
+    var blk = raw(&dev, log_pos(super_of(&dev), cp.pos))
+    put_le32(blk.view(), 0, JOURNAL_MAGIC)
+    raw_put(&dev, log_pos(super_of(&dev), cp.pos), blk.view())
+    val bad = check(&dev)
+    assert(has(bad, Problem.LogAudit(cp.pos)))
+    assert_eq(bad.problems.len(), 2)
+
+@test("pass 1: an inode's checksum, mode, flags, parent, a device's size, an extent tree's rule, a doubly claimed block, a wrong block count")
+pass1_problems()
+    var a = small_device()
+    edit_inode(&a, LOST_FOUND_INO, 9, 0x55, 1, false)
+    assert(has(check(&a), Problem.InodeChecksum(LOST_FOUND_INO)))
+
+    var b = small_device()
+    edit_inode(&b, LOST_FOUND_INO, 0, 0xFFFF, 2, true)
+    assert(has(check(&b), Problem.InodeMode(LOST_FOUND_INO)))
+
+    var c = small_device()
+    edit_inode(&c, LOST_FOUND_INO, 16, 0x08, 1, true)
+    assert(has(check(&c), Problem.InodeFlags(LOST_FOUND_INO)))
+    var c2 = small_device()
+    edit_inode(&c2, LOST_FOUND_INO, 16, u64(INODE_INLINE), 1, true)
+    assert(has(check(&c2), Problem.InodeFlags(LOST_FOUND_INO)))
+
+    var d = small_device()
+    edit_inode(&d, LOST_FOUND_INO, 104, 0, 8, true)
+    assert(has(check(&d), Problem.InodeParent(LOST_FOUND_INO)))
+
+    // lost+found made a character device (0o020600) with a size.
+    var e = small_device()
+    edit_inode(&e, LOST_FOUND_INO, 0, 0x2180, 2, true)
+    edit_inode(&e, LOST_FOUND_INO, 104, 0, 8, true)
+    edit_inode(&e, LOST_FOUND_INO, 24, 12, 8, true)
+    assert(has(check(&e), Problem.InodeSize(LOST_FOUND_INO)))
+
+    // lost+found's root with count above max.
+    var f = small_device()
+    edit_inode(&f, LOST_FOUND_INO, 112 + 4, 9, 2, true)
+    assert(has(check(&f), Problem.Extent(LOST_FOUND_INO, 0, NodeFault.Header)))
+
+    // lost+found mapping the root's leaf: one block claimed twice. The extent is logical 0, length 1.
+    var g = small_device()
+    val leaf = root_leaf(&g)
+    edit_inode(&g, LOST_FOUND_INO, 112 + 4, 1, 2, true)
+    edit_inode(&g, LOST_FOUND_INO, 112 + 16, 0x1_0000_0000, 8, true)
+    edit_inode(&g, LOST_FOUND_INO, 112 + 24, leaf, 8, true)
+    edit_inode(&g, LOST_FOUND_INO, 32, 1, 8, true)
+    assert(has(check(&g), Problem.DoubleClaim(leaf, LOST_FOUND_INO)))
+
+    var h = small_device()
+    edit_inode(&h, ROOT_INO, 32, 5, 8, true)
+    assert(has(check(&h), Problem.BlockCount(ROOT_INO, 5, 1)))
+
+@test("pass 1 checks a node block as stage 4's oracle does: another owner, another generation, a bad checksum")
+pass1_node_blocks()
+    for which in 0..<3
+        var dev = small_device()
+        var fs = mounted(&dev)
+        var h = fs.start("create", 3)
+        val ino = alloc_inode(&fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)) match
+            Ok(i) -> i
+            Err(_) -> panic("no inode")
+        fs.stop(&h)
+        // Nine one-block extents overflow the root's seven: the tree grows a node block.
+        for k in 0..<9u64
+            var w = fs.start("write", C_ALLOC)
+            val run = alloc_blocks(&fs, &w, 0, 1, 0) match
+                Ok(r) -> r
+                Err(_) -> panic("no block")
+            must(insert(&fs, &w, extent_tree(ino, 0), Extent(2 * k, 1, run.first, false)))
+            fs.stop(&w)
+        must(fs.unmount())
+        val clean = checked_clean(&dev)
+        // The first claim of the file is its node block.
+        var node: u64 = 0
+        for b in clean.claimed.view()
+            if node == 0 && b != root_leaf(&dev) then node = b
+        var blk = raw(&dev, node)
+        if which == 0 then put_le64(blk.view(), TAIL_OFFSET, ino + 1)
+        if which == 1 then put_le32(blk.view(), TAIL_OFFSET + 8, 7)
+        if which < 2 then seal_block(fs.seed, blk.view()) else blk[100] = blk[100] ^ 4
+        raw_put(&dev, node, blk.view())
+        val want = if which == 0 then NodeFault.Owner else if which == 1 then NodeFault.Generation else NodeFault.Checksum
+        assert(has(check(&dev), Problem.Extent(ino, node, want)))
+
+@test("pass 5: a leaked block, a claimed block marked free, counts, directories and bitmap checksums")
+pass5_problems()
+    var a = small_device()
+    val free = root_leaf(&a) + 50
+    flip_block_bit(&a, free, true)
+    // The fresh image is CLEAN, so its superblock's totals no longer agree either.
+    val ra = check(&a)
+    assert(has(ra, Problem.BlockBit(free, false)))
+    assert(has(ra, Problem.Totals))
+    assert_eq(ra.problems.len(), 2)
+
+    var b = small_device()
+    val leaf = root_leaf(&b)
+    flip_block_bit(&b, leaf, false)
+    val rb = check(&b)
+    assert(has(rb, Problem.BlockBit(leaf, true)))
+    assert(has(rb, Problem.Totals))
+    assert_eq(rb.problems.len(), 2)
+
+    var c = small_device()
+    edit_desc(&c, 0, 1, None, None)
+    assert(has(check(&c), Problem.FreeBlocks(0)))
+
+    var d = small_device()
+    edit_desc(&d, 1, 0, Some(1), None)
+    assert(has(check(&d), Problem.Directories(1)))
+
+    var e = small_device()
+    var sb = super_of(&e)
+    val g = geometry_of(&sb)
+    var bm = raw(&e, g.block_bitmap(1))
+    // A free block past group 1's journal.
+    assert(!bit_test(bm.view(), 1900))
+    bit_set(bm.view(), 1900)
+    raw_put(&e, g.block_bitmap(1), bm.view())
+    val re = check(&e)
+    assert(has(re, Problem.BlockBitmapCrc(1)))
+    assert(has(re, Problem.FreeBlocks(1)))
+
+    // A reserved inode's bit cleared (its count and checksum then disagree too).
+    var f = small_device()
+    var fsb = super_of(&f)
+    val fg = geometry_of(&fsb)
+    var ib = raw(&f, fg.inode_bitmap(0))
+    bit_clear(ib.view(), 4)
+    raw_put(&f, fg.inode_bitmap(0), ib.view())
+    assert(has(check(&f), Problem.InodeBit(5, true)))
+
+    // The superblock's totals, checked only while CLEAN says they are exact.
+    var t = small_device()
+    var tb = raw(&t, 1)
+    val tsb: *Superblock = at(tb.view(), 0)
+    tsb.free_blocks = tsb.free_blocks + 1
+    seal_superblock(tb.view())
+    raw_put(&t, 1, tb.view())
+    assert(has(check(&t), Problem.Totals))
+    var fs = mounted(&t)
+    assert(!has(check(&t), Problem.Totals))
+
+@test("a free inode whose slot holds a mode is a warning, not a problem")
+free_inode_warning()
+    var dev = small_device()
+    edit_inode(&dev, 20, 0, 0x81A4, 2, false)
+    val rep = check(&dev)
+    assert(rep.clean())
+    assert_eq(rep.warnings.len(), 1)

@@ -1423,6 +1423,8 @@ private run_model(seed: u64, root_max: u16, node_max: u16, low: u64, high: u64, 
     if final.len > 0
         print(s"extent model: seed $seed after a remount: $final")
         panic("the extent tree disagrees with the model after a remount")
+    // And the checker, which shares no code with the tree or with this oracle, finds nothing wrong.
+    val _ = checked_clean(&dev)
     out
 
 @test("model: nodes of 2 under a root of 2, the fixed seed — depth 5 reached, the sixth level refused")

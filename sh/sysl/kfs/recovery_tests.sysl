@@ -1,0 +1,287 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// Recovery (kfs/SPEC.md section 15) against logs written by the journal and then damaged on the device:
+// where the scan stops, what a bad checksum rejects, what revokes keep dead, and that recovery
+// interrupted at any write and run again gives the same bytes.
+//
+// The base log: T1 sets A = 1; T2 sets A = 2 and B = 2 and revokes a block nothing logged; T3 sets
+// C = 3. In positions: T1 1-3, T2 4-8 (descriptor, two copies, the revoke block, the commit), T3 9-11.
+
+private struct Base
+    dev: RamDevice
+    a: u64
+    b: u64
+    c: u64
+    log: LogContents
+
+private base() -> Base
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val a = scratch(&fs, 0)
+    val b = scratch(&fs, 1)
+    val c = scratch(&fs, 2)
+    var t1 = fs.start("t1", 1)
+    stamp(&fs, &t1, a, 1)
+    fs.stop(&t1)
+    must(fs.commit())
+    var t2 = fs.start("t2", 3)
+    stamp(&fs, &t2, a, 2)
+    stamp(&fs, &t2, b, 2)
+    fs.revoke(&t2, scratch(&fs, 50))
+    fs.stop(&t2)
+    must(fs.commit())
+    var t3 = fs.start("t3", 1)
+    stamp(&fs, &t3, c, 3)
+    fs.stop(&t3)
+    must(fs.commit())
+    val log = log_contents(&dev)
+    assert_eq(log.txns.len(), 3)
+    assert_eq(log.txns[1].first, 4)
+    assert_eq(log.txns[1].commit, 8)
+    Base(dev, a, b, c, log)
+
+// The base's transaction `i` (0-based): its sequence.
+private seq_of(x: Base, i: usize) -> u64 = x.log.txns[i].seq
+
+// A copy of log block `pos`'s bytes.
+private log_block_bytes(x: *Base, pos: u32) -> Buf[u8] = raw(&x.dev, log_pos(super_of(&x.dev), pos))
+
+private put_log_block(x: *Base, pos: u32, bytes: []const u8) = raw_put(&x.dev, log_pos(super_of(&x.dev), pos), bytes)
+
+private flip(x: *Base, pos: u32, at_byte: usize)
+    var blk = log_block_bytes(x, pos)
+    blk[at_byte] = blk[at_byte] ^ 0x10
+    put_log_block(x, pos, blk.view())
+
+// Only T1 replayed: A is 1, B and C never reached home.
+private only_t1(x: *Base) -> bool
+    holds(&x.dev, x.a, 1) && !holds(&x.dev, x.b, 2) && !holds(&x.dev, x.c, 3)
+
+private all_three(x: *Base) -> bool
+    holds(&x.dev, x.a, 2) && holds(&x.dev, x.b, 2) && holds(&x.dev, x.c, 3)
+
+@test("recovery after the commit and before the checkpoint makes every committed change visible, and empties the log")
+recovery_after_commit()
+    var x = base()
+    assert(!holds(&x.dev, x.a, 2))
+    var fs = mounted(&x.dev)
+    assert(all_three(&x))
+    assert(!fs.read_only())
+    assert_eq(journal_of(&x.dev).start, 0)
+    assert_eq(journal_of(&x.dev).start_seq, seq_of(x, 2) + 1)
+    assert_eq(fs.running(), seq_of(x, 2) + 1)
+    val _ = checked_clean(&x.dev)
+
+@test("the scan stops at a missing commit: the transactions before it are replayed, it and those after are not")
+stops_at_a_missing_commit()
+    var x = base()
+    put_log_block(&x, 8, new_block().view())
+    var fs = mounted(&x.dev)
+    assert(only_t1(&x))
+    assert(!fs.read_only())
+    assert_eq(journal_of(&x.dev).start_seq, seq_of(x, 1))
+    // The next transaction takes T2's sequence: nothing of T2 was ever committed.
+    assert_eq(fs.running(), seq_of(x, 1))
+
+@test("a commit block of the wrong sequence, or counting the wrong number of blocks, ends the scan")
+stops_at_a_wrong_commit()
+    for which in 0..<2
+        var x = base()
+        var blk = log_block_bytes(&x, 8)
+        val c: *Commit = at(blk.view(), 0)
+        if which == 0 then c.header.sequence = c.header.sequence + 5 else c.blocks = c.blocks - 1
+        seal_sector(super_of(&x.dev).csum_seed, blk.view())
+        put_log_block(&x, 8, blk.view())
+        var fs = mounted(&x.dev)
+        assert(only_t1(&x))
+
+@test("a gap in the sequence ends the scan: T3 moved to just after T1 is not replayed")
+stops_at_a_gap()
+    var x = base()
+    for k in 0u32..<3
+        val moved = log_block_bytes(&x, 9 + k)
+        put_log_block(&x, 4 + k, moved.view())
+    put_log_block(&x, 7, new_block().view())
+    put_log_block(&x, 8, new_block().view())
+    var fs = mounted(&x.dev)
+    assert(only_t1(&x))
+    assert_eq(journal_of(&x.dev).start_seq, seq_of(x, 1))
+
+@test("a stale transaction of the previous lap after the last one is not replayed")
+stops_at_the_previous_lap()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val xb = scratch(&fs, 0)
+    val zb = scratch(&fs, 2)
+    var one: Buf[u64] = buf()
+    one.push(xb)
+    stamp_all(&fs, one, 1)
+    stamp_all(&fs, one, 2)
+    must(fs.checkpoint_all())
+    stamp_all(&fs, one, 3)
+    must(fs.checkpoint_all())
+    assert(holds(&dev, xb, 3))
+    // A new mount writes from log position 1 again, over the old lap's first transaction only.
+    var fs2 = mounted(&dev)
+    var z: Buf[u64] = buf()
+    z.push(zb)
+    stamp_all(&fs2, z, 4)
+    val log = log_contents(&dev)
+    assert_eq(log.txns.len(), 1)
+    assert_eq(log.txns[0].first, 1)
+    // Position 4 still holds the old lap's second transaction, X = 2, valid but of an older sequence.
+    val stale = raw(&dev, log_pos(super_of(&dev), 4))
+    val h: *JournalHeader = at(stale.view(), 0)
+    assert_eq(h.magic, JOURNAL_MAGIC)
+    assert_eq(h.kind, JOURNAL_DESCRIPTOR)
+    assert(h.sequence < log.txns[0].seq)
+    var again = mounted(&dev)
+    assert(holds(&dev, xb, 3))
+    assert(holds(&dev, zb, 4))
+
+@test("a bit flipped in a committed copy is media corruption: the transactions before it replay, it and the rest do not, error is recorded and the mount is read-only")
+flipped_copy()
+    var x = base()
+    val bcopy = copies_of(x.log, x.b)[0]
+    flip(&x, bcopy.pos, 3000)
+    var fs = mounted(&x.dev)
+    assert(only_t1(&x))
+    assert(fs.read_only())
+    assert_eq(fs.journal_error(), 5)
+    val st = journal_of(&x.dev)
+    assert_eq(st.error, 5)
+    // The log is left for fsck.kfs; every mount finds the same and stays read-only.
+    assert_eq(st.start, x.log.txns[0].first)
+    var again = mounted(&x.dev)
+    assert(again.read_only())
+    assert(check(&x.dev).problems.len() > 0)
+
+@test("a bit flipped in a descriptor, a revoke block or the commit block's first sector ends the scan at that transaction")
+flipped_headers()
+    for which in 0..<3
+        var x = base()
+        val pos: u32 = if which == 0 then 4 else if which == 1 then 7 else 8
+        val at_byte: usize = if which == 2 then 100 else 2000
+        flip(&x, pos, at_byte)
+        var fs = mounted(&x.dev)
+        assert(only_t1(&x))
+        assert(!fs.read_only())
+        assert_eq(journal_of(&x.dev).error, 0)
+
+@test("the commit block's meaning is in its first sector: damage to the other seven does not matter")
+commit_later_sectors_ignored()
+    for sector in 1usize..<8
+        var x = base()
+        flip(&x, 8, sector * SECTOR_SIZE + 17)
+        var fs = mounted(&x.dev)
+        assert(all_three(&x))
+
+@test("a tag naming a block replay may not write — the journal itself, or block 0 — is corruption")
+tag_outside_the_filesystem()
+    for which in 0..<2
+        var x = base()
+        var blk = log_block_bytes(&x, 4)
+        val tag = tag_at(blk.view(), 1)
+        tag.block = if which == 0 then super_of(&x.dev).journal_start + 5 else 0
+        seal_journal_block(super_of(&x.dev).csum_seed, blk.view())
+        put_log_block(&x, 4, blk.view())
+        var fs = mounted(&x.dev)
+        assert(fs.read_only())
+        assert(only_t1(&x))
+
+@test("revokes are taken only from the transactions replayed: one after a corrupt copy cancels nothing")
+revokes_only_from_replayed()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val m = scratch(&fs, 0)
+    val n = scratch(&fs, 1)
+    var one: Buf[u64] = buf()
+    one.push(m)
+    stamp_all(&fs, one, 1)
+    var two: Buf[u64] = buf()
+    two.push(n)
+    stamp_all(&fs, two, 2)
+    var t3 = fs.start("t3", 1)
+    fs.revoke(&t3, m)
+    fs.stop(&t3)
+    must(fs.commit())
+    // Spoil T2's copy: replay stops before T2, so T3's revoke of m must not cancel T1's copy.
+    val log = log_contents(&dev)
+    val ncopy = copies_of(log, n)[0]
+    var blk = raw(&dev, log_pos(super_of(&dev), ncopy.pos))
+    blk[9] = blk[9] ^ 1
+    raw_put(&dev, log_pos(super_of(&dev), ncopy.pos), blk.view())
+    var again = mounted(&dev)
+    assert(again.read_only())
+    assert(holds(&dev, m, 1))
+
+// The device's every block, as checksums, with the superblock's mount fields masked.
+private image(dev: *RamDevice) -> Buf[u32]
+    var out: Buf[u32] = buf()
+    var blk = new_block()
+    for b in 0..<dev.blocks()
+        assert(dev.read(b, blk.view()).is_ok())
+        if b == 1 then mask_mount_fields(blk.view())
+        out.push(crc32c(0xFFFF_FFFF, blk.view()))
+    out
+
+// Zero the superblock's fields that every mount writes directly: state, the free totals, the mount
+// count, the times, and the checksum over them.
+mask_mount_fields(blk: []u8)
+    for i in 12..<14
+        blk[i] = 0
+    for i in 48..<64
+        blk[i] = 0
+    for i in 188..<192
+        blk[i] = 0
+    for i in 200..<216
+        blk[i] = 0
+    for i in 508..<512
+        blk[i] = 0
+
+@test("recovery interrupted at any of its writes (lost or torn) and run again leaves exactly the bytes of one recovery")
+double_recovery()
+    var x = base()
+    var cd = crash_device(&x.dev)
+    cd.mark()
+    cd.arm()
+    var once = mounted(&cd)
+    val total = cd.counted
+    assert(total > 4)
+    cd.disarm()
+    val want = image(&x.dev)
+    assert(cd.rewind().is_ok())
+    var points: u64 = 0
+    for n in 0..<total
+        for mode in 0..<3
+            cd.plan = if mode == 0 then CrashMode.DropAfter(n) else if mode == 1 then CrashMode.Tear(n + 1, 0xFE) else CrashMode.Reorder(n + 1, n * 31 + 7)
+            cd.arm()
+            assert(mount(&cd, host_platform()).is_err())
+            assert(cd.crashed)
+            cd.disarm()
+            var fs = mounted(&cd)
+            assert(!fs.read_only())
+            assert(image(&x.dev) == want)
+            assert(cd.rewind().is_ok())
+            x.dev.reset_counters()
+            points += 1
+    assert_eq(points, total * 3)
+
+@test("a torn superblock write at mount leaves a superblock that verifies: its meaning is in sector 0")
+torn_superblock()
+    for mask in [0x01u8, 0xFE, 0x0F, 0x00]
+        var dev = small_device()
+        var cd = crash_device(&dev)
+        cd.plan = CrashMode.Tear(1, mask)
+        cd.arm()
+        assert(mount(&cd, host_platform()).is_err())
+        cd.disarm()
+        assert(verify_superblock(raw(&dev, 1).view()))
+        val sb = super_of(&dev)
+        assert_eq(sb.state & STATE_CLEAN != 0, mask & 1 == 0)
+        var fs = mounted(&dev)
+        assert(!fs.read_only())

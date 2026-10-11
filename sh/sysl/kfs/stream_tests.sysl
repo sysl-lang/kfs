@@ -1,0 +1,169 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// "A log kept nearly full by a stream of handles never deadlocks" (kfs/SPEC.md section 27, stage 5),
+// on the host, where there is one thread.
+//
+// The host platform is told there is a commit thread (`committer_thread`), so nothing commits inline;
+// the test is that thread, and the operations' threads too. It runs four simulated operations and the
+// committer as a seeded cooperative schedule: at every step it picks one of them. An operation opens a
+// handle with `try_start` — on a None it is *waiting*, and retries when picked again — then touches its
+// buffers one per step (so handles stay open across commits and checkpoints), and stops. The committer's
+// step is `journal_step`, which does one unit of work: finish a commit, begin one (step 1 — so handles
+// of the next transaction run while the last one is committing, and frozen copies are taken), or
+// checkpoint for a waiter, committing the running transaction first when the checkpoint needs a buffer
+// it pins. The transactions are large (20-199 credits, every credit a distinct block) against a log of
+// 1023 blocks, so the log is close to full the whole time.
+//
+// A deadlock is the state the spec says cannot happen: every unfinished operation waiting, none able to
+// join when retried, and the committer unable to move. The test fails there, or if the schedule ever
+// runs past its bound. At the end the in-memory filesystem is dropped — a crash — and the remounted image
+// must hold, for every block, the last stamp of a committed transaction: had a frozen copy been missed,
+// an uncommitted operation's bytes would have ridden in an earlier commit.
+
+private struct Actor
+    // 0 ready to open its next handle, 1 waiting, 2 active, 3 finished.
+    state: u32
+    h: Handle
+    credits: u32
+    todo: Buf[u64]
+    ops_left: u32
+
+private struct Touch
+    block: u64
+    salt: u32
+    seq: u64
+
+private struct Rng
+    x: u64
+
+    next(*self) -> u64
+        self.x = self.x * 6364136223846793005 + 1442695040888963407
+        self.x >> 33
+
+private next(rng: *Rng) -> u64 = rng.next()
+
+private no_handle() -> Handle = Handle("", 0, 0, buf(), 0, None)
+
+@test("a log kept nearly full by a stream of handles never deadlocks: handles wait, checkpoints run, every handle finishes")
+stream_never_deadlocks()
+    for seed in [0x5EEDu64, 0xBEEF, 0xC0FFEE]
+        stream(seed)
+
+// One schedule, from `seed`: four operations of 30 handles each.
+private stream(seed: u64)
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.plat.committer_thread = true
+    val pool: u64 = 400
+    var actors: Buf[Actor] = buf()
+    for _ in 0..<4
+        actors.push(Actor(0, no_handle(), 0, buf(), 30))
+    var touches: Buf[Touch] = buf()
+    var rng = Rng(seed)
+    var salt: u32 = 1000
+    var steps: u64 = 0
+    var waited: u64 = 0
+    var committer_moves: u64 = 0
+    var most_used: u32 = 0
+    var checkpoints_seen: u64 = 0
+    var last_used: u32 = 0
+    var frozen_seen: u64 = 0
+    loop
+        var unfinished: usize = 0
+        for a in actors.view()
+            if a.state != 3 then unfinished += 1
+        if unfinished == 0 then break
+        steps += 1
+        assert(steps < 2_000_000)
+        val pick = usize(next(&rng) % 5)
+        if pick == 4
+            if must_bool(fs.journal_step()) then committer_moves += 1
+        else
+            var a = actors[pick]
+            if a.state == 0 || a.state == 1
+                if a.state == 0 then a.credits = 20 + u32(next(&rng) % 180)
+                fs.try_start("stream", a.credits) match
+                    Ok(Some(h)) ->
+                        a.h = h
+                        a.state = 2
+                        a.todo = buf()
+                        val first = next(&rng) % pool
+                        for k in 0..<u64(a.credits)
+                            a.todo.push(scratch(&fs, (first + k) % pool))
+                    Ok(None) ->
+                        a.state = 1
+                        waited += 1
+                    Err(_) -> panic("a handle was refused")
+            else if a.state == 2
+                if a.todo.len() == 0
+                    fs.stop(&a.h)
+                    a.ops_left -= 1
+                    a.state = if a.ops_left == 0 then 3 else 0
+                else
+                    val b = a.todo.pop() match
+                        Some(x) -> x
+                        None -> 0
+                    salt += 1
+                    stamp(&fs, &a.h, b, salt)
+                    touches.push(Touch(b, salt, a.h.seq))
+            actors[pick] = a
+
+        // Everyone left is waiting: retry each, and if none can join, the committer must be able to move.
+        var all_waiting = false
+        var moving = false
+        for a in actors.view()
+            if a.state == 1 then all_waiting = true
+            if a.state == 0 || a.state == 2 then moving = true
+        if moving then all_waiting = false
+        if all_waiting
+            var joined = false
+            for i in 0..<actors.len()
+                var a = actors[i]
+                if a.state == 1 && !joined
+                    fs.try_start("stream", a.credits) match
+                        Ok(Some(h)) ->
+                            a.h = h
+                            a.state = 2
+                            a.todo = buf()
+                            val first = next(&rng) % pool
+                            for k in 0..<u64(a.credits)
+                                a.todo.push(scratch(&fs, (first + k) % pool))
+                            joined = true
+                        _ -> ()
+                    actors[i] = a
+            if !joined
+                if !must_bool(fs.journal_step())
+                    panic("deadlock: every operation waits and the committer cannot move")
+                committer_moves += 1
+
+        if fs.committing()
+            for bf in fs.buffers.view()
+                if bf.frozen.len() > 0
+                    frozen_seen += 1
+                    break
+        val used = fs.log_used()
+        if used > most_used then most_used = used
+        if used < last_used then checkpoints_seen += 1
+        last_used = used
+
+    print(s"stream $seed: $steps steps, $waited waits, $committer_moves committer moves, $checkpoints_seen checkpoints, $frozen_seen steps with a frozen copy, at most ${most_used} of 1023 log blocks used")
+    assert(waited > 0)
+    assert(checkpoints_seen > 0)
+    assert(frozen_seen > 0)
+    assert(most_used > 1000)
+
+    // A crash now: everything committed must be there, nothing else.
+    val upto = if fs.committing() then fs.j.committing.seq - 1 else fs.j.running.seq - 1
+    var again = mounted(&dev)
+    for k in 0..<pool
+        val b = scratch(&again, k)
+        var want: u32 = 0
+        for t in touches.view()
+            if t.block == b && t.seq <= upto then want = t.salt
+        if want != 0 then assert(holds(&dev, b, want)) else assert(same(raw(&dev, b).view(), new_block().view()))
+    must(again.unmount())
+    val _ = checked_clean(&dev)

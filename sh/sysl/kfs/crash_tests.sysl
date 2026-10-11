@@ -1,0 +1,291 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The every-write loop of kfs/SPEC.md section 27 over the operations that exist at stage 5. For an
+// operation it counts the writes W of a clean run; then for every N in 1 ... W and every mode — drop
+// after N, the Nth torn three ways (sector 0 only, all but sector 0, a seeded mask), and two seeded
+// reorders of the writes since the last flush — it crashes there, mounts the surviving image (which
+// recovers it), runs the checker, which must find nothing, and compares the visible state with the
+// state before the operation and the state after it: it must be exactly one of them.
+//
+// The visible state is what a reader of the filesystem can see: the superblock but for the fields
+// every mount writes directly, the descriptor table, every bitmap and inode-table block, and every
+// block an inode claims (extent nodes and data). Free blocks and the log are not part of it.
+
+private struct Loop
+    writes: u64
+    points: u64
+    before: u64
+    after: u64
+
+private visible(cd: *CrashDevice[RamDevice]) -> Buf[u32]
+    var fs = mounted(cd)
+    assert(!fs.read_only())
+    val rep = checked_clean(cd)
+    var out: Buf[u32] = buf()
+    var sb = raw(cd, 1)
+    mask_mount_fields(sb.view())
+    out.push(crc32c(0xFFFF_FFFF, sb.view()))
+    val g = fs.geo
+    for t in 0..<u64(g.gdt_blocks)
+        out.push(crc32c(0xFFFF_FFFF, raw(cd, 2 + t).view()))
+    for grp in 0..<g.group_count
+        out.push(crc32c(0xFFFF_FFFF, raw(cd, g.block_bitmap(grp)).view()))
+        out.push(crc32c(0xFFFF_FFFF, raw(cd, g.inode_bitmap(grp)).view()))
+        for t in 0..<u64(g.itable_blocks())
+            out.push(crc32c(0xFFFF_FFFF, raw(cd, g.inode_table(grp) + t).view()))
+    for b in rep.claimed.view()
+        out.push(u32(b))
+        out.push(crc32c(0xFFFF_FFFF, raw(cd, b).view()))
+    out
+
+private rewound(cd: *CrashDevice[RamDevice], base: *RamDevice)
+    assert(cd.rewind().is_ok())
+    base.reset_counters()
+
+private plan_for(n: u64, mode: u32, total: u64) -> Option[CrashMode]
+    mode match
+        0 -> if n < total then Some(CrashMode.DropAfter(n)) else None
+        1 -> Some(CrashMode.Tear(n, 0x01))
+        2 -> Some(CrashMode.Tear(n, 0xFE))
+        3 -> Some(CrashMode.Tear(n, u8((n * 0x9E37 + 0x5B) & 0xFF)))
+        4 -> Some(CrashMode.Reorder(n, n * 7919 + 1))
+        _ -> Some(CrashMode.Reorder(n, n * 104729 + 3))
+
+// Run `op` (which mounts, prepares, calls `cd.arm()`, and does the operation) once per crash point.
+private every_write(base: *RamDevice, op: &Fn(*CrashDevice[RamDevice]) -> unit) -> Loop
+    var cd = crash_device(base)
+    cd.mark()
+    cd.plan = CrashMode.Off
+    op(&cd)
+    val total = cd.counted
+    assert(!cd.crashed)
+    assert(total > 0)
+    cd.disarm()
+    val after = visible(&cd)
+    rewound(&cd, base)
+    cd.plan = CrashMode.DropAfter(0)
+    op(&cd)
+    assert(cd.crashed)
+    cd.disarm()
+    val before = visible(&cd)
+    rewound(&cd, base)
+    assert(before != after)
+    var l = Loop(total, 0, 0, 0)
+    for n in 1..<(total + 1)
+        for mode in 0u32..<6
+            plan_for(n, mode, total) match
+                None -> ()
+                Some(p) ->
+                    cd.plan = p
+                    op(&cd)
+                    cd.disarm()
+                    val v = visible(&cd)
+                    if v == before
+                        l.before += 1
+                    else if v == after
+                        l.after += 1
+                    else
+                        print(s"crash at write $n of $total, mode $mode: neither the state before nor the state after")
+                        panic("a crash left an intermediate state")
+                    l.points += 1
+                    rewound(&cd, base)
+    print(s"every-write loop: $total writes, ${l.points} crash points, ${l.before} before and ${l.after} after")
+    l
+
+// The checkpoint's loop: there the visible state is the same before and after, and every crash point
+// must give it.
+private every_write_same(base: *RamDevice, op: &Fn(*CrashDevice[RamDevice]) -> unit) -> Loop
+    var cd = crash_device(base)
+    cd.mark()
+    cd.plan = CrashMode.Off
+    op(&cd)
+    val total = cd.counted
+    assert(!cd.crashed)
+    cd.disarm()
+    val want = visible(&cd)
+    rewound(&cd, base)
+    var l = Loop(total, 0, 0, 0)
+    for n in 0..<(total + 1)
+        for mode in 0u32..<6
+            val p = if n == 0 then (if mode == 0 then Some(CrashMode.DropAfter(0)) else None) else plan_for(n, mode, total)
+            p match
+                None -> ()
+                Some(plan) ->
+                    cd.plan = plan
+                    op(&cd)
+                    cd.disarm()
+                    assert(visible(&cd) == want)
+                    l.points += 1
+                    l.after += 1
+                    rewound(&cd, base)
+    print(s"every-write loop (checkpoint): $total writes, ${l.points} crash points, all the same state")
+    l
+
+// -- The operations -----------------------------------------------------------------------------------
+
+// A file with one extent of `len` new blocks, all in one handle: the allocation transaction.
+private make_file(fs: *CrashFs, len: u32) -> Result[u64, FsError]
+    var h = fs.start("create", 3 + C_ALLOC)
+    val r = make_file_in(fs, &h, len)
+    fs.stop(&h)
+    r
+
+private make_file_in(fs: *CrashFs, h: *Handle, len: u32) -> Result[u64, FsError]
+    val ino = alloc_inode(fs, h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO))?
+    val run = alloc_blocks(fs, h, 0, len, 0)?
+    insert(fs, h, extent_tree(ino, 0), Extent(0, run.len, run.first, false))?
+    Ok(ino)
+
+@test("every write of a single allocation transaction: inode, blocks and extent, then the commit")
+crash_allocation()
+    var base = small_device()
+    val l = every_write(&base, (cd) ->
+        var fs = mounted(cd)
+        cd.arm()
+        val _ = make_file(&fs, 4)
+        val _ = fs.commit())
+    assert(l.writes >= 7)
+    assert(l.before > 0)
+    assert(l.after > 0)
+
+// Give inode `ino`'s root `max` 1, so its tree deepens after very few extents.
+private narrow_root(fs: *CrashFs, ino: u64)
+    var h = fs.start("setattr", C_INODE)
+    val loc = fs.inode_location(ino)
+    val id = must_id(fs.buffer(loc.block))
+    fs.plat.lock(LockId.Buffer(loc.block))
+    must(fs.write_access(&h, id))
+    val head: *NodeHeader = at(fs.bytes(id), loc.offset + 112)
+    head.max = 1
+    seal_inode(fs.seed, ino, fs.bytes(id)[loc.offset..<loc.offset + INODE_SIZE])
+    fs.plat.unlock(LockId.Buffer(loc.block))
+    fs.stop(&h)
+
+// Map logical block `l` of the narrow tree to one new block, in a handle of its own.
+private put_one(fs: *CrashFs, ino: u64, l: u64) -> Result[unit, FsError]
+    var h = fs.start("write", C_ALLOC)
+    val r = put_one_in(fs, &h, ino, l)
+    fs.stop(&h)
+    r
+
+private put_one_in(fs: *CrashFs, h: *Handle, ino: u64, l: u64) -> Result[unit, FsError]
+    val run = alloc_blocks(fs, h, fs.geo.data_start(0) + 600, 1, 0)?
+    insert(fs, h, ExtentTree(ino, 0, 2), Extent(l, 1, run.first, false))
+
+// A file with a narrow tree of `count` single-block extents at 0, 2, 4, ...; committed and
+// checkpointed. Answers the inode.
+private narrow_file(fs: *CrashFs, count: u64) -> u64
+    var h = fs.start("create", 3)
+    val ino = alloc_inode(fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)) match
+        Ok(i) -> i
+        Err(_) -> panic("no inode")
+    fs.stop(&h)
+    narrow_root(fs, ino)
+    for k in 0..<count
+        must(put_one(fs, ino, 2 * k))
+    must(fs.checkpoint_all())
+    ino
+
+private depth(fs: *CrashFs, ino: u64) -> u16
+    depth_of(fs, ino) match
+        Ok(d) -> d
+        Err(_) -> panic("no depth")
+
+// How many extents the narrow tree holds when an insert first takes it to depth 3.
+private extents_to_depth_three() -> u64
+    var dev = small_device()
+    var cd = crash_device(&dev)
+    var fs = mounted(&cd)
+    val ino = narrow_file(&fs, 0)
+    var k: u64 = 0
+    while depth(&fs, ino) < 3
+        must(put_one(&fs, ino, 2 * k))
+        k += 1
+    k
+
+@test("every write of an extent-tree insert that splits the tree to depth 3")
+crash_deep_split()
+    val k = extents_to_depth_three()
+    var base = small_device()
+    val l = every_write(&base, (cd) ->
+        var fs = mounted(cd)
+        val ino = narrow_file(&fs, k - 1)
+        assert_eq(depth(&fs, ino), 2)
+        cd.arm()
+        val _ = put_one(&fs, ino, 2 * (k - 1))
+        if !cd.crashed then assert_eq(depth(&fs, ino), 3)
+        val _ = fs.commit())
+    assert(l.after > 0)
+
+@test("every write of a removal that empties the tree, freeing (and revoking) its nodes")
+crash_removal()
+    val k = extents_to_depth_three()
+    var base = small_device()
+    val l = every_write(&base, (cd) ->
+        var fs = mounted(cd)
+        val ino = narrow_file(&fs, k)
+        cd.arm()
+        var hi = 2 * k
+        var steps = 0
+        loop
+            var h = fs.start("punch", C_EXT + C_GROUP)
+            val r = remove(&fs, &h, ExtentTree(ino, 0, 2), 0, hi, 1)
+            fs.stop(&h)
+            steps += 1
+            val next = r match
+                Ok(n) -> n
+                Err(_) -> 0
+            if next == 0 || steps > 100 then break
+            hi = next
+        if !cd.crashed
+            assert(fs.j.running.revokes.len() > 0)
+            assert_eq(depth(&fs, ino), 0)
+        val _ = fs.commit())
+    assert(l.after > 0)
+
+@test("every write of a transaction that wraps the log")
+crash_wrap()
+    var base = small_device()
+    val l = every_write(&base, (cd) ->
+        var fs = mounted(cd)
+        advance_head_to(&fs, 1020)
+        cd.arm()
+        val _ = make_file(&fs, 3)
+        val _ = fs.commit()
+        if !cd.crashed then assert(fs.log_head() < 1020))
+    assert(l.after > 0)
+
+// Journal a change to block 1: the label's first byte.
+private relabel_crash(fs: *CrashFs, c: u8)
+    var h = fs.start("label", 1)
+    val id = must_id(fs.buffer(1))
+    fs.plat.lock(LockId.Buffer(1))
+    must(fs.write_access(&h, id))
+    val sb: *Superblock = at(fs.bytes(id), 0)
+    sb.label[0] = c
+    seal_superblock(fs.bytes(id))
+    fs.plat.unlock(LockId.Buffer(1))
+    fs.stop(&h)
+
+@test("every write of a checkpoint of three committed transactions, the first's buffers taken over by the third")
+crash_checkpoint()
+    var base = small_device()
+    val l = every_write_same(&base, (cd) ->
+        var fs = mounted(cd)
+        assert(make_file(&fs, 2).is_ok())
+        must(fs.commit())
+        relabel_crash(&fs, u8('C'))
+        must(fs.commit())
+        assert(make_file(&fs, 2).is_ok())
+        must(fs.commit())
+        assert_eq(fs.logged_count(), 3)
+        cd.arm()
+        val _ = fs.checkpoint_all())
+    // The first checkpoints with nothing left on its list (its four buffers are the third's now): its
+    // journal superblock; the second, block 1 and the journal superblock; the third, its four buffers
+    // and the journal superblock.
+    assert_eq(l.writes, 8)

@@ -121,26 +121,24 @@ check[D: BlockDevice](dev: *D) -> Report
         rep.add(Problem.NeedsRecovery)
         audit_log(dev, sb, st, rep)
         return rep
-    var c = Checker(m, 0, buf(), buf(), buf())
+    var c = Checker(m, 0, 0, buf(), buf())
     for _ in 0..<usize(sb.blocks)
         c.owner.push(0)
-    for _ in 0..<usize(sb.inode_count)
-        c.used.push(false)
     for _ in 0..<m.geo.group_count
         c.dirs.push(0)
     var failed = pass1(dev, &c, rep).is_err()
     if !failed then failed = pass5(dev, &c, rep).is_err()
     if failed then rep.add(Problem.Super(OpenError.Device(DeviceError.Io)))
+    rep.inodes = c.inodes
     rep
 
-// What pass 1 leaves for pass 5: the filesystem, which inode claims each block (0 for none), which
-// inode slots hold a mode, and each group's directories; and the blocks the inode being walked has
-// claimed so far.
+// What pass 1 leaves for pass 5: the filesystem, which inode claims each block (0 for none) and each
+// group's directories; the blocks the inode being walked has claimed so far, and the inodes checked.
 private struct Checker
     m: Mounted
     count: u64
+    inodes: u64
     owner: Buf[u64]
-    used: Buf[bool]
     dirs: Buf[u32]
 
 // -- Pass 0: the log ----------------------------------------------------------------------------------
@@ -203,12 +201,11 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
             val off = usize(i % 16) * INODE_SIZE
             val slot = table.view()[off..<off + INODE_SIZE]
             val node: *Inode = at(table.view(), off)
-            if node.mode != 0 then c.used[usize(ino - 1)] = true
             if !bit_test(ibm.view(), usize(i))
                 if node.mode != 0 then rep.warnings.push(Problem.FreeInodeInUse(ino))
                 continue
             if ino == 1 || (ino >= 3 && ino < FIRST_INO) then continue
-            rep.inodes += 1
+            c.inodes += 1
             if !verify_inode(seed, ino, slot)
                 rep.add(Problem.InodeChecksum(ino))
                 continue
@@ -343,11 +340,12 @@ private pass5[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
             val journal = b >= g.journal_start && b < g.journal_start + u64(g.journal_blocks)
             val want = i < meta || i >= len || journal || c.owner[usize(b)] != 0
             if bit_test(bb.view(), i) != want then rep.add(Problem.BlockBit(b, want))
+        // Which inodes are allocated is the bitmap's to say, and pass 1 judged every slot it marks; what
+        // the bitmap itself must hold is the reserved inodes and every bit past the group's last inode.
         val ipg = usize(g.inodes_per_group)
         for i in 0..<(BLOCK_SIZE * 8)
             val ino = u64(grp) * u64(g.inodes_per_group) + u64(i) + 1
-            val want = i >= ipg || ino < FIRST_INO || c.used[usize(ino - 1)]
-            if bit_test(ib.view(), i) != want then rep.add(Problem.InodeBit(ino, want))
+            if (i >= ipg || ino < FIRST_INO) && !bit_test(ib.view(), i) then rep.add(Problem.InodeBit(ino, true))
         if count_clear(bb.view(), len) != d.free_blocks then rep.add(Problem.FreeBlocks(grp))
         if count_clear(ib.view(), ipg) != d.free_inodes then rep.add(Problem.FreeInodes(grp))
         if c.dirs[usize(grp)] != d.directories then rep.add(Problem.Directories(grp))
