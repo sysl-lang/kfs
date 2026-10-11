@@ -9,8 +9,8 @@ import sysl.buf.{Buf, buf}
 // command line runs. Each takes the arguments after the program's name and answers the text to print, or
 // the message to print on failure.
 
-const MKFS_USAGE: string = "usage: mkfs.kfs <image> <blocks> [-i bytes-per-inode] [-m reserved-percent] [-g blocks-per-group] [-j journal-blocks]"
-const DUMP_USAGE: string = "usage: kfsdump <image> [super | groups | inode <number>]"
+const MKFS_USAGE: string = "usage: mkfs.kfs <image> <blocks> [-i bytes-per-inode] [-m reserved-percent] [-g blocks-per-group] [-j journal-blocks] [-d host-directory] [-o spec-file]"
+const DUMP_USAGE: string = "usage: kfsdump <image> [super | groups | inode <number>] | kfsdump get <image> <path> <host-file> | kfsdump put <image> <host-file> <path>"
 
 private number(text: string) -> Option[u64]
     if text.bytes.len == 0 || text.bytes.len > 18 then return None
@@ -27,6 +27,10 @@ private option_value(args: []string, at: usize, flag: string) -> Result[u32, str
         None -> return Err(s"mkfs.kfs: '${args[at]}' is not a number")
     if v > 0xFFFF_FFFE then return Err(s"mkfs.kfs: ${args[at]} is too large for ${flag}")
     Ok(u32(v))
+
+private text_value(args: []string, at: usize, flag: string) -> Result[string, string]
+    if at >= args.len then return Err(s"mkfs.kfs: ${flag} needs a name")
+    Ok(args[at])
 
 // An option value that may not be zero, since zero would mean "choose".
 private given(v: u32, refusal: GeometryError) -> Result[u32, string]
@@ -69,6 +73,8 @@ run_mkfs(args: []string, entropy: []const u8, now: i64) -> Result[string, string
         Some(n) -> n
         None -> return Err(s"mkfs.kfs: '${args[1]}' is not a number of blocks")
     var o = default_options()
+    var from: Option[string] = None
+    var spec: Option[string] = None
     var i: usize = 2
     while i < args.len
         val flag = args[i]
@@ -78,6 +84,8 @@ run_mkfs(args: []string, entropy: []const u8, now: i64) -> Result[string, string
         elif flag == "-m" then o.reserved_percent = option_value(args, i + 1, flag)?
         elif flag == "-g" then o.blocks_per_group = given(option_value(args, i + 1, flag)?, GeometryError.BadBlocksPerGroup)?
         elif flag == "-j" then o.journal_blocks = given(option_value(args, i + 1, flag)?, GeometryError.BadJournalBlocks)?
+        elif flag == "-d" then from = Some(text_value(args, i + 1, flag)?)
+        elif flag == "-o" then spec = Some(text_value(args, i + 1, flag)?)
         else return Err(s"mkfs.kfs: unknown option '${flag}'\n${MKFS_USAGE}")
         i += 2
 
@@ -90,16 +98,31 @@ run_mkfs(args: []string, entropy: []const u8, now: i64) -> Result[string, string
         Ok(d) -> d
         Err(_) -> return Err(s"mkfs.kfs: cannot create ${path}")
     val made = format(&dev, o, entropy, now)
-    dev.close()
-    made match
-        Ok(g) -> Ok(s"mkfs.kfs: ${path}: ${g.blocks} blocks, ${g.group_count} groups of ${g.blocks_per_group} blocks, ${g.inodes_per_group} inodes each, journal ${g.journal_blocks} blocks at ${g.journal_start}")
-        Err(e) -> Err(s"mkfs.kfs: ${format_message(e)}")
+    val g = made match
+        Ok(g) -> g
+        Err(e) ->
+            dev.close()
+            return Err(s"mkfs.kfs: ${format_message(e)}")
+    var text = s"mkfs.kfs: ${path}: ${g.blocks} blocks, ${g.group_count} groups of ${g.blocks_per_group} blocks, ${g.inodes_per_group} inodes each, journal ${g.journal_blocks} blocks at ${g.journal_start}"
+    var filled = true
+    if from.is_none() && spec.is_none() then filled = false
+    if filled
+        val t = fill_image(&dev, now, from, spec)
+        dev.close()
+        t match
+            Ok(t) -> text = text + s"\nmkfs.kfs: ${t.describe()}"
+            Err(why) -> return Err(s"mkfs.kfs: ${why}")
+    else
+        dev.close()
+    Ok(text)
 
 // `kfsdump <image> [super | groups | inode <number>]`: print what is asked about an image. With nothing
 // asked, the superblock and the descriptors. A primary superblock that fails its check is reported with
 // the backup the search finds.
 run_dump(args: []string) -> Result[string, string]
     if args.len < 1 then return Err(DUMP_USAGE)
+    if args[0] == "get" then return run_get(args[1..])
+    if args[0] == "put" then return run_put(args[1..])
     var dev = open_image(args[0]) match
         Ok(d) -> d
         Err(_) -> return Err(s"kfsdump: cannot open ${args[0]}")

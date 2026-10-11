@@ -2026,8 +2026,9 @@ Builds: geometry selection (section 4) and refusal; writing groups, descriptor t
 bitmaps with metadata and the journal marked, the inode table zeroed, reserved inodes, the root (2,
 empty, no blocks) and `/lost+found`, an empty journal. `kfsdump` prints the superblock, descriptors,
 any inode, any extent tree and any directory. `mkfs.kfs` takes the filesystem size and, optionally, a
-host directory and a **spec file** (lines `<path> <type> <mode> <uid> <gid> [<major> <minor> | <target>]`)
-for owners, device nodes and symlinks — filled in stage 10 once files can be written.
+host directory and a **spec file** (lines `<path> <type> <mode> <uid> <gid> [<major> <minor> | <target>]`,
+and the shorter owners line `<path> <uid> <gid> <mode>`; stage 10 gives the syntax in full) for owners,
+directories, device nodes and symlinks — filled in stage 10 once files can be written.
 Tests: geometry at the edges (just under and over 2 × 2048 blocks, a last group of 63 and 64 data
 blocks, the largest `blocks_per_group`, a journal that does not fit); every computed location equals
 the descriptor's; the bitmap bits of metadata and past-the-end blocks; corrupting block 1 → the backup
@@ -2158,10 +2159,56 @@ stage 8's workload are clean.
 
 Builds: `mkfs.kfs` fills an image from a host directory and the spec file through the package's own
 operations (so the image is made by the same code the kernel runs); `kfsdump get <image> <path>
-<host-file>` and `kfsdump put`. 
+<host-file>` and `kfsdump put <image> <host-file> <path>`.
+
+**`mkfs.kfs <image> <blocks> [options] [-d <host-directory>] [-o <spec-file>]`.** The image is formatted,
+mounted, filled and unmounted. The host directory is copied first, in byte order of name so the same tree
+always makes the same image: a directory is `mkdir` 0755, a regular file `create` 0644 (0755 when any
+execute bit is set on the host) and written whole, a symbolic link `symlink` to its host target; all are
+owned by root. Anything else on the host (a device, a FIFO, a socket) is refused, naming it. Then the spec
+file is applied line by line, in order.
+
+**The spec file.** Blank lines and lines starting with `#` are skipped; fields are separated by spaces or
+tabs; every path is absolute and is looked up without following symbolic links. A line has one of two
+shapes, told apart by its field count:
+
+| line | meaning |
+|---|---|
+| `<path> <uid> <gid> <mode>` (4 fields) | `setattr` on an existing entry: owner and permission bits (`mode` is octal, `0` to `7777`, setuid, setgid and sticky included) |
+| `<path> d <mode> <uid> <gid>` | `mkdir` |
+| `<path> p <mode> <uid> <gid>` | `mknod` a FIFO |
+| `<path> c <mode> <uid> <gid> <major> <minor>` | `mknod` a character device |
+| `<path> b <mode> <uid> <gid> <major> <minor>` | `mknod` a block device |
+| `<path> l <mode> <uid> <gid> <target>` | `symlink` (the target holds no space) |
+
+`uid`, `gid`, `major` and `minor` are decimal, up to 4294967295. The parent of an entry a line makes has to
+exist (from the host directory or an earlier line), and the name must not. Every line is parsed before the
+first is applied, so a malformed line (wrong field count, unknown type, a number that is not one, a mode
+that is not octal or is past 7777, a relative path) is refused with its line number and changes nothing;
+a line that names a path the image lacks, a parent that is not a directory, a name that exists, a name
+past 255 bytes, or more than the image can hold is refused with the path and the reason (`no such file or
+directory`, `not a directory`, `already exists`, `name too long`, `no space left on the image`). Any
+refusal ends `mkfs.kfs` with exit 1 and a message on standard output.
+
+**`kfsdump get <image> <path> <host-file>`** copies one regular file out; the image is mounted read-only
+and nothing is written to it (beyond the replay of a log that needs one). A missing path, a directory, a
+symbolic link (it is not followed), a device or a FIFO, a relative path and an image that will not mount
+are refused, exit 1, and the host file is not created.
+
+**`kfsdump put <image> <host-file> <path>`** copies one host file in. A regular file already at the path
+is replaced (truncated, then written: it keeps its inode, owner and mode); a name that is not there is
+created, 0644 or 0755 as for the host directory. The directory above has to exist; a directory, a symbolic
+link or a device at the path is refused; a name past 255 bytes is `name too long`. A copy that runs out
+of space removes a file it created and leaves a replaced one as far as it got; the image stays
+`fsck`-clean either way.
+
 Tests: an image built from a tree with nested directories, a 200 KiB file, symlinks, device nodes and
 an owners line is `fsck`-clean and reads back byte for byte; `boot-test.sh`'s fsroot builds into a
-32 MiB image.
+32 MiB image (the script builds it with `mkfs.kfs`, `fsck.kfs -n`s it and reads four files back with
+`kfsdump get`). The kfshost tests also cover empty trees, nesting, file sizes at 0, 1, 4095, 4096, 4097,
+65536, 65537 and 200 KiB, inline and block symlinks (128 and 129 bytes), the owners of every kind of
+entry, every malformed spec line, a name of 255 bytes and one of 256, a tree that does not fit, `get` and
+`put` in every refused and accepted case, and an image built twice from one tree being identical.
 
 ### Stage 11 — KFS in the kernel, beside the old filesystem
 

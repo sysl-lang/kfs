@@ -103,3 +103,22 @@ host_entropy() -> Option[Buf[u8]]
 
 // The host's clock, in seconds since the epoch.
 host_now() -> i64 = time.now().us / 1_000_000
+
+// `dev` seen through a wrapper that says it has no flush, so a mount of it is read-only and a command
+// that only reads writes nothing (beyond the replay of a log that needs one).
+struct ReadMostly[D: BlockDevice]
+    inner: *D
+
+impl[D: BlockDevice] BlockDevice for ReadMostly[D]
+    blocks(self) -> u64 = self.inner.blocks()
+
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
+        self.inner.read(b, out)
+
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+        self.inner.write(b, data)
+
+    flush(*self) -> Result[unit, DeviceError]
+        self.inner.flush()
+
+    override has_flush(self) -> bool = false

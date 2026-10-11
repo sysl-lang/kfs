@@ -1,0 +1,809 @@
+module keel.kfshost
+@tests
+@requires(os)
+
+// Filling an image from the host (kfs/SPEC.md section 27, "Populating images on the host"): `mkfs.kfs -d
+// <directory> -o <spec file>`, `kfsdump get` and `kfsdump put`. Every image a test makes is checked with
+// `fsck.kfs -n` (exit 0), and every file is compared byte for byte after it has been through the image.
+
+import kfs.keel.kfs.{DeviceNumbers, INODE_INLINE, Inode, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG}
+import kfs.keel.kfs.{device_numbers, host_platform, mount, readlink, stat}
+import sysl.buf.{Buf, buf}
+import sysl.fs
+import sysl.text.{Search, repeat}
+
+private seed() -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i) * 5 + 1)
+    e
+
+private home(name: string) -> string = s"/tmp/keel-kfshost-pop-${name}"
+
+// A clean directory for one test.
+private fresh(dir: string)
+    if fs.exists(dir) then assert(fs.remove_dir_all(dir).is_ok())
+    assert(fs.make_dir_all(dir).is_ok())
+
+// `n` bytes that differ from one block to the next, so a block written in the wrong place shows.
+private pattern(n: usize, salt: usize) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for i in 0..<n
+        b.push(u8((i * 31 + i / 251 + i / 4096 * 7 + salt) % 256))
+    b
+
+private host_put(path: string, data: []const u8)
+    assert(fs.write_bytes(path, data).is_ok())
+
+private same(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+private args_of(img: string, blocks: usize, dir: string, spec: string) -> Buf[string]
+    var a: Buf[string] = buf()
+    a.push(img)
+    a.push(s"${blocks}")
+    if dir != ""
+        a.push("-d")
+        a.push(dir)
+    if spec != ""
+        a.push("-o")
+        a.push(spec)
+    a
+
+private mkfs(img: string, blocks: usize, dir: string, spec: string) -> Result[string, string]
+    val e = seed()
+    run_mkfs(args_of(img, blocks, dir, spec).view(), e.view(), 1_700_000_000)
+
+private built(img: string, blocks: usize, dir: string, spec: string) -> string
+    mkfs(img, blocks, dir, spec) match
+        Ok(text) -> text
+        Err(why) -> panic(s"mkfs.kfs failed: ${why}")
+
+private refused(img: string, blocks: usize, dir: string, spec: string) -> string
+    mkfs(img, blocks, dir, spec) match
+        Ok(_) -> panic("mkfs.kfs succeeded")
+        Err(why) -> why
+
+private clean(img: string)
+    val r = run_fsck(["-n", img])
+    if r.code != 0 then panic(s"fsck.kfs -n ${img} answered ${r.code}:\n${r.text}")
+
+private got(img: string, path: string) -> []u8
+    val out = s"${img}.out"
+    run_get([img, path, out]) match
+        Ok(_) -> ()
+        Err(why) -> panic(s"get ${path} failed: ${why}")
+    val data = fs.read_bytes(out) match
+        Ok(b) -> b
+        Err(_) -> panic("no output file")
+    assert(fs.remove_file(out).is_ok())
+    data
+
+private get_refused(img: string, path: string) -> string
+    run_get([img, path, s"${img}.out"]) match
+        Ok(_) -> panic(s"get ${path} succeeded")
+        Err(why) -> why
+
+private put_ok(img: string, host: string, path: string) -> string
+    run_put([img, host, path]) match
+        Ok(text) -> text
+        Err(why) -> panic(s"put ${path} failed: ${why}")
+
+private put_refused(img: string, host: string, path: string) -> string
+    run_put([img, host, path]) match
+        Ok(_) -> panic(s"put ${path} succeeded")
+        Err(why) -> why
+
+// What the image says about a path, read through a read-only mount.
+private node_of(img: string, path: string) -> Inode
+    var dev = open_image(img) match
+        Ok(d) -> d
+        Err(_) -> panic("no image")
+    var ro: ReadMostly[FileDevice[fs.File]] = ReadMostly(&dev)
+    var vol = mount(&ro, host_platform()) match
+        Ok(v) -> v
+        Err(_) -> panic("the image did not mount")
+    val ino = resolve(&vol, path) match
+        Ok(i) -> i
+        Err(why) -> panic(why)
+    val n = stat(&vol, ino) match
+        Ok(n) -> n
+        Err(_) -> panic("no inode")
+    dev.close()
+    n
+
+private target_of(img: string, path: string) -> Buf[u8]
+    var dev = open_image(img) match
+        Ok(d) -> d
+        Err(_) -> panic("no image")
+    var ro: ReadMostly[FileDevice[fs.File]] = ReadMostly(&dev)
+    var vol = mount(&ro, host_platform()) match
+        Ok(v) -> v
+        Err(_) -> panic("the image did not mount")
+    val ino = resolve(&vol, path) match
+        Ok(i) -> i
+        Err(why) -> panic(why)
+    var out: Buf[u8] = buf()
+    for _ in 0..<4096
+        out.push(0)
+    val n = readlink(&vol, ino, out.view()) match
+        Ok(n) -> n
+        Err(_) -> panic("readlink failed")
+    dev.close()
+    var exact: Buf[u8] = buf()
+    for i in 0..<n
+        exact.push(out[i])
+    exact
+
+private image_bytes(img: string) -> []u8
+    fs.read_bytes(img) match
+        Ok(b) -> b
+        Err(_) -> panic("no image")
+
+private finish(dir: string, img: string)
+    assert(fs.remove_dir_all(dir).is_ok())
+    assert(fs.remove_file(img).is_ok())
+
+// -- Building from a directory ----------------------------------------------------------------------------
+
+@test("an empty host directory makes an empty filesystem: only the root, fsck-clean")
+populate_empty_directory()
+    val dir = home("empty")
+    val img = s"${dir}.img"
+    fresh(dir)
+    val text = built(img, 8192, dir, "")
+    assert(text.contains("0 files (0 bytes), 0 directories, 0 symbolic links, 0 device nodes and FIFOs"))
+    clean(img)
+    assert(node_of(img, "/").mode & S_IFMT == S_IFDIR)
+    finish(dir, img)
+
+@test("no directory and no spec file: the image is just formatted, and says nothing of a tree")
+populate_nothing_asked()
+    val img = "/tmp/keel-kfshost-pop-nothing.img"
+    val text = built(img, 8192, "", "")
+    assert(!text.contains("files ("))
+    clean(img)
+    assert(fs.remove_file(img).is_ok())
+
+@test("nested directories several deep, a file at every level, read back byte for byte")
+populate_nested_directories()
+    val dir = home("nested")
+    val img = s"${dir}.img"
+    fresh(dir)
+    assert(fs.make_dir_all(s"${dir}/a/b/c/d/e/f").is_ok())
+    var path = ""
+    var shown = ""
+    for part in ["a", "b", "c", "d", "e", "f"]
+        path = path + "/" + part
+        shown = shown + "/" + part
+        host_put(s"${dir}${path}/level.txt", s"level ${part}".bytes)
+    assert(fs.make_dir_all(s"${dir}/empty/inner").is_ok())
+    val text = built(img, 8192, dir, "")
+    assert(text.contains("6 files"))
+    assert(text.contains("8 directories"))
+    clean(img)
+    assert(same(got(img, "/a/b/c/d/e/f/level.txt"), "level f".bytes))
+    assert(same(got(img, "/a/level.txt"), "level a".bytes))
+    assert(same(got(img, "/a/b/c/level.txt"), "level c".bytes))
+    assert_eq(node_of(img, "/empty/inner").mode & S_IFMT, S_IFDIR)
+    assert_eq(node_of(img, "/empty/inner").size, 0)
+    finish(dir, img)
+
+@test("file sizes at every edge: 0, 1, 4095, 4096, 4097, 8192, 65536, 65537 and 200 KiB read back byte for byte")
+populate_file_sizes()
+    val dir = home("sizes")
+    val img = s"${dir}.img"
+    fresh(dir)
+    val sizes: []usize = [0, 1, 4095, 4096, 4097, 8192, 8193, 65535, 65536, 65537, 204800]
+    for n in sizes
+        host_put(s"${dir}/f${n}", pattern(n, n).view())
+    val text = built(img, 8192, dir, "")
+    assert(text.contains("11 files"))
+    clean(img)
+    for n in sizes
+        val back = got(img, s"/f${n}")
+        assert_eq(back.len, n)
+        assert(same(back, pattern(n, n).view()))
+        assert_eq(node_of(img, s"/f${n}").size, u64(n))
+    finish(dir, img)
+
+@test("a host file executable by anyone is 0755 in the image, any other 0644, a directory 0755; all root's")
+populate_modes_and_owner()
+    val dir = home("modes")
+    val img = s"${dir}.img"
+    fresh(dir)
+    host_put(s"${dir}/plain", "p".bytes)
+    host_put(s"${dir}/run", "r".bytes)
+    host_put(s"${dir}/group", "g".bytes)
+    assert(fs.set_permissions(s"${dir}/run", 0o755).is_ok())
+    assert(fs.set_permissions(s"${dir}/group", 0o610).is_ok())
+    assert(fs.make_dir(s"${dir}/sub").is_ok())
+    assert(fs.set_permissions(s"${dir}/sub", 0o700).is_ok())
+    built(img, 8192, dir, "")
+    clean(img)
+    assert_eq(node_of(img, "/plain").mode, S_IFREG | 0o644)
+    assert_eq(node_of(img, "/run").mode, S_IFREG | 0o755)
+    assert_eq(node_of(img, "/group").mode, S_IFREG | 0o755)
+    assert_eq(node_of(img, "/sub").mode, S_IFDIR | 0o755)
+    assert_eq(node_of(img, "/run").uid, 0)
+    assert_eq(node_of(img, "/run").gid, 0)
+    finish(dir, img)
+
+@test("symbolic links: an inline target, a target of a block, a dangling one and one to a directory")
+populate_symlinks()
+    val dir = home("links")
+    val img = s"${dir}.img"
+    fresh(dir)
+    assert(fs.make_dir(s"${dir}/d").is_ok())
+    host_put(s"${dir}/d/file", "inside".bytes)
+    val long_target = repeat("long/", 40) + "end"
+    assert(fs.symlink("d/file", s"${dir}/short").is_ok())
+    assert(fs.symlink(long_target, s"${dir}/long").is_ok())
+    assert(fs.symlink("nowhere", s"${dir}/dangling").is_ok())
+    assert(fs.symlink("d", s"${dir}/todir").is_ok())
+    assert(fs.symlink(repeat("x", 128), s"${dir}/edge128").is_ok())
+    assert(fs.symlink(repeat("y", 129), s"${dir}/edge129").is_ok())
+    val text = built(img, 8192, dir, "")
+    assert(text.contains("6 symbolic links"))
+    clean(img)
+    assert(same(target_of(img, "/short").view(), "d/file".bytes))
+    assert(same(target_of(img, "/long").view(), long_target.bytes))
+    assert(same(target_of(img, "/dangling").view(), "nowhere".bytes))
+    assert(same(target_of(img, "/todir").view(), "d".bytes))
+    assert(same(target_of(img, "/edge128").view(), repeat("x", 128).bytes))
+    assert(same(target_of(img, "/edge129").view(), repeat("y", 129).bytes))
+    assert_eq(node_of(img, "/short").mode & S_IFMT, S_IFLNK)
+    assert(node_of(img, "/short").flags & INODE_INLINE != 0)
+    assert(node_of(img, "/edge128").flags & INODE_INLINE != 0)
+    assert(node_of(img, "/long").flags & INODE_INLINE == 0)
+    assert(node_of(img, "/edge129").flags & INODE_INLINE == 0)
+    assert_eq(node_of(img, "/long").size, u64(long_target.bytes.len))
+    finish(dir, img)
+
+@test("a name of 255 bytes is made and read back; the same tree built twice gives the same image")
+populate_longest_name_and_determinism()
+    val dir = home("longname")
+    val img = s"${dir}.img"
+    val img2 = s"${dir}-2.img"
+    fresh(dir)
+    val name = repeat("n", 255)
+    host_put(s"${dir}/${name}", "longest".bytes)
+    host_put(s"${dir}/b", "b".bytes)
+    host_put(s"${dir}/a", "a".bytes)
+    assert(fs.make_dir(s"${dir}/c").is_ok())
+    host_put(s"${dir}/c/z", pattern(10000, 1).view())
+    host_put(s"${dir}/c/y", pattern(5000, 2).view())
+    built(img, 8192, dir, "")
+    built(img2, 8192, dir, "")
+    clean(img)
+    assert(same(got(img, s"/${name}"), "longest".bytes))
+    assert(same(image_bytes(img), image_bytes(img2)))
+    assert(fs.remove_file(img2).is_ok())
+    finish(dir, img)
+
+@test("a host directory that is not one, or cannot be listed, is refused before anything is made")
+populate_bad_directory()
+    val img = "/tmp/keel-kfshost-pop-baddir.img"
+    val missing = refused(img, 8192, "/tmp/keel-kfshost-no-such-directory", "")
+    assert(missing.contains("is not a directory"))
+    host_put("/tmp/keel-kfshost-pop-afile", "x".bytes)
+    val file = refused(img, 8192, "/tmp/keel-kfshost-pop-afile", "")
+    assert(file.contains("is not a directory"))
+    assert(fs.remove_file("/tmp/keel-kfshost-pop-afile").is_ok())
+    if fs.exists(img) then assert(fs.remove_file(img).is_ok())
+
+@test("-d and -o need a name")
+populate_options_need_values()
+    val e = seed()
+    run_mkfs(["/tmp/keel-kfshost-pop-novalue.img", "8192", "-d"], e.view(), 1) match
+        Ok(_) -> panic("accepted")
+        Err(why) -> assert(why.contains("-d needs a name"))
+    run_mkfs(["/tmp/keel-kfshost-pop-novalue.img", "8192", "-o"], e.view(), 1) match
+        Ok(_) -> panic("accepted")
+        Err(why) -> assert(why.contains("-o needs a name"))
+
+@test("a host tree that does not fit is refused with ENOSPC")
+populate_does_not_fit()
+    val dir = home("big")
+    val img = s"${dir}.img"
+    fresh(dir)
+    host_put(s"${dir}/huge", pattern(14 * 1024 * 1024, 3).view())
+    val why = refused(img, 3205, dir, "")
+    assert(why.contains("/huge: no space left on the image"))
+    finish(dir, img)
+
+// -- The spec file -----------------------------------------------------------------------------------------
+
+private spec_file(dir: string, text: string) -> string
+    val file = s"${dir}.spec"
+    assert(fs.write_text(file, text).is_ok())
+    file
+
+@test("owners lines set uid, gid and permission bits, setuid included, on files and directories")
+populate_owners_applied()
+    val dir = home("owners")
+    val img = s"${dir}.img"
+    fresh(dir)
+    assert(fs.make_dir_all(s"${dir}/bin").is_ok())
+    assert(fs.make_dir_all(s"${dir}/home/alice").is_ok())
+    host_put(s"${dir}/bin/su", "su".bytes)
+    host_put(s"${dir}/etc-secret", "s".bytes)
+    val spec = spec_file(dir, "/bin/su 0 0 4755\n/home/alice 1000 1000 750\n/etc-secret 0 100 600\n/ 7 8 1777\n")
+    built(img, 8192, dir, spec)
+    clean(img)
+    val su = node_of(img, "/bin/su")
+    assert_eq(su.mode, S_IFREG | 0o4755)
+    assert_eq(su.uid, 0)
+    val alice = node_of(img, "/home/alice")
+    assert_eq(alice.mode, S_IFDIR | 0o750)
+    assert_eq(alice.uid, 1000)
+    assert_eq(alice.gid, 1000)
+    val secret = node_of(img, "/etc-secret")
+    assert_eq(secret.mode, S_IFREG | 0o600)
+    assert_eq(secret.gid, 100)
+    val top = node_of(img, "/")
+    assert_eq(top.mode, S_IFDIR | 0o1777)
+    assert_eq(top.uid, 7)
+    assert_eq(top.gid, 8)
+    assert(same(got(img, "/bin/su"), "su".bytes))
+    assert(fs.remove_file(spec).is_ok())
+    finish(dir, img)
+
+@test("setgid and the largest ids: 2755 and 4294967295 are taken")
+populate_owners_extremes()
+    val dir = home("extremes")
+    val img = s"${dir}.img"
+    fresh(dir)
+    host_put(s"${dir}/f", "f".bytes)
+    val spec = spec_file(dir, "/f 4294967295 4294967295 6777\n")
+    built(img, 8192, dir, spec)
+    clean(img)
+    assert_eq(node_of(img, "/f").uid, 4294967295)
+    assert_eq(node_of(img, "/f").gid, 4294967295)
+    assert_eq(node_of(img, "/f").mode, S_IFREG | 0o6777)
+    assert(fs.remove_file(spec).is_ok())
+    finish(dir, img)
+
+@test("device nodes and FIFOs from the spec file: type, numbers, owner and mode")
+populate_nodes()
+    val dir = home("nodes")
+    val img = s"${dir}.img"
+    fresh(dir)
+    assert(fs.make_dir(s"${dir}/dev").is_ok())
+    val text = "# the devices\n\n/dev/console c 600 0 0 5 1\n/dev/sda b 660 0 6 8 0\n/dev/fifo p 644 1000 100\n" +
+        "/dev/big c 666 3 4 70000 259\n/dev/console 2 3 620\n"
+    val spec = spec_file(dir, text)
+    val said = built(img, 8192, dir, spec)
+    assert(said.contains("4 device nodes and FIFOs"))
+    clean(img)
+    val console = node_of(img, "/dev/console")
+    assert_eq(console.mode, S_IFCHR | 0o620)
+    assert_eq(console.uid, 2)
+    assert_eq(console.gid, 3)
+    val c = device_numbers(console)
+    assert_eq(c.major, 5)
+    assert_eq(c.minor, 1)
+    val sda = node_of(img, "/dev/sda")
+    assert_eq(sda.mode, S_IFBLK | 0o660)
+    assert_eq(sda.gid, 6)
+    assert_eq(device_numbers(sda).major, 8)
+    assert_eq(device_numbers(sda).minor, 0)
+    val fifo = node_of(img, "/dev/fifo")
+    assert_eq(fifo.mode, S_IFIFO | 0o644)
+    assert_eq(fifo.uid, 1000)
+    assert_eq(fifo.gid, 100)
+    val big = node_of(img, "/dev/big")
+    assert_eq(device_numbers(big).major, 70000)
+    assert_eq(device_numbers(big).minor, 259)
+    assert_eq(big.mode, S_IFCHR | 0o666)
+    assert(get_refused(img, "/dev/console").contains("not a regular file"))
+    assert(get_refused(img, "/dev/fifo").contains("not a regular file"))
+    assert(fs.remove_file(spec).is_ok())
+    finish(dir, img)
+
+@test("spec lines make directories and symbolic links, in order: a directory made by one line holds the next")
+populate_spec_directories_and_links()
+    val dir = home("speclinks")
+    val img = s"${dir}.img"
+    fresh(dir)
+    val long_target = repeat("t/", 100) + "x"
+    val text = s"/etc d 755 0 0\n/etc/mtab l 777 0 0 /proc/mounts\n/priv d 4700 5 6\n/priv/node p 600 5 6\n/long l 777 1 2 ${long_target}\n/etc/mtab 8 9 755\n"
+    val spec = spec_file(dir, text)
+    val said = built(img, 8192, dir, spec)
+    assert(said.contains("0 files (0 bytes), 2 directories, 2 symbolic links, 1 device nodes and FIFOs"))
+    clean(img)
+    assert_eq(node_of(img, "/etc").mode, S_IFDIR | 0o755)
+    assert_eq(node_of(img, "/priv").mode, S_IFDIR | 0o4700)
+    assert_eq(node_of(img, "/priv").uid, 5)
+    assert_eq(node_of(img, "/priv").gid, 6)
+    assert_eq(node_of(img, "/priv/node").mode, S_IFIFO | 0o600)
+    assert(same(target_of(img, "/etc/mtab").view(), "/proc/mounts".bytes))
+    assert_eq(node_of(img, "/etc/mtab").mode, S_IFLNK | 0o755)
+    assert_eq(node_of(img, "/etc/mtab").uid, 8)
+    assert(same(target_of(img, "/long").view(), long_target.bytes))
+    assert_eq(node_of(img, "/long").uid, 1)
+    assert(fs.remove_file(spec).is_ok())
+    finish(dir, img)
+
+@test("a spec directory line over a name the host tree made is refused as existing")
+populate_spec_directory_exists()
+    assert(spec_refused("dexists", "/f d 755 0 0\n").contains("/f: already exists"))
+    assert(spec_refused("lexists", "/f l 777 0 0 x\n").contains("/f: already exists"))
+
+@test("a spec file alone, with no host directory, makes nodes in an empty filesystem")
+populate_spec_without_directory()
+    val img = "/tmp/keel-kfshost-pop-specalone.img"
+    val file = "/tmp/keel-kfshost-pop-specalone.spec"
+    assert(fs.write_text(file, "/tty c 620 0 5 4 64\n/ 0 0 755\n").is_ok())
+    val said = built(img, 8192, "", file)
+    assert(said.contains("1 device nodes and FIFOs"))
+    clean(img)
+    assert_eq(node_of(img, "/tty").mode, S_IFCHR | 0o620)
+    assert(fs.remove_file(file).is_ok())
+    assert(fs.remove_file(img).is_ok())
+
+private spec_refused(name: string, text: string) -> string
+    val dir = home(name)
+    val img = s"${dir}.img"
+    fresh(dir)
+    assert(fs.make_dir(s"${dir}/dev").is_ok())
+    host_put(s"${dir}/f", "f".bytes)
+    val spec = spec_file(dir, text)
+    val why = refused(img, 8192, dir, spec)
+    assert(fs.remove_file(spec).is_ok())
+    assert(fs.remove_dir_all(dir).is_ok())
+    if fs.exists(img) then assert(fs.remove_file(img).is_ok())
+    why
+
+@test("an owners line for a path that is not in the image is refused, naming the path and its line")
+populate_owners_missing_path()
+    val why = spec_refused("missing", "/f 0 0 644\n/no/such 0 0 644\n")
+    assert(why.contains("/no/such: no such file or directory"))
+    val under_file = spec_refused("underfile", "/f/inner 0 0 644\n")
+    assert(under_file.contains("/f/inner: not a directory"))
+
+@test("malformed owners lines are refused with their line number, and nothing in the file is applied")
+populate_owners_malformed()
+    assert(spec_refused("m1", "/f 0 0\n").contains("line 1: '/f 0 0' is neither '<path> <uid> <gid> <mode>' nor '<path> <type> <mode> <uid> <gid> ...'"))
+    assert(spec_refused("m2", "/f 0 0 644 extra\n").contains("'0' is not an entry type (d, c, b, p or l)"))
+    assert(spec_refused("m3", "\n\n/f abc 0 644\n").contains("line 3: an owner is not a number"))
+    assert(spec_refused("m4", "/f 0 -1 644\n").contains("an owner is not a number"))
+    assert(spec_refused("m5", "/f 0 0 999\n").contains("'999' is not an octal permission mode"))
+    assert(spec_refused("m6", "/f 0 0 17777\n").contains("'17777' is not an octal permission mode"))
+    assert(spec_refused("m7", "/f 4294967296 0 644\n").contains("an owner is not a number"))
+    assert(spec_refused("m8", "f 0 0 644\n").contains("'f' is not an absolute path"))
+    assert(spec_refused("m9", "/f 0 0 644\nnonsense here\n").contains("line 2"))
+    assert(spec_refused("m10", "/f 0 0 -644\n").contains("not an octal permission mode"))
+
+@test("a malformed line anywhere changes nothing: the image's owners stay root's")
+populate_malformed_changes_nothing()
+    val dir = home("nothing")
+    val img = s"${dir}.img"
+    fresh(dir)
+    host_put(s"${dir}/f", "f".bytes)
+    val spec = spec_file(dir, "/f 5 5 600\n/f oops\n")
+    val why = refused(img, 8192, dir, spec)
+    assert(why.contains("line 2"))
+    assert_eq(node_of(img, "/f").uid, 0)
+    assert_eq(node_of(img, "/f").mode, S_IFREG | 0o644)
+    assert(fs.remove_file(spec).is_ok())
+    finish(dir, img)
+
+@test("malformed node lines: unknown type, wrong field count, bad numbers, relative path, missing parent, existing name")
+populate_node_lines_refused()
+    assert(spec_refused("n1", "/dev/x q 600 0 0 1 1\n").contains("'q' is not an entry type"))
+    assert(spec_refused("n2", "/dev/x c 600 0 0 1\n").contains("takes 7 fields, not 6"))
+    assert(spec_refused("n3", "/dev/x p 600 0 0 9\n").contains("takes 5 fields, not 6"))
+    assert(spec_refused("n4", "/dev/x c 600 0 0 a 1\n").contains("a device number is not a number"))
+    assert(spec_refused("n5", "/dev/x c 600 0 0 1 b\n").contains("a device number is not a number"))
+    assert(spec_refused("n6", "dev/x p 600 0 0\n").contains("not an absolute path"))
+    assert(spec_refused("n7", "/nodir/x c 600 0 0 1 1\n").contains("/nodir/x: no such file or directory"))
+    assert(spec_refused("n8", "/f p 600 0 0\n").contains("/f: already exists"))
+    assert(spec_refused("n9", "/dev/x p 12345 0 0\n").contains("not an octal permission mode"))
+    assert(spec_refused("n10", "/dev/x p 600 x 0\n").contains("an owner is not a number"))
+    assert(spec_refused("n11", "node\n").contains("is not an absolute path"))
+    assert(spec_refused("n12", "/f/x p 600 0 0\n").contains("not a directory"))
+    assert(spec_refused("n13", "/ p 600 0 0\n").contains("names no file"))
+    assert(spec_refused("n14", "/dev/x l 777 0 0\n").contains("takes 6 fields, not 5"))
+    assert(spec_refused("n15", "/dev/x d 600 0\n").contains("an owner is not a number"))
+    assert(spec_refused("n16", "/dev/x d 1000000 0 0\n").contains("not an octal permission mode"))
+    assert(spec_refused("n17", "/dev/x l 777 0 0 a b\n").contains("takes 6 fields, not 7"))
+    assert(spec_refused("n18", "/dev/x\n").contains("neither"))
+    assert(spec_refused("n19", "/dev/x c 600 0 0 4294967296 1\n").contains("a device number is not a number"))
+
+@test("a node name of 255 bytes is made and one of 256 is refused as too long")
+populate_node_name_lengths()
+    val dir = home("nodename")
+    val img = s"${dir}.img"
+    fresh(dir)
+    val spec = spec_file(dir, s"/${repeat("d", 255)} p 600 0 0\n")
+    built(img, 8192, dir, spec)
+    clean(img)
+    assert_eq(node_of(img, s"/${repeat("d", 255)}").mode & S_IFMT, S_IFIFO)
+    assert(fs.remove_file(spec).is_ok())
+    val spec2 = spec_file(dir, s"/${repeat("d", 256)} p 600 0 0\n")
+    val why = refused(img, 8192, dir, spec2)
+    assert(why.contains("name too long"))
+    assert(fs.remove_file(spec2).is_ok())
+    finish(dir, img)
+
+@test("a spec file that cannot be read is refused")
+populate_spec_unreadable()
+    val img = "/tmp/keel-kfshost-pop-nospec.img"
+    val why = refused(img, 8192, "", "/tmp/keel-kfshost-pop-no-such-spec")
+    assert(why.contains("cannot read /tmp/keel-kfshost-pop-no-such-spec"))
+    if fs.exists(img) then assert(fs.remove_file(img).is_ok())
+
+// -- boot-test's fsroot --------------------------------------------------------------------------------------
+
+@test("a tree shaped like boot-test.sh's fsroot builds into a 32 MiB image, fsck-clean, every file back byte for byte")
+populate_fsroot_in_32_mib()
+    val dir = home("fsroot")
+    val img = s"${dir}.img"
+    fresh(dir)
+    assert(fs.make_dir_all(s"${dir}/bin").is_ok())
+    assert(fs.make_dir_all(s"${dir}/etc").is_ok())
+    assert(fs.make_dir_all(s"${dir}/home/alice").is_ok())
+    assert(fs.make_dir_all(s"${dir}/dir").is_ok())
+    assert(fs.make_dir_all(s"${dir}/m9").is_ok())
+    var names: Buf[string] = buf()
+    val programs: usize = 28
+    for i in 0..<programs
+        val name = s"prog${i}"
+        names.push(name)
+        host_put(s"${dir}/bin/${name}", pattern(60000 + i * 1237, i).view())
+        assert(fs.set_permissions(s"${dir}/bin/${name}", 0o755).is_ok())
+    host_put(s"${dir}/bin/su", "su".bytes)
+    host_put(s"${dir}/bin/busybox", pattern(1116408, 99).view())
+    assert(fs.set_permissions(s"${dir}/bin/busybox", 0o755).is_ok())
+    host_put(s"${dir}/etc/passwd", "root:x:0:0:/root:/bin/sh\nalice:y:1000:100:/home/alice:/bin/sh\n".bytes)
+    host_put(s"${dir}/etc/group", "root:x:0:\nusers:x:100:alice\n".bytes)
+    host_put(s"${dir}/etc/secret", "keel".bytes)
+    host_put(s"${dir}/hello.txt", "hello from the disk\n".bytes)
+    host_put(s"${dir}/dir/inner.txt", "inside a directory\n".bytes)
+    host_put(s"${dir}/m9/big.bin", pattern(204800, 9).view())
+    val spec = spec_file(dir, "/bin/su 0 0 4755\n/bin/prog3 0 0 4755\n/home/alice 1000 100 755\n/etc/secret 0 0 600\n")
+    built(img, 8192, dir, spec)
+    clean(img)
+    assert_eq(fs.size_of(img).unwrap(), long(8192 * 4096))
+    for i in 0..<programs
+        assert(same(got(img, s"/bin/${names[i]}"), pattern(60000 + i * 1237, i).view()))
+    assert(same(got(img, "/bin/busybox"), pattern(1116408, 99).view()))
+    assert(same(got(img, "/m9/big.bin"), pattern(204800, 9).view()))
+    assert(same(got(img, "/hello.txt"), "hello from the disk\n".bytes))
+    assert_eq(node_of(img, "/bin/prog3").mode, S_IFREG | 0o4755)
+    assert_eq(node_of(img, "/etc/secret").mode, S_IFREG | 0o600)
+    assert_eq(node_of(img, "/home/alice").uid, 1000)
+    assert(fs.remove_file(spec).is_ok())
+    finish(dir, img)
+
+// -- kfsdump get -------------------------------------------------------------------------------------------
+
+private small_image(name: string) -> string
+    val dir = home(name)
+    val img = s"${dir}.img"
+    fresh(dir)
+    host_put(s"${dir}/file", "contents".bytes)
+    host_put(s"${dir}/empty", "".bytes)
+    assert(fs.make_dir_all(s"${dir}/d/e").is_ok())
+    host_put(s"${dir}/d/e/deep", "deep".bytes)
+    assert(fs.symlink("file", s"${dir}/link").is_ok())
+    assert(fs.symlink("d", s"${dir}/dirlink").is_ok())
+    built(img, 8192, dir, "")
+    assert(fs.remove_dir_all(dir).is_ok())
+    img
+
+@test("get: a file at the top, one deep, an empty one, with repeated and trailing slashes")
+get_files()
+    val img = small_image("get1")
+    assert(same(got(img, "/file"), "contents".bytes))
+    assert(same(got(img, "/d/e/deep"), "deep".bytes))
+    assert(same(got(img, "//d///e/deep"), "deep".bytes))
+    assert_eq(got(img, "/empty").len, 0)
+    clean(img)
+    assert(fs.remove_file(img).is_ok())
+
+@test("get: a missing path, a missing directory on the way, a directory, a symbolic link and a relative path are refused")
+get_refusals()
+    val img = small_image("get2")
+    assert(get_refused(img, "/nothing").contains("/nothing: no such file or directory"))
+    assert(get_refused(img, "/nodir/deep").contains("no such file or directory"))
+    assert(get_refused(img, "/file/deep").contains("not a directory"))
+    assert(get_refused(img, "/d").contains("/d: is a directory"))
+    assert(get_refused(img, "/").contains("is a directory"))
+    assert(get_refused(img, "/link").contains("is a symbolic link"))
+    assert(get_refused(img, "/dirlink/e/deep").contains("not a directory"))
+    assert(get_refused(img, "file").contains("not an absolute path"))
+    assert(get_refused(img, "").contains("not an absolute path"))
+    assert(!fs.exists(s"${img}.out"))
+    clean(img)
+    assert(fs.remove_file(img).is_ok())
+
+@test("get: usage, a missing image, a file that is not an image; and it writes nothing to the image")
+get_usage_and_images()
+    val img = small_image("get3")
+    run_get([img, "/file"]) match
+        Ok(_) -> panic("accepted")
+        Err(why) -> assert(why.contains("usage: kfsdump get"))
+    run_get([img, "/file", "/tmp/keel-kfshost-pop-out", "extra"]) match
+        Ok(_) -> panic("accepted")
+        Err(why) -> assert(why.contains("usage: kfsdump get"))
+    run_get(["/tmp/keel-kfshost-pop-no-image", "/file", "/tmp/keel-kfshost-pop-out"]) match
+        Ok(_) -> panic("accepted")
+        Err(why) -> assert(why.contains("cannot open"))
+    host_put("/tmp/keel-kfshost-pop-notkfs.img", pattern(4096 * 8, 1).view())
+    run_get(["/tmp/keel-kfshost-pop-notkfs.img", "/file", "/tmp/keel-kfshost-pop-out"]) match
+        Ok(_) -> panic("accepted")
+        Err(why) -> assert(why.contains("cannot mount the image"))
+    assert(fs.remove_file("/tmp/keel-kfshost-pop-notkfs.img").is_ok())
+    val before = image_bytes(img)
+    got(img, "/file")
+    got(img, "/d/e/deep")
+    assert(same(image_bytes(img), before))
+    assert(fs.remove_file(img).is_ok())
+
+@test("get through kfsdump's entry point: 'get' as the first word")
+get_through_dump()
+    val img = small_image("get4")
+    val out = "/tmp/keel-kfshost-pop-get4.out"
+    run_dump(["get", img, "/file", out]) match
+        Ok(text) -> assert(text.contains("/file: 8 bytes"))
+        Err(why) -> panic(why)
+    assert(same(fs.read_bytes(out).unwrap(), "contents".bytes))
+    assert(fs.remove_file(out).is_ok())
+    run_dump(["put", img, out, "/x"]) match
+        Ok(_) -> panic("accepted")
+        Err(why) -> assert(why.contains("cannot read"))
+    assert(fs.remove_file(img).is_ok())
+
+// -- kfsdump put -------------------------------------------------------------------------------------------
+
+@test("put creates a file, 0644 or 0755 as the host file is, and it is fsck-clean and reads back")
+put_creates()
+    val img = small_image("put1")
+    val a = "/tmp/keel-kfshost-pop-put1a"
+    val b = "/tmp/keel-kfshost-pop-put1b"
+    host_put(a, pattern(100000, 4).view())
+    host_put(b, "#!/bin/sh\n".bytes)
+    assert(fs.set_permissions(b, 0o755).is_ok())
+    assert(put_ok(img, a, "/d/new.bin").contains("/d/new.bin: 100000 bytes"))
+    put_ok(img, b, "/run.sh")
+    clean(img)
+    assert(same(got(img, "/d/new.bin"), pattern(100000, 4).view()))
+    assert(same(got(img, "/run.sh"), "#!/bin/sh\n".bytes))
+    assert_eq(node_of(img, "/d/new.bin").mode, S_IFREG | 0o644)
+    assert_eq(node_of(img, "/run.sh").mode, S_IFREG | 0o755)
+    assert(same(got(img, "/file"), "contents".bytes))
+    assert(fs.remove_file(a).is_ok())
+    assert(fs.remove_file(b).is_ok())
+    assert(fs.remove_file(img).is_ok())
+
+@test("put over an existing file replaces it, shorter or longer, keeping its inode, owner and mode")
+put_replaces()
+    val dir = home("put2")
+    val img = s"${dir}.img"
+    fresh(dir)
+    host_put(s"${dir}/f", pattern(50000, 1).view())
+    val spec = spec_file(dir, "/f 42 43 4750\n")
+    built(img, 8192, dir, spec)
+    val before = node_of(img, "/f")
+    val a = "/tmp/keel-kfshost-pop-put2a"
+    host_put(a, pattern(300, 2).view())
+    put_ok(img, a, "/f")
+    clean(img)
+    assert(same(got(img, "/f"), pattern(300, 2).view()))
+    assert_eq(node_of(img, "/f").size, 300)
+    assert_eq(node_of(img, "/f").uid, 42)
+    assert_eq(node_of(img, "/f").gid, 43)
+    assert_eq(node_of(img, "/f").mode, S_IFREG | 0o4750)
+    assert_eq(node_of(img, "/f").generation, before.generation)
+    host_put(a, pattern(200000, 3).view())
+    put_ok(img, a, "/f")
+    clean(img)
+    assert(same(got(img, "/f"), pattern(200000, 3).view()))
+    assert_eq(node_of(img, "/f").mode, S_IFREG | 0o4750)
+    assert(fs.remove_file(a).is_ok())
+    assert(fs.remove_file(spec).is_ok())
+    finish(dir, img)
+
+@test("put of a 0-byte file creates an empty file, and over a full one empties it")
+put_empty()
+    val img = small_image("put3")
+    val z = "/tmp/keel-kfshost-pop-put3z"
+    host_put(z, "".bytes)
+    assert(put_ok(img, z, "/zero").contains("0 bytes"))
+    assert_eq(got(img, "/zero").len, 0)
+    put_ok(img, z, "/file")
+    assert_eq(got(img, "/file").len, 0)
+    assert_eq(node_of(img, "/file").size, 0)
+    clean(img)
+    assert(fs.remove_file(z).is_ok())
+    assert(fs.remove_file(img).is_ok())
+
+@test("put sizes at every edge read back and leave the image clean")
+put_sizes()
+    val img = small_image("put4")
+    val f = "/tmp/keel-kfshost-pop-put4f"
+    val sizes: []usize = [1, 4095, 4096, 4097, 65536, 65537, 204800]
+    for n in sizes
+        host_put(f, pattern(n, n).view())
+        put_ok(img, f, s"/p${n}")
+    clean(img)
+    for n in sizes
+        assert(same(got(img, s"/p${n}"), pattern(n, n).view()))
+    assert(fs.remove_file(f).is_ok())
+    assert(fs.remove_file(img).is_ok())
+
+@test("put refusals: a missing parent, a file as a parent, a directory, a symbolic link, the root, a relative path, a missing host file")
+put_refusals()
+    val img = small_image("put5")
+    val f = "/tmp/keel-kfshost-pop-put5f"
+    host_put(f, "x".bytes)
+    assert(put_refused(img, f, "/nodir/x").contains("/nodir/x: no such file or directory"))
+    assert(put_refused(img, f, "/d/nodir/x").contains("no such file or directory"))
+    assert(put_refused(img, f, "/file/x").contains("not a directory"))
+    assert(put_refused(img, f, "/d").contains("exists and is not a regular file"))
+    assert(put_refused(img, f, "/link").contains("exists and is not a regular file"))
+    assert(put_refused(img, f, "/").contains("names no file"))
+    assert(put_refused(img, f, "x").contains("not an absolute path"))
+    assert(put_refused(img, "/tmp/keel-kfshost-pop-no-host-file", "/y").contains("cannot read /tmp/keel-kfshost-pop-no-host-file"))
+    assert(put_refused("/tmp/keel-kfshost-pop-no-image", f, "/y").contains("cannot open"))
+    run_put([img, f]) match
+        Ok(_) -> panic("accepted")
+        Err(why) -> assert(why.contains("usage: kfsdump put"))
+    assert(same(got(img, "/file"), "contents".bytes))
+    assert(get_refused(img, "/y").contains("no such file"))
+    clean(img)
+    assert(fs.remove_file(f).is_ok())
+    assert(fs.remove_file(img).is_ok())
+
+@test("put names: 255 bytes is made, 256 is refused as too long and nothing is left behind")
+put_name_lengths()
+    val img = small_image("put6")
+    val f = "/tmp/keel-kfshost-pop-put6f"
+    host_put(f, "named".bytes)
+    val name = repeat("p", 255)
+    put_ok(img, f, s"/d/${name}")
+    assert(same(got(img, s"/d/${name}"), "named".bytes))
+    val why = put_refused(img, f, s"/d/${repeat("p", 256)}")
+    assert(why.contains("name too long"))
+    clean(img)
+    assert(fs.remove_file(f).is_ok())
+    assert(fs.remove_file(img).is_ok())
+
+@test("put into a full image is refused with ENOSPC, removes the file it made, and leaves the image clean")
+put_does_not_fit()
+    val dir = home("put7")
+    val img = s"${dir}.img"
+    fresh(dir)
+    host_put(s"${dir}/keep", pattern(1000, 1).view())
+    built(img, 3205, dir, "")
+    val f = "/tmp/keel-kfshost-pop-put7f"
+    host_put(f, pattern(14 * 1024 * 1024, 5).view())
+    val why = put_refused(img, f, "/big")
+    assert(why.contains("no space left on the image"))
+    assert(get_refused(img, "/big").contains("no such file or directory"))
+    assert(same(got(img, "/keep"), pattern(1000, 1).view()))
+    clean(img)
+    host_put(f, pattern(100000, 6).view())
+    put_ok(img, f, "/after")
+    assert(same(got(img, "/after"), pattern(100000, 6).view()))
+    clean(img)
+    assert(fs.remove_file(f).is_ok())
+    finish(dir, img)
+
+@test("a built image takes put and get in turn, and stays clean through a run of them")
+put_get_run()
+    val img = small_image("put8")
+    val f = "/tmp/keel-kfshost-pop-put8f"
+    val rounds: usize = 12
+    for round in 0..<rounds
+        host_put(f, pattern(1000 + round * 7919, round).view())
+        put_ok(img, f, s"/r${round % 4}")
+        assert(same(got(img, s"/r${round % 4}"), pattern(1000 + round * 7919, round).view()))
+    clean(img)
+    assert(fs.remove_file(f).is_ok())
+    assert(fs.remove_file(img).is_ok())

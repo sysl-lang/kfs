@@ -1,0 +1,395 @@
+module keel.kfshost
+@requires(os)
+
+import kfs.keel.kfs.{BlockDevice, Caller, DeviceError, DeviceNumbers, Fs, FsError, HostPlatform, ROOT_INO}
+import kfs.keel.kfs.{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG}
+import kfs.keel.kfs.{create, errno, host_platform, lookup_name, mkdir, mknod, mount, no_change, read, setattr, stat, symlink, truncate, unlink, write}
+import sysl.buf.{Buf, buf}
+import sysl.fs
+import sysl.text.{parse_long, parse_long_base}
+
+// Filling an image from the host, through the package's own operations (kfs/SPEC.md section 27): the
+// tree of a host directory and the lines of a spec file are made with `create`, `mkdir`, `symlink`,
+// `mknod`, `write` and `setattr`, so the image is made by the code the kernel runs. `kfsdump get` and
+// `kfsdump put` are the same operations over one file.
+//
+// The **spec file** has one line per entry; blank lines and lines starting with `#` are skipped, fields
+// are separated by spaces or tabs, and lines are applied in order, after the host directory is copied:
+//
+//   <path> <uid> <gid> <octal mode>                  set an existing entry's owner and permission bits
+//   <path> d <octal mode> <uid> <gid>                make a directory
+//   <path> c <octal mode> <uid> <gid> <major> <minor>   make a character device
+//   <path> b <octal mode> <uid> <gid> <major> <minor>   make a block device
+//   <path> p <octal mode> <uid> <gid>                make a FIFO
+//   <path> l <octal mode> <uid> <gid> <target>       make a symbolic link (the target holds no space)
+//
+// A path is absolute; the parent of an entry a line makes has to exist already. The two forms are told
+// apart by their length: four fields set an owner, five or more make an entry (kfs/SPEC.md section 4).
+
+const GET_USAGE: string = "usage: kfsdump get <image> <path> <host-file>"
+const PUT_USAGE: string = "usage: kfsdump put <image> <host-file> <path>"
+
+// Bytes handed to one `write`.
+private const CHUNK: usize = 65536
+
+// What `populate` made.
+struct Tally
+    files: u32
+    dirs: u32
+    links: u32
+    nodes: u32
+    bytes: u64
+
+    describe(self) -> string = s"${self.files} files (${self.bytes} bytes), ${self.dirs} directories, ${self.links} symbolic links, ${self.nodes} device nodes and FIFOs"
+
+private root() -> Caller = Caller(0, 0)
+
+fs_reason(e: FsError) -> string
+    e match
+        NoSpace -> "no space left on the image"
+        TooBig -> "file too large"
+        Invalid -> "invalid argument"
+        ReadOnly -> "the image is read-only"
+        Exists -> "already exists"
+        NotFound -> "no such file or directory"
+        NameTooLong -> "name too long"
+        NotDirectory -> "not a directory"
+        IsDirectory -> "is a directory"
+        NotEmpty -> "directory not empty"
+        TooManyLinks -> "too many links"
+        NotPermitted -> "operation not permitted"
+        Busy -> "busy"
+        _ -> s"filesystem error ${errno(e)}"
+
+private made[T](r: Result[T, FsError], at: string) -> Result[T, string]
+    r match
+        Ok(v) -> Ok(v)
+        Err(e) -> Err(s"${at}: ${fs_reason(e)}")
+
+// -- Paths --------------------------------------------------------------------------------------------
+
+private struct Place
+    dir: u64
+    name: string
+
+private parts(path: string) -> Result[Buf[string], string]
+    if path.bytes.len == 0 || path.bytes[0] != u8('/') then return Err(s"${path}: not an absolute path")
+    var out: Buf[string] = buf()
+    var start: usize = 0
+    for i in 0..<path.bytes.len + 1
+        if i == path.bytes.len || path.bytes[i] == u8('/')
+            if i > start then out.push(path[start..<i])
+            start = i + 1
+    Ok(out)
+
+// The inode an absolute path names; a symbolic link on the way is not followed.
+resolve[D: BlockDevice](vol: *Fs[D, HostPlatform], path: string) -> Result[u64, string]
+    val names = parts(path)?
+    var ino = ROOT_INO
+    for p in names.view()
+        ino = made(lookup_name(vol, ino, p.bytes), path)?.ino
+    Ok(ino)
+
+// The directory that holds `path`'s last name, and that name.
+private place[D: BlockDevice](vol: *Fs[D, HostPlatform], path: string) -> Result[Place, string]
+    val names = parts(path)?
+    if names.len() == 0 then return Err(s"${path}: names no file")
+    var ino = ROOT_INO
+    for i in 0..<names.len() - 1
+        ino = made(lookup_name(vol, ino, names[i].bytes), path)?.ino
+    Ok(Place(ino, names[names.len() - 1]))
+
+// -- Writing a file -----------------------------------------------------------------------------------
+
+private store[D: BlockDevice](vol: *Fs[D, HostPlatform], ino: u64, data: []const u8, at: string) -> Result[unit, string]
+    var off: usize = 0
+    while off < data.len
+        val n = if data.len - off < CHUNK then data.len - off else CHUNK
+        val done = made(write(vol, ino, u64(off), data[off..<off + n], 0), at)?
+        if done != n then return Err(s"${at}: no space left on the image")
+        off += n
+    Ok(())
+
+private less(a: string, b: string) -> bool
+    val n = if a.bytes.len < b.bytes.len then a.bytes.len else b.bytes.len
+    for i in 0..<n
+        if a.bytes[i] != b.bytes[i] then return a.bytes[i] < b.bytes[i]
+    a.bytes.len < b.bytes.len
+
+// The names in byte order, so the same tree always makes the same image.
+private sorted(names: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+    for n in names.view()
+        out.push(n)
+        var j = out.len() - 1
+        while j > 0 && less(n, out[j - 1])
+            out[j] = out[j - 1]
+            j -= 1
+        out[j] = n
+    out
+
+private copy_dir[D: BlockDevice](vol: *Fs[D, HostPlatform], dir: u64, host: string, shown: string, t: *Tally) -> Result[unit, string]
+    val listed = fs.entries(host) match
+        Ok(n) -> n
+        Err(_) -> return Err(s"cannot list ${host}")
+    val names = sorted(listed)
+    for name in names.view()
+        val from = s"${host}/${name}"
+        val at = s"${shown}${name}"
+        val m = fs.link_metadata(from) match
+            Ok(m) -> m
+            Err(_) -> return Err(s"cannot read ${from}")
+        if m.is_dir()
+            val child = made(mkdir(vol, dir, name.bytes, 0o755, root()), at)?
+            t.dirs += 1
+            copy_dir(vol, child, from, s"${at}/", t)?
+        elif m.is_link()
+            val target = fs.read_link(from) match
+                Ok(s) -> s
+                Err(_) -> return Err(s"cannot read the link ${from}")
+            made(symlink(vol, dir, name.bytes, target.bytes, root()), at)?
+            t.links += 1
+        elif m.is_file()
+            val data = fs.read_bytes(from) match
+                Ok(b) -> b
+                Err(_) -> return Err(s"cannot read ${from}")
+            val ino = made(create(vol, dir, name.bytes, if m.permissions() & 0o111 != 0 then 0o755 else 0o644, root()), at)?
+            store(vol, ino, data, at)?
+            t.files += 1
+            t.bytes += u64(data.len)
+        else
+            return Err(s"${from}: not a regular file, a directory or a symbolic link")
+    Ok(())
+
+// -- The spec file ------------------------------------------------------------------------------------
+
+private struct Line
+    // Whether the line makes an entry (`kind` is its S_IF type) or only sets an existing one's owner.
+    makes: bool
+    path: string
+    kind: u16
+    target: string
+    major: u32
+    minor: u32
+    uid: u32
+    gid: u32
+    mode: u16
+    number: usize
+
+private fields(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+    for i in 0..<text.bytes.len + 1
+        if i == text.bytes.len || text.bytes[i] == u8(' ') || text.bytes[i] == u8('\t') || text.bytes[i] == u8('\r')
+            if i > start then out.push(text[start..<i])
+            start = i + 1
+    out
+
+private count(text: string, top: long) -> Option[long]
+    parse_long(text) match
+        Ok(n) -> if n >= 0 && n <= top then Some(n) else None
+        Err(_) -> None
+
+private octal(text: string) -> Option[long]
+    parse_long_base(text, 8) match
+        Ok(n) -> if n >= 0 && n <= 0o7777 then Some(n) else None
+        Err(_) -> None
+
+private bad(file: string, number: usize, why: string) -> string = s"${file}: line ${number}: ${why}"
+
+private parse_line(file: string, text: string, number: usize) -> Result[Option[Line], string]
+    val f = fields(text)
+    if f.len() == 0 || f[0].bytes[0] == u8('#') then return Ok(None)
+    val ID: long = 0xFFFF_FFFF
+    if f[0].bytes[0] != u8('/') then return Err(bad(file, number, s"'${f[0]}' is not an absolute path"))
+    if f.len() == 4
+        val uid = count(f[1], ID)
+        val gid = count(f[2], ID)
+        val mode = octal(f[3])
+        if uid.is_none() || gid.is_none() then return Err(bad(file, number, "an owner is not a number"))
+        if mode.is_none() then return Err(bad(file, number, s"'${f[3]}' is not an octal permission mode"))
+        return Ok(Some(Line(false, f[0], 0, "", 0, 0, u32(uid.unwrap()), u32(gid.unwrap()), u16(mode.unwrap()), number)))
+    if f.len() < 5 then return Err(bad(file, number, s"'${text}' is neither '<path> <uid> <gid> <mode>' nor '<path> <type> <mode> <uid> <gid> ...'"))
+    val kind = if f[1] == "d" then S_IFDIR elif f[1] == "c" then S_IFCHR elif f[1] == "b" then S_IFBLK elif f[1] == "p" then S_IFIFO elif f[1] == "l" then S_IFLNK else 0
+    if kind == 0 then return Err(bad(file, number, s"'${f[1]}' is not an entry type (d, c, b, p or l)"))
+    val want: usize = if kind == S_IFCHR || kind == S_IFBLK then 7 elif kind == S_IFLNK then 6 else 5
+    if f.len() != want then return Err(bad(file, number, s"an entry of type ${f[1]} takes ${want} fields, not ${f.len()}"))
+    val mode = octal(f[2])
+    val uid = count(f[3], ID)
+    val gid = count(f[4], ID)
+    if mode.is_none() then return Err(bad(file, number, s"'${f[2]}' is not an octal permission mode"))
+    if uid.is_none() || gid.is_none() then return Err(bad(file, number, "an owner is not a number"))
+    var major: Option[long] = Some(0)
+    var minor: Option[long] = Some(0)
+    if kind == S_IFCHR || kind == S_IFBLK
+        major = count(f[5], ID)
+        minor = count(f[6], ID)
+    if major.is_none() || minor.is_none() then return Err(bad(file, number, "a device number is not a number"))
+    val target = if kind == S_IFLNK then f[5] else ""
+    Ok(Some(Line(true, f[0], kind, target, u32(major.unwrap()), u32(minor.unwrap()), u32(uid.unwrap()), u32(gid.unwrap()), u16(mode.unwrap()), number)))
+
+private own[D: BlockDevice](vol: *Fs[D, HostPlatform], ino: u64, l: Line) -> Result[unit, string]
+    var a = no_change()
+    a.mode = Some(l.mode)
+    a.uid = Some(l.uid)
+    a.gid = Some(l.gid)
+    made(setattr(vol, ino, a, 0), l.path)
+
+private apply_spec[D: BlockDevice](vol: *Fs[D, HostPlatform], file: string, t: *Tally) -> Result[unit, string]
+    val text = fs.read_text(file) match
+        Ok(s) -> s
+        Err(_) -> return Err(s"cannot read ${file}")
+    // Every line is read before the first is applied, so a malformed one changes nothing.
+    var lines: Buf[Line] = buf()
+    var start: usize = 0
+    var number: usize = 1
+    for i in 0..<text.bytes.len + 1
+        if i == text.bytes.len || text.bytes[i] == u8('\n')
+            parse_line(file, text[start..<i], number)? match
+                Some(l) -> lines.push(l)
+                None -> ()
+            start = i + 1
+            number += 1
+    for l in lines.view()
+        if l.makes
+            val p = place(vol, l.path)?
+            var ino: u64 = 0
+            if l.kind == S_IFDIR
+                ino = made(mkdir(vol, p.dir, p.name.bytes, l.mode, root()), l.path)?
+                t.dirs += 1
+            elif l.kind == S_IFLNK
+                ino = made(symlink(vol, p.dir, p.name.bytes, l.target.bytes, root()), l.path)?
+                t.links += 1
+            else
+                ino = made(mknod(vol, p.dir, p.name.bytes, l.kind | l.mode, DeviceNumbers(l.major, l.minor), root()), l.path)?
+                t.nodes += 1
+            own(vol, ino, l)?
+        else
+            own(vol, resolve(vol, l.path)?, l)?
+    Ok(())
+
+// Copy the host directory `dir` into the image's root, then apply the spec file.
+populate[D: BlockDevice](vol: *Fs[D, HostPlatform], dir: Option[string], spec: Option[string]) -> Result[Tally, string]
+    var t = Tally(0, 0, 0, 0, 0)
+    dir match
+        Some(d) ->
+            if !fs.is_dir(d) then return Err(s"${d} is not a directory")
+            copy_dir(vol, ROOT_INO, d, "/", &t)?
+        None -> ()
+    spec match
+        Some(file) -> apply_spec(vol, file, &t)?
+        None -> ()
+    Ok(t)
+
+// Mount `dev`, populate it, and unmount.
+fill_image[D: BlockDevice](dev: *D, now: i64, dir: Option[string], spec: Option[string]) -> Result[Tally, string]
+    var plat = host_platform()
+    plat.clock = now
+    var vol = mount(dev, plat) match
+        Ok(v) -> v
+        Err(e) -> return Err(s"cannot mount the image: ${fs_reason(e)}")
+    val t = populate(&vol, dir, spec)
+    val u = vol.unmount()
+    if t.is_err() then return t
+    if u.is_err() then return Err("cannot unmount the image")
+    t
+
+// -- kfsdump get and put ------------------------------------------------------------------------------
+
+// `kfsdump get <image> <path> <host-file>`: copy a regular file out of the image. A directory, a symbolic
+// link or a device node is refused: there is no one file to copy.
+run_get(args: []string) -> Result[string, string]
+    if args.len != 3 then return Err(GET_USAGE)
+    var dev = open_image(args[0]) match
+        Ok(d) -> d
+        Err(_) -> return Err(s"kfsdump: cannot open ${args[0]}")
+    var ro: ReadMostly[FileDevice[fs.File]] = ReadMostly(&dev)
+    val r = get_from(&ro, args[1], args[2])
+    dev.close()
+    r
+
+private get_from[D: BlockDevice](dev: *D, path: string, host: string) -> Result[string, string]
+    var vol = mount(dev, host_platform()) match
+        Ok(v) -> v
+        Err(e) -> return Err(s"kfsdump: cannot mount the image: ${fs_reason(e)}")
+    val ino = resolve(&vol, path) match
+        Ok(i) -> i
+        Err(why) -> return Err(s"kfsdump: ${why}")
+    val node = made(stat(&vol, ino), path) match
+        Ok(n) -> n
+        Err(why) -> return Err(s"kfsdump: ${why}")
+    val kind = node.mode & S_IFMT
+    if kind == S_IFDIR then return Err(s"kfsdump: ${path}: is a directory")
+    if kind == S_IFLNK then return Err(s"kfsdump: ${path}: is a symbolic link, not a regular file")
+    if kind != S_IFREG then return Err(s"kfsdump: ${path}: not a regular file")
+    var data: Buf[u8] = buf()
+    for _ in 0..<usize(node.size)
+        data.push(0)
+    val got = made(read(&vol, ino, 0, data.view()), path) match
+        Ok(n) -> n
+        Err(why) -> return Err(s"kfsdump: ${why}")
+    if got != data.len() then return Err(s"kfsdump: ${path}: short read")
+    fs.write_bytes(host, data.view()) match
+        Ok(_) -> ()
+        Err(_) -> return Err(s"kfsdump: cannot write ${host}")
+    Ok(s"kfsdump: ${path}: ${got} bytes to ${host}")
+
+// `kfsdump put <image> <host-file> <path>`: copy a host file into the image. A file already there is
+// replaced (it keeps its inode, owner and mode); a name that is not there is made 0o644, or 0o755 when the
+// host file is executable. The directory above has to exist. A copy that runs out of space removes a file
+// it made, and leaves a replaced one as far as it got.
+run_put(args: []string) -> Result[string, string]
+    if args.len != 3 then return Err(PUT_USAGE)
+    val data = fs.read_bytes(args[1]) match
+        Ok(b) -> b
+        Err(_) -> return Err(s"kfsdump: cannot read ${args[1]}")
+    var exec = false
+    fs.metadata(args[1]) match
+        Ok(m) -> exec = m.permissions() & 0o111 != 0
+        Err(_) -> ()
+    var dev = open_image(args[0]) match
+        Ok(d) -> d
+        Err(_) -> return Err(s"kfsdump: cannot open ${args[0]}")
+    val r = put_into(&dev, data, exec, args[2])
+    dev.close()
+    r
+
+private put_into[D: BlockDevice](dev: *D, data: []const u8, exec: bool, path: string) -> Result[string, string]
+    var vol = mount(dev, host_platform()) match
+        Ok(v) -> v
+        Err(e) -> return Err(s"kfsdump: cannot mount the image: ${fs_reason(e)}")
+    val r = put_file(&vol, data, exec, path)
+    val u = vol.unmount()
+    if r.is_err() then return r
+    if u.is_err() then return Err("kfsdump: cannot unmount the image")
+    r
+
+private put_file[D: BlockDevice](vol: *Fs[D, HostPlatform], data: []const u8, exec: bool, path: string) -> Result[string, string]
+    val p = place(vol, path) match
+        Ok(p) -> p
+        Err(why) -> return Err(s"kfsdump: ${why}")
+    val there = lookup_name(vol, p.dir, p.name.bytes)
+    var ino: u64 = 0
+    var fresh = false
+    there match
+        Ok(e) ->
+            val node = made(stat(vol, e.ino), path) match
+                Ok(n) -> n
+                Err(why) -> return Err(s"kfsdump: ${why}")
+            if node.mode & S_IFMT != S_IFREG then return Err(s"kfsdump: ${path}: exists and is not a regular file")
+            made(truncate(vol, e.ino, 0, 0), path) match
+                Ok(_) -> ()
+                Err(why) -> return Err(s"kfsdump: ${why}")
+            ino = e.ino
+        Err(FsError.NotFound) ->
+            ino = made(create(vol, p.dir, p.name.bytes, if exec then 0o755 else 0o644, root()), path) match
+                Ok(i) -> i
+                Err(why) -> return Err(s"kfsdump: ${why}")
+            fresh = true
+        Err(e) -> return Err(s"kfsdump: ${path}: ${fs_reason(e)}")
+    store(vol, ino, data, path) match
+        Ok(_) -> ()
+        Err(why) ->
+            if fresh then unlink(vol, p.dir, p.name.bytes)
+            return Err(s"kfsdump: ${why}")
+    Ok(s"kfsdump: ${path}: ${data.len} bytes from the host")
