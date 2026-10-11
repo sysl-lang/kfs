@@ -1,0 +1,123 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// fsck's repairs run in journal transactions (kfs/SPEC.md section 23, "The rounds"), so a crash at any
+// write of a repairing run leaves an image recovery makes consistent, and a second run finishes the work.
+// The loop crashes `fsck -y` at every write it makes, in every mode of the crash device, then runs it
+// again: the image must be checker-clean with every file where the repairs put it.
+
+// The inodes of the broken image.
+private struct Broken
+    a: u64
+    b: u64
+    f: u64
+    d: u64
+    lone: u64
+    gone: u64
+
+// An image needing every kind of repair that writes: a leaked block, an inflated link count, a wrong
+// parent, a dangling entry (a directory rebuilt), a nameless file (into lost+found), an unlinked inode
+// (put on the orphan list and freed), and a block two files claim (copied).
+private broken_image(dev: *RamDevice) -> Broken
+    var fs = mounted(dev)
+    val a = mk(&fs, ROOT_INO, "a")
+    put_pattern(&fs, a, 0, 8192, 1)
+    val b = mk(&fs, ROOT_INO, "b")
+    put_pattern(&fs, b, 0, 8192, 2)
+    val sub = mkd(&fs, ROOT_INO, "sub")
+    val d = mkd(&fs, ROOT_INO, "d")
+    val f = mk(&fs, sub, "f")
+    val lone = mk(&fs, ROOT_INO, "lone")
+    put_pattern(&fs, lone, 0, 2000, 3)
+    val gone = mk(&fs, ROOT_INO, "gone")
+    put_pattern(&fs, gone, 0, 5000, 4)
+    fs_poke(&fs, f, (n) -> n.links = 4)
+    fs_poke(&fs, d, (n) -> n.parent = sub)
+    must(add_name(&fs, sub, "ghost".bytes, 70, DT_REG, 0))
+    val _ = must_entry(remove_name(&fs, ROOT_INO, "lone".bytes))
+    val _ = must_entry(remove_name(&fs, ROOT_INO, "gone".bytes))
+    fs_poke(&fs, gone, (n) -> n.links = 0)
+    must(fs.unmount())
+    var sb = super_of(dev)
+    disk_block_bit(dev, geometry_of(&sb).data_start(0) + 500, true)
+    val pa = first_phys(dev, a)
+    disk_edit(dev, b, true, (n) -> put_le64(n.data[0..<128], 24, pa))
+    Broken(a, b, f, d, lone, gone)
+
+// The repaired image as a mount sees it: each file where the repairs put it, with its bytes.
+private as_repaired(cd: *CrashDevice[RamDevice], x: Broken) -> bool
+    var fs = mounted(cd)
+    val lf = named(&fs, ROOT_INO, "lost+found")
+    var ok = named(&fs, ROOT_INO, "a") == x.a && named(&fs, ROOT_INO, "b") == x.b
+    ok = ok && bytes_equal(got(&fs, x.a, 0, 8192), pattern(8192, 1))
+    ok = ok && bytes_equal(got(&fs, x.b, 0, 8192), pattern(8192, 1))
+    ok = ok && named(&fs, lf, s"#${x.lone}") == x.lone && bytes_equal(got(&fs, x.lone, 0, 2000), pattern(2000, 3))
+    ok = ok && links_of(&fs, x.f) == 1 && node(&fs, x.d).parent == ROOT_INO && !alive(&fs, x.gone)
+    ok = ok && named(&fs, named(&fs, ROOT_INO, "sub"), "ghost") == 0
+    must(fs.unmount())
+    ok
+
+private crash_plan(n: u64, mode: u32, total: u64) -> Option[CrashMode]
+    mode match
+        0 -> if n < total then Some(CrashMode.DropAfter(n)) else None
+        1 -> Some(CrashMode.Tear(n, 0x01))
+        2 -> Some(CrashMode.Tear(n, 0xFE))
+        3 -> Some(CrashMode.Tear(n, u8((n * 0x9E37 + 0x5B) & 0xFF)))
+        4 -> Some(CrashMode.Reorder(n, n * 7919 + 1))
+        _ -> Some(CrashMode.Reorder(n, n * 104729 + 3))
+
+@test("§23 a crash at every write of a repairing fsck, dropped after, torn three ways, reordered with two seeds: a second run leaves the image clean and every file as the repairs put it")
+fsck_every_crash()
+    var base = small_device()
+    val x = broken_image(&base)
+    crash_every_write(&base, x)
+
+@test("§23 the same with the primary superblock broken too: the restore from the backup is direct writes, and a crash among them is finished by the second run")
+fsck_every_crash_from_backup()
+    var base = small_device()
+    val x = broken_image(&base)
+    flip_byte(&base, 1, 40)
+    crash_every_write(&base, x)
+
+// Run `fsck -y` on `base` crashing at each of its writes in each mode, then again: see the file's header.
+private crash_every_write(base: *RamDevice, x: Broken)
+    var cd = crash_device(base)
+    cd.mark()
+    cd.plan = CrashMode.Off
+    cd.arm()
+    val whole = fsck_y(&cd)
+    cd.disarm()
+    if whole.code != FSCK_FIXED then show_run(whole)
+    assert_eq(whole.code, FSCK_FIXED)
+    val total = cd.counted
+    assert(total > 0)
+    assert(as_repaired(&cd, x))
+    assert(cd.rewind().is_ok())
+    var points: u64 = 0
+    var finished: u64 = 0
+    for n in 1..<(total + 1)
+        for mode in 0u32..<6
+            crash_plan(n, mode, total) match
+                None -> ()
+                Some(p) ->
+                    cd.plan = p
+                    cd.arm()
+                    val first = fsck_y(&cd)
+                    val crashed = cd.crashed
+                    cd.disarm()
+                    if !crashed then finished += 1
+                    val second = fsck_y(&cd)
+                    val rep = check(&cd)
+                    if second.code > FSCK_FIXED || !rep.clean() || !as_repaired(&cd, x)
+                        show_run(first)
+                        show_run(second)
+                        for q in rep.problems.view()
+                            print("checker: " + describe(q))
+                        panic(s"a crash at write $n (mode $mode) left an image a second fsck could not finish")
+                    points += 1
+                    assert(cd.rewind().is_ok())
+    print(s"fsck -y: $total writes, $points crash points, $finished runs the crash did not reach")
+    assert(points >= 5 * total)

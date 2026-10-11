@@ -1,0 +1,158 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Helpers the fsck tests share: a run in each mode, what a run must have found and left, corruptions
+// written straight to the device behind every layer's back, and a digest of a whole image.
+
+fsck_y[D: BlockDevice](dev: *D) -> FsckReport = fsck(dev, host_platform(), FsckMode.Repair)
+fsck_n[D: BlockDevice](dev: *D) -> FsckReport = fsck(dev, host_platform(), FsckMode.Check)
+fsck_rebuild[D: BlockDevice](dev: *D) -> FsckReport = fsck(dev, host_platform(), FsckMode.Rebuild)
+
+// Whether `want` is among `ps`.
+among_problems(ps: Buf[Problem], want: Problem) -> bool
+    for p in ps.view()
+        if describe(p) == describe(want) then return true
+    false
+
+// Print what a run found, did and left: the first thing to read when an assertion below fails.
+show_run(r: FsckReport)
+    for p in r.found.view()
+        print("found: " + describe(p))
+    for d in r.done.view()
+        print("done: " + d)
+    for p in r.left.view()
+        print("left: " + describe(p))
+    print(s"exit ${r.code}, ${r.rounds} rounds")
+
+// Run `fsck -y` on an image that must hold `want`: it must be found, everything repaired (exit 1), and a
+// second run, and the checker, must find the image clean.
+repaired[D: BlockDevice](dev: *D, want: Problem) -> FsckReport
+    val r = fsck_y(dev)
+    if !among_problems(r.found, want) || r.code != FSCK_FIXED || r.left.len() != 0
+        show_run(r)
+        panic(s"fsck -y did not find and repair: ${describe(want)}")
+    val again = fsck_n(dev)
+    if again.code != FSCK_CLEAN
+        show_run(again)
+        panic("the image is not clean after fsck -y")
+    val _ = checked_clean(dev)
+    r
+
+// Run `fsck -y` on an image whose `want` it must find and leave: exit 4, `want` still reported.
+left_alone[D: BlockDevice](dev: *D, want: Problem) -> FsckReport
+    val r = fsck_y(dev)
+    if !among_problems(r.found, want) || !among_problems(r.left, want) || r.code != FSCK_LEFT
+        show_run(r)
+        panic(s"fsck -y did not leave: ${describe(want)}")
+    r
+
+// Whether a note of the run contains `text`.
+did(r: FsckReport, text: string) -> bool
+    for d in r.done.view()
+        if d.contains(text) then return true
+    false
+
+// -- Corruption behind every layer's back --------------------------------------------------------------
+
+// Where inode `ino`'s slot is on the device.
+disk_slot(dev: *RamDevice, ino: u64) -> InodeLoc
+    var sb = super_of(dev)
+    val g = geometry_of(&sb)
+    val grp = u32((ino - 1) / u64(g.inodes_per_group))
+    val i = (ino - 1) % u64(g.inodes_per_group)
+    InodeLoc(g.inode_table(grp) + i / 16, usize(i % 16) * INODE_SIZE)
+
+// Inode `ino` on the device, changed by `edit`, sealed again unless `seal` is false.
+disk_edit(dev: *RamDevice, ino: u64, seal: bool, edit: &Fn(*Inode) -> unit)
+    val sb = super_of(dev)
+    val loc = disk_slot(dev, ino)
+    var blk = raw(dev, loc.block)
+    edit(at(blk.view(), loc.offset))
+    if seal then seal_inode(sb.csum_seed, ino, blk.view()[loc.offset..<loc.offset + INODE_SIZE])
+    raw_put(dev, loc.block, blk.view())
+
+// Inode `ino` as the device holds it.
+disk_inode(dev: *RamDevice, ino: u64) -> Inode
+    val loc = disk_slot(dev, ino)
+    var blk = raw(dev, loc.block)
+    val n: *Inode = at(blk.view(), loc.offset)
+    *n
+
+// One byte of block `b` flipped, nothing resealed.
+flip_byte(dev: *RamDevice, b: u64, at_byte: usize)
+    var blk = raw(dev, b)
+    blk[at_byte] = blk[at_byte] ^ 0xFF
+    raw_put(dev, b, blk.view())
+
+// Block `b`'s bit in its group's bitmap set or cleared, the descriptor's count and both checksums kept in
+// step, so the bit alone is wrong.
+disk_block_bit(dev: *RamDevice, b: u64, set: bool)
+    var sb = super_of(dev)
+    val g = geometry_of(&sb)
+    val grp = u32((b - 1) / u64(g.blocks_per_group))
+    var bm = raw(dev, g.block_bitmap(grp))
+    val i = usize(b - g.group_first(grp))
+    if set then bit_set(bm.view(), i) else bit_clear(bm.view(), i)
+    raw_put(dev, g.block_bitmap(grp), bm.view())
+    disk_desc(dev, grp, (d) ->
+        d.free_blocks = if set then d.free_blocks - 1 else d.free_blocks + 1
+        d.block_bitmap_crc = bitmap_crc(sb.csum_seed, grp, bm.view()))
+
+// Group `grp`'s descriptor changed by `edit` and sealed again.
+disk_desc(dev: *RamDevice, grp: u32, edit: &Fn(*GroupDesc) -> unit)
+    val sb = super_of(dev)
+    val tb = 2 + u64(grp / 64)
+    var blk = raw(dev, tb)
+    val off = usize(grp % 64) * 64
+    edit(at(blk.view(), off))
+    seal_group_desc(sb.csum_seed, grp, blk.view()[off..<off + 64])
+    raw_put(dev, tb, blk.view())
+
+// The superblock changed by `edit` and sealed again.
+disk_super(dev: *RamDevice, edit: &Fn(*Superblock) -> unit)
+    var b = raw(dev, 1)
+    edit(at(b.view(), 0))
+    seal_superblock(b.view())
+    raw_put(dev, 1, b.view())
+
+// A digest of every block of the device.
+image_digest(dev: *RamDevice) -> u64
+    var all: Buf[u8] = buf()
+    for b in 0..<dev.blocks()
+        val d = digest(raw(dev, b).view())
+        for k in 0..<8
+            all.push(u8((d >> u64(8 * k)) & 0xFF))
+    digest(all.view())
+
+// Inode `ino`'s change made through the filesystem, behind the namespace code's back, and checkpointed.
+fs_poke(fs: *RamFs, ino: u64, edit: &Fn(*Inode) -> unit)
+    var h = fs.start("test", C_INODE)
+    must(change_inode(fs, &h, ino, edit))
+    fs.stop(&h)
+    must(fs.checkpoint_all())
+
+// The first physical block of inode `ino`'s first extent, read from its root (a depth-0 tree).
+first_phys(dev: *RamDevice, ino: u64) -> u64
+    val n = disk_inode(dev, ino)
+    le64(n.data[0..<128], 16 + 8)
+
+// The data of a file through a fresh mount: `n` bytes from 0.
+read_back(dev: *RamDevice, ino: u64, n: usize) -> Buf[u8]
+    var fs = mounted(dev)
+    val got = got(&fs, ino, 0, n)
+    must(fs.unmount())
+    got
+
+// A device on which every operation fails.
+struct DeadDevice
+    size: u64
+
+impl BlockDevice for DeadDevice
+    blocks(self) -> u64 = self.size
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError] = Err(DeviceError.Io)
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError] = Err(DeviceError.Io)
+    flush(*self) -> Result[unit, DeviceError] = Err(DeviceError.Io)

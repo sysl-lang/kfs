@@ -1,0 +1,136 @@
+module keel.kfshost
+@tests
+@requires(os)
+
+import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, INODE_SIZE, STATE_ERROR, Superblock, at, block_buf, open, seal_superblock}
+import sysl.buf.{Buf, buf}
+import sysl.fs
+import sysl.text.Search
+
+// `fsck.kfs` as the command line runs it (kfs/SPEC.md section 23): each exit code — 0 clean, 1 corrected,
+// 4 left, 8 an operational error, 16 a usage error — on a real image file, and -n writing nothing.
+
+private seed_bytes() -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i) + 7)
+    e
+
+// A fresh image at `path`, the default geometry at 8192 blocks.
+private fresh(path: string)
+    val e = seed_bytes()
+    run_mkfs([path, "8192"], e.view(), 1_700_000_000) match
+        Ok(_) -> ()
+        Err(why) -> panic(s"mkfs.kfs failed: ${why}")
+
+// Block `b` of the image changed by `edit`.
+private poke(path: string, b: u64, edit: &Fn([]u8) -> unit)
+    var d = open_image(path) match
+        Ok(x) -> x
+        Err(_) -> panic("no image")
+    var blk = block_buf()
+    assert(d.read(b, blk.view()).is_ok())
+    edit(blk.view())
+    assert(d.write(b, blk.view()).is_ok())
+    assert(d.flush().is_ok())
+    assert(d.close())
+
+// The block holding inode `ino` (group 0) and its offset there.
+private inode_place(path: string, ino: u64) -> (u64, usize)
+    var d = open_image(path) match
+        Ok(x) -> x
+        Err(_) -> panic("no image")
+    val m = open(&d) match
+        Ok(x) -> x
+        Err(_) -> panic("the image does not open")
+    assert(d.close())
+    (m.descs[0].inode_table + (ino - 1) / 16, usize((ino - 1) % 16) * INODE_SIZE)
+
+private bytes_of(path: string) -> []u8
+    fs.read_bytes(path) match
+        Ok(b) -> b
+        Err(_) -> panic("unreadable image")
+
+private same_bytes(a: []u8, b: []u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+@test("fsck.kfs on a fresh image: clean, exit 0, with no flag, -n and -y")
+fsck_tool_clean()
+    val path = "/tmp/keel-kfshost-fsck-clean.img"
+    fresh(path)
+    for flags in 0..<3
+        val args: []string = if flags == 0 then [path] elif flags == 1 then ["-n", path] else ["-y", path]
+        val r = run_fsck(args)
+        assert_eq(r.code, 0)
+        assert(r.text.contains(s"fsck.kfs: ${path}: clean"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("fsck.kfs: ERROR set — -n reports it, exit 4, and writes nothing; -y clears it, exit 1; the next run exits 0")
+fsck_tool_corrected()
+    val path = "/tmp/keel-kfshost-fsck-fixed.img"
+    fresh(path)
+    poke(path, 1, (b) ->
+        val sb: *Superblock = at(b, 0)
+        sb.state = sb.state | STATE_ERROR
+        seal_superblock(b))
+    val before = bytes_of(path)
+    val n = run_fsck(["-n", path])
+    assert_eq(n.code, 4)
+    assert(n.text.contains("problem: the superblock has ERROR set"))
+    assert(same_bytes(bytes_of(path), before))
+    val y = run_fsck(["-y", path])
+    assert_eq(y.code, 1)
+    assert(y.text.contains("errors corrected, clean now"))
+    assert_eq(run_fsck([path]).code, 0)
+    assert(fs.remove_file(path).is_ok())
+
+@test("fsck.kfs: an inode failing its checksum is left by -y (exit 4) and cleared by -y --rebuild-corrupt (exit 1)")
+fsck_tool_left_then_rebuilt()
+    val path = "/tmp/keel-kfshost-fsck-left.img"
+    fresh(path)
+    val place = inode_place(path, 11)
+    poke(path, place.0, (b) -> b[place.1 + 30] = b[place.1 + 30] ^ 0xFF)
+    val y = run_fsck(["-y", path])
+    assert_eq(y.code, 4)
+    assert(y.text.contains("left: inode 11 fails its checksum"))
+    assert(y.text.contains("problems left uncorrected"))
+    val r = run_fsck(["-y", "--rebuild-corrupt", path])
+    assert_eq(r.code, 1)
+    assert(r.text.contains("done: inode 11 was cleared"))
+    assert_eq(run_fsck(["-n", path]).code, 0)
+    assert(fs.remove_file(path).is_ok())
+
+@test("fsck.kfs: an image that cannot be opened, or holds no filesystem at all, is an operational error, exit 8")
+fsck_tool_operational()
+    val r = run_fsck(["/tmp/keel-kfshost-fsck-no-such.img"])
+    assert_eq(r.code, 8)
+    assert(r.text.contains("cannot open"))
+    val path = "/tmp/keel-kfshost-fsck-zero.img"
+    var d = create_image(path, 4096) match
+        Ok(x) -> x
+        Err(_) -> panic("no image")
+    assert(d.close())
+    assert_eq(run_fsck(["-y", path]).code, 8)
+    assert(fs.remove_file(path).is_ok())
+
+@test("fsck.kfs: no image, two images, an unknown option, and -n with -y or --rebuild-corrupt are usage errors, exit 16")
+fsck_tool_usage()
+    val path = "/tmp/keel-kfshost-fsck-usage.img"
+    fresh(path)
+    val before = bytes_of(path)
+    assert_eq(run_fsck([]).code, 16)
+    assert_eq(run_fsck(["-y"]).code, 16)
+    assert_eq(run_fsck([path, path]).code, 16)
+    val x = run_fsck(["-x", path])
+    assert_eq(x.code, 16)
+    assert(x.text.contains("unknown option '-x'"))
+    val ny = run_fsck(["-n", "-y", path])
+    assert_eq(ny.code, 16)
+    assert(ny.text.contains("cannot go with -y"))
+    assert(ny.text.contains("usage: fsck.kfs"))
+    assert_eq(run_fsck(["-n", "--rebuild-corrupt", path]).code, 16)
+    assert(same_bytes(bytes_of(path), before))
+    assert(fs.remove_file(path).is_ok())
