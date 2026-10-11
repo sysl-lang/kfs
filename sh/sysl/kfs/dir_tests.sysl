@@ -20,6 +20,11 @@ fails_dir[T](r: Result[T, FsError]) -> i64
         Err(FsError.Invalid) -> 3
         Err(FsError.NoSpace) -> 1
         Err(FsError.Corrupt(_)) -> 6
+        Err(FsError.IsDirectory) -> 24
+        Err(FsError.NotEmpty) -> 25
+        Err(FsError.TooManyLinks) -> 26
+        Err(FsError.NotPermitted) -> 27
+        Err(FsError.Busy) -> 28
         Err(_) -> 9
 
 private bytes_of(xs: []const u8) -> Buf[u8] = copy_of(xs)
@@ -129,7 +134,7 @@ exists_and_missing()
     assert_eq(must_entry(lookup_name(&fs, d, "x".bytes)).ino, f)
     assert_eq(fails_dir(remove_name(&fs, d, "y".bytes)), 21)
     assert_eq(fails_dir(lookup_name(&fs, d, "X".bytes)), 21)
-    assert_eq(must_entry(remove_name(&fs, d, "x".bytes)).ino, f)
+    take_out(&fs, d, "x".bytes)
     assert_eq(fails_dir(remove_name(&fs, d, "x".bytes)), 21)
     val _ = dir_clean(&fs)
 

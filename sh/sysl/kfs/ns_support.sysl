@@ -1,0 +1,195 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// Helpers the tests of the namespace operations share: errors as Linux's errno, names made and
+// checked, and the every-write crash loop over an operation run on a base image.
+
+// 0 for success, else the errno the call would answer.
+err[T](r: Result[T, FsError]) -> u32
+    r match
+        Ok(_) -> 0
+        Err(e) -> errno(e)
+
+// Linux's errno values the tests name.
+const EPERM: u32 = 1
+const ENOENT: u32 = 2
+const EBUSY: u32 = 16
+const EEXIST: u32 = 17
+const ENOTDIR: u32 = 20
+const EISDIR: u32 = 21
+const EINVAL: u32 = 22
+const EFBIG: u32 = 27
+const ENOSPC: u32 = 28
+const EROFS: u32 = 30
+const EMLINK: u32 = 31
+const ERANGE: u32 = 34
+const ENAMETOOLONG: u32 = 36
+const ENOTEMPTY: u32 = 39
+const ENODATA: u32 = 61
+
+must_ino(r: Result[u64, FsError]) -> u64
+    r match
+        Ok(i) -> i
+        Err(e) -> panic(s"a namespace call failed: errno ${errno(e)}")
+
+// A regular file `name` in `dir`, mode 0644, made by root.
+mk[D: BlockDevice](fs: *Fs[D, HostPlatform], dir: u64, name: string) -> u64 = must_ino(create(fs, dir, name.bytes, 0o644, Caller(0, 0)))
+
+// A directory `name` in `dir`, mode 0755, made by root.
+mkd[D: BlockDevice](fs: *Fs[D, HostPlatform], dir: u64, name: string) -> u64 = must_ino(mkdir(fs, dir, name.bytes, 0o755, Caller(0, 0)))
+
+// The inode as it is now.
+node[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64) -> Inode = must_inode(stat(fs, ino))
+
+links_of[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64) -> u32 = node(fs, ino).links
+
+// What `name` names in `dir`: its inode, 0 when it is not there.
+named[D: BlockDevice](fs: *Fs[D, HostPlatform], dir: u64, name: string) -> u64
+    lookup_name(fs, dir, name.bytes) match
+        Ok(e) -> e.ino
+        Err(FsError.NotFound) -> 0
+        Err(_) -> panic("a lookup failed")
+
+// Whether inode `ino` is allocated (its slot in use).
+alive[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64) -> bool
+    stat(fs, ino) match
+        Ok(_) -> true
+        Err(FsError.Invalid) -> false
+        Err(_) -> panic("a stat failed")
+
+// `n` bytes of a symlink target: 'a' ... 'z' over and over.
+target_of(n: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n
+        out.push(u8('a') + u8(i % 26))
+    out
+
+// The group descriptor of group `g` as the cache has it.
+desc_of[D: BlockDevice](fs: *Fs[D, HostPlatform], g: u32) -> GroupDesc
+    val id = must_id(fs.buffer(fs.desc_block(g)))
+    val d: *GroupDesc = at(fs.bytes(id), fs.desc_offset(g))
+    *d
+
+// Every group's `directories`, summed.
+directories[D: BlockDevice](fs: *Fs[D, HostPlatform]) -> u32
+    var n: u32 = 0
+    for g in 0..<fs.geo.group_count
+        n += desc_of(fs, g).directories
+    n
+
+// Set inode `ino`'s `links` in a transaction of its own: a test's shortcut to LINK_MAX.
+set_links[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64, links: u32)
+    var h = fs.start("test", C_INODE)
+    must(change_inode(fs, &h, ino, (n) -> n.links = links))
+    fs.stop(&h)
+
+// Use up the free blocks until `leave` are left, in a file of uid 0 (so the reserve goes too).
+ns_fill_disk(fs: *RamFs, leave: u64)
+    val big = new_file(fs, 0)
+    val bs = u64(BLOCK_SIZE)
+    var off: u64 = 0
+    loop
+        val free = free_total(fs)
+        if free <= leave then break
+        val want = if free - leave > 16 then free - leave - 8 else 1
+        must(fallocate(fs, big, Falloc.Allocate, off * bs, want * bs, 0))
+        off += want
+    assert_eq(free_total(fs), leave)
+
+// Fill directory `d`'s one linear leaf with 255-byte names linking `f`, until the next such name would
+// need a conversion (two new blocks).
+ns_fill_leaf(fs: *RamFs, d: u64, f: u64)
+    for i in 0..<14
+        add(fs, d, long_name(u64(i), 255, u8('-')).view(), f)
+
+// -- The every-write loop -------------------------------------------------------------------------------
+
+struct NsTally
+    writes: u64
+    points: u64
+    before: u64
+    after: u64
+
+// The visible state after recovery: mounted (which finishes the orphan list), checkpointed, checked
+// clean; then the superblock but for what every mount writes, the descriptors, bitmaps and inode tables,
+// and every claimed block.
+ns_state(cd: *CrashDevice[RamDevice]) -> Buf[u64]
+    var fs = mounted(cd)
+    assert(!fs.read_only())
+    must(fs.checkpoint_all())
+    val rep = checked_clean(cd)
+    var out: Buf[u64] = buf()
+    var sb = raw(cd, 1)
+    mask_mount_fields(sb.view())
+    out.push(digest(sb.view()))
+    val g = fs.geo
+    for t in 0..<u64(g.gdt_blocks)
+        out.push(digest(raw(cd, 2 + t).view()))
+    for grp in 0..<g.group_count
+        out.push(digest(raw(cd, g.block_bitmap(grp)).view()))
+        out.push(digest(raw(cd, g.inode_bitmap(grp)).view()))
+        for t in 0..<u64(g.itable_blocks())
+            out.push(digest(raw(cd, g.inode_table(grp) + t).view()))
+    for b in rep.claimed.view()
+        out.push(b)
+        out.push(digest(raw(cd, b).view()))
+    out
+
+private ns_rewind(cd: *CrashDevice[RamDevice], base: *RamDevice)
+    assert(cd.rewind().is_ok())
+    base.reset_counters()
+
+private ns_plan(n: u64, mode: u32, total: u64) -> Option[CrashMode]
+    mode match
+        0 -> if n < total then Some(CrashMode.DropAfter(n)) else None
+        1 -> Some(CrashMode.Tear(n, 0x01))
+        2 -> Some(CrashMode.Tear(n, 0xFE))
+        3 -> Some(CrashMode.Tear(n, u8((n * 0x9E37 + 0x5B) & 0xFF)))
+        4 -> Some(CrashMode.Reorder(n, n * 7919 + 1))
+        _ -> Some(CrashMode.Reorder(n, n * 104729 + 3))
+
+private ns_outcome(base: *RamDevice, cd: *CrashDevice[RamDevice], op: &Fn(*CrashDevice[RamDevice]) -> unit, plan: CrashMode) -> Buf[u64]
+    cd.plan = plan
+    op(cd)
+    cd.disarm()
+    val r = ns_state(cd)
+    ns_rewind(cd, base)
+    r
+
+// Run `op` (which mounts the crash device, arms it, does its operation and commits) on a clean run to
+// count its writes, then crash at every one of them in every mode — dropped after it, torn three ways,
+// reordered with two seeds: the recovered image must be checker-clean and exactly the state before or
+// the state after.
+ns_every_crash(name: string, base: *RamDevice, op: &Fn(*CrashDevice[RamDevice]) -> unit) -> NsTally
+    var cd = crash_device(base)
+    cd.mark()
+    val after = ns_outcome(base, &cd, op, CrashMode.Off)
+    val before = ns_outcome(base, &cd, op, CrashMode.DropAfter(0))
+    assert(before != after)
+    cd.plan = CrashMode.Off
+    op(&cd)
+    val total = cd.counted
+    assert(!cd.crashed && total > 0)
+    cd.disarm()
+    ns_rewind(&cd, base)
+    var t = NsTally(total, 0, 0, 0)
+    for n in 1..<(total + 1)
+        for mode in 0u32..<6
+            ns_plan(n, mode, total) match
+                None -> ()
+                Some(p) ->
+                    cd.plan = p
+                    op(&cd)
+                    cd.disarm()
+                    val s = ns_state(&cd)
+                    if s == before then t.before += 1
+                    else if s == after then t.after += 1
+                    else panic(s"$name: a crash at write $n left a state that is neither before nor after")
+                    t.points += 1
+                    ns_rewind(&cd, base)
+    print(s"$name: $total writes, ${t.points} crash points: ${t.before} before, ${t.after} after")
+    assert(t.before > 0 && t.after > 0)
+    t

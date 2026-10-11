@@ -6,17 +6,53 @@ import sysl.buf.{Buf, buf}
 
 // Helpers the tests of files, the orphan list and the inode layer share.
 
-// A regular file of mode `0o644` (or `mode`), owned by `uid`, one link, no name: the directory's half
-// of a create is stage 7's, and nothing here needs a name.
+// A regular file of mode `0o644` (or `mode`), owned by `uid`, named `i<ino>` in the root (`ino_name`).
 new_file[D: BlockDevice](fs: *Fs[D, HostPlatform], uid: u32) -> u64 = new_inode(fs, S_IFREG | 0o644, uid)
 
+// A new inode of `mode` owned by `uid`, made as section 18's create makes one, in one transaction: placed
+// as a child of the root, named `i<ino>` there, one link — a directory two, and one more for the root.
+// The name follows the number, which the allocator chooses, so this is create with the name picked
+// inside the handle.
 new_inode[D: BlockDevice](fs: *Fs[D, HostPlatform], mode: u16, uid: u32) -> u64
-    var h = fs.start("create", C_GROUP + 2 * C_INODE)
-    val r = alloc_inode(fs, &h, NewInode(mode, uid, uid, 1, ROOT_INO))
-    fs.stop(&h)
-    r match
-        Ok(ino) -> ino
+    val is_dir = mode & S_IFMT == S_IFDIR
+    fs.plat.lock(LockId.Dir(ROOT_INO))
+    var h = fs.start("create", C_CREATE)
+    val r = alloc_inode(fs, &h, NewInode(mode, uid, uid, if is_dir then 2 else 1, ROOT_INO))
+    val ino = r match
+        Ok(i) -> i
         Err(_) -> panic("an inode allocation failed")
+    must(dir_add(fs, &h, ROOT_INO, ino_name(ino).view(), ino, dt_of_mode(mode), 0))
+    if is_dir then must(change_inode(fs, &h, ROOT_INO, (n) -> n.links += 1))
+    fs.stop(&h)
+    fs.plat.unlock(LockId.Dir(ROOT_INO))
+    ino
+
+// The directory's half of a create, for a test that makes a non-directory inode by hand: `i<ino>` in the
+// root, in `h` (C_DIR_ADD credits).
+name_in_root[D: BlockDevice](fs: *Fs[D, HostPlatform], h: *Handle, ino: u64, mode: u16) -> Result[unit, FsError]
+    dir_add(fs, h, ROOT_INO, ino_name(ino).view(), ino, dt_of_mode(mode), 0)
+
+// The root's name for an inode `new_inode` made: `i` and its number.
+ino_name(ino: u64) -> Buf[u8]
+    var digits: Buf[u8] = buf()
+    var v = ino
+    loop
+        digits.push(u8('0') + u8(v % 10))
+        v = v / 10
+        if v == 0 then break
+    var out: Buf[u8] = buf()
+    out.push(u8('i'))
+    var k = digits.len()
+    while k > 0
+        k -= 1
+        out.push(digits[k])
+    out
+
+// Unlink the root's name for an inode `new_inode` made.
+unlink_ino[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64) -> Result[unit, FsError] = unlink(fs, ROOT_INO, ino_name(ino).view())
+
+// The caller every test of a namespace operation is, unless it says otherwise: root.
+root_caller() -> Caller = Caller(0, 0)
 
 // How a call failed, as a number: 0 for success; NoSpace 1, Bug 2, Invalid 3, ReadOnly 4, Device 5,
 // Corrupt 6, TooBig 7.

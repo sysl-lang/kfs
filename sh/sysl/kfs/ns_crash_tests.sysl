@@ -1,0 +1,127 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The every-write loop of kfs/SPEC.md section 27 over each namespace operation: for every write W of the
+// operation and its commit, crash there — drop W and everything after, tear W three ways, reorder two
+// ways — and the recovered image, mounted (which finishes the orphan list), must check clean and be
+// exactly the state before the operation or the state after it. An operation that deletes its victim
+// runs the delete's steps after its transaction; a crash between them leaves the victim on the orphan
+// list, and the mount that finishes it arrives at the state after.
+
+// The base image: /a holding f (two blocks of data), g (also named /b/g2), c (an empty directory);
+// /b holding v (a block of data), e (an empty directory), d (a directory holding a file), and /x, a file
+// with one xattr when `xattrs` (else none anywhere, so the feature is clear). Unmounted.
+private ns_base(xattrs: bool) -> RamDevice
+    var base = small_device()
+    var fs = mounted(&base)
+    val a = mkd(&fs, ROOT_INO, "a")
+    val b = mkd(&fs, ROOT_INO, "b")
+    val f = mk(&fs, a, "f")
+    put_pattern(&fs, f, 0, 2 * BLOCK_SIZE, 1)
+    val g = mk(&fs, a, "g")
+    must(link(&fs, g, b, "g2".bytes, Caller(0, 0)))
+    val _ = mkd(&fs, a, "c")
+    val v = mk(&fs, b, "v")
+    put_pattern(&fs, v, 0, BLOCK_SIZE, 2)
+    val _ = mkd(&fs, b, "e")
+    val d = mkd(&fs, b, "d")
+    val _ = mk(&fs, d, "inside")
+    val x = mk(&fs, ROOT_INO, "x")
+    if xattrs then must(setxattr(&fs, x, XATTR_USER, "keep".bytes, "value".bytes, 0, 0))
+    must(fs.unmount())
+    base
+
+// Crash at every write of `act` on the base image.
+private crash_loop(name: string, xattrs: bool, act: &Fn(*CrashFs) -> unit) -> NsTally
+    var base = ns_base(xattrs)
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        cd.arm()
+        act(&fs)
+        val _ = fs.commit()
+    ns_every_crash(name, &base, op)
+
+// A call that makes an inode must succeed; its number is not needed.
+private made(r: Result[u64, FsError])
+    val _ = must_ino(r)
+
+private dir_a(fs: *CrashFs) -> u64 = named(fs, ROOT_INO, "a")
+private dir_b(fs: *CrashFs) -> u64 = named(fs, ROOT_INO, "b")
+
+@test("§27 every write of a create: before or after, never a name to a free inode nor an inode without a name")
+crash_create()
+    val _ = crash_loop("create", false, (fs) -> made(create(fs, dir_a(fs), "new".bytes, 0o644, Caller(0, 0))))
+
+@test("§27 every write of mknod of a character device, a block device, a FIFO and a socket: before or after")
+crash_mknod()
+    val modes: [4]u16 = [S_IFCHR | 0o600, S_IFBLK | 0o600, S_IFIFO | 0o600, S_IFSOCK | 0o600]
+    val kinds: [4]string = ["mknod chr", "mknod blk", "mknod fifo", "mknod sock"]
+    for i in 0..<4
+        val m = modes[i]
+        val _ = crash_loop(kinds[i], false, (fs) -> made(mknod(fs, dir_b(fs), "node".bytes, m, DeviceNumbers(4, 64), Caller(0, 0))))
+
+@test("§27 every write of a mkdir: the new directory and the parent's link together or neither")
+crash_mkdir()
+    val _ = crash_loop("mkdir", false, (fs) -> made(mkdir(fs, dir_a(fs), "sub".bytes, 0o755, Caller(0, 0))))
+
+@test("§27 every write of an inline symlink and of a block symlink: never a symlink pointing at an unwritten block")
+crash_symlink()
+    val _ = crash_loop("symlink inline", false, (fs) -> made(symlink(fs, dir_a(fs), "s".bytes, target_of(100).view(), Caller(0, 0))))
+    val _ = crash_loop("symlink block", false, (fs) -> made(symlink(fs, dir_a(fs), "s".bytes, target_of(3000).view(), Caller(0, 0))))
+
+@test("§27 every write of a link: links and names always agree")
+crash_link()
+    val _ = crash_loop("link", false, (fs) -> must(link(fs, named(fs, dir_a(fs), "f"), dir_b(fs), "f2".bytes, Caller(0, 0))))
+
+@test("§27 every write of an unlink of a last link (and the delete after it) and of a link that is not the last: before or after")
+crash_unlink()
+    val _ = crash_loop("unlink last", false, (fs) -> must(unlink(fs, dir_a(fs), "f".bytes)))
+    val _ = crash_loop("unlink not last", false, (fs) -> must(unlink(fs, dir_a(fs), "g".bytes)))
+
+@test("§27 every write of an rmdir: the name, the parent's link, the victim freed — before or after")
+crash_rmdir()
+    val _ = crash_loop("rmdir", false, (fs) -> must(rmdir(fs, dir_b(fs), "e".bytes)))
+
+@test("§27 every write of a rename in one directory, across directories, and over an existing file (freed after): before or after")
+crash_rename_files()
+    val _ = crash_loop("rename same dir", false, (fs) -> must(rename(fs, dir_a(fs), "f".bytes, dir_a(fs), "f9".bytes, 0, Caller(0, 0))))
+    val _ = crash_loop("rename across", false, (fs) -> must(rename(fs, dir_a(fs), "f".bytes, dir_b(fs), "f9".bytes, 0, Caller(0, 0))))
+    val _ = crash_loop("rename over a file", false, (fs) -> must(rename(fs, dir_a(fs), "f".bytes, dir_b(fs), "v".bytes, 0, Caller(0, 0))))
+
+@test("§27 every write of a directory renamed over an empty directory in another parent, and of a NOREPLACE rename of a directory: before or after")
+crash_rename_dirs()
+    val _ = crash_loop("rename over a dir", false, (fs) -> must(rename(fs, dir_a(fs), "c".bytes, dir_b(fs), "e".bytes, 0, Caller(0, 0))))
+    val _ = crash_loop("rename noreplace", false, (fs) -> must(rename(fs, dir_b(fs), "d".bytes, dir_a(fs), "d9".bytes, RENAME_NOREPLACE, Caller(0, 0))))
+
+@test("§27 every write of RENAME_EXCHANGE of a file and a directory across parents: names, parent fields and counts all swap or none do")
+crash_exchange()
+    val _ = crash_loop("exchange", false, (fs) -> must(rename(fs, dir_a(fs), "f".bytes, dir_b(fs), "d".bytes, RENAME_EXCHANGE, Caller(0, 0))))
+
+@test("§27 every write of a setattr of mode, owner and times: before or after")
+crash_setattr()
+    val _ = crash_loop("setattr", false, (fs) ->
+        var s = no_change()
+        s.mode = Some(0o600)
+        s.uid = Some(77)
+        s.mtime = TimeSet.At(Time(12345, 6))
+        must(setattr(fs, named(fs, dir_a(fs), "f"), s, 0)))
+
+@test("§27 every write of setxattr making the first block (and the feature), of a replacement, and of the removal that frees the block: before or after")
+crash_xattrs()
+    val _ = crash_loop("setxattr new", false, (fs) -> must(setxattr(fs, named(fs, ROOT_INO, "x"), XATTR_USER, "n".bytes, "v".bytes, 0, 0)))
+    val _ = crash_loop("setxattr replace", true, (fs) -> must(setxattr(fs, named(fs, ROOT_INO, "x"), XATTR_USER, "keep".bytes, "other".bytes, 0, 0)))
+    val _ = crash_loop("removexattr", true, (fs) -> must(removexattr(fs, named(fs, ROOT_INO, "x"), XATTR_USER, "keep".bytes)))
+
+@test("§27 every write of an unmount carrying an uncommitted create: before (nothing of it) or after (the file, CLEAN)")
+crash_unmount()
+    var base = ns_base(false)
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        val _ = mk(&fs, ROOT_INO, "late")
+        cd.arm()
+        val _ = fs.unmount()
+    val t = ns_every_crash("unmount", &base, op)
+    assert(t.writes > 3)

@@ -202,7 +202,7 @@ level_limit()
     var i: u64 = 0
     var refused = false
     while !refused
-        val r = add_name(&fs, d, long_name(i, 200, u8('-')).view(), f, DT_REG, 0)
+        val r = link(&fs, f, d, long_name(i, 200, u8('-')).view(), Caller(0, 0))
         if fails_dir(r) == 1 then refused = true else must(r)
         i += 1
         assert(i < 2000)
@@ -335,9 +335,9 @@ split_respects_reserve()
     for i in 0..<14
         add(&fs, d, long_name(u64(i), 255, u8('-')).view(), f)
     fill_disk(&fs, fs.sb.reserved_blocks)
-    assert_eq(fails_dir(add_name(&fs, d, long_name(98, 255, u8('a')).view(), f, DT_REG, 1000)), 1)
+    assert_eq(fails_dir(link(&fs, f, d, long_name(98, 255, u8('a')).view(), Caller(1000, 1000))), 1)
     assert(!indexed(&fs, d))
-    must(add_name(&fs, d, long_name(98, 255, u8('r')).view(), f, DT_REG, 0))
+    must(link(&fs, f, d, long_name(98, 255, u8('r')).view(), Caller(0, 0)))
     assert(indexed(&fs, d))
     val _ = dir_clean(&fs)
 

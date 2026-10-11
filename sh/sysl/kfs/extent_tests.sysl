@@ -106,8 +106,9 @@ private faulty_block[T](r: Result[T, FsError]) -> u64
         _ -> 0
 
 private file_inode(fs: *HostFs) -> u64
-    var h = fs.start("create", 3)
+    var h = fs.start("create", 3 + C_DIR_ADD)
     val ino = ok_u64(alloc_inode(fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)))
+    must(name_in_root(fs, &h, ino, S_IFREG))
     cover_all(fs, &h, ino)
     fs.stop(&h)
     ino
@@ -1176,6 +1177,7 @@ refused_previous_life()
     var fs = mounted_fs(&dev)
     val loc = fs.inode_location(old.ino)
     val root_copy = read_dev(&dev, loc.block)
+    val _ = must_entry(remove_name(&fs, ROOT_INO, ino_name(old.ino).view()))
     var h = fs.start("delete", 3)
     ok(free_inode(&fs, &h, old.ino))
     fs.stop(&h)

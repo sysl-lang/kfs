@@ -129,13 +129,14 @@ private every_write_same(base: *RamDevice, op: &Fn(*CrashDevice[RamDevice]) -> u
 
 // A file with one extent of `len` new blocks, all in one handle: the allocation transaction.
 private make_file(fs: *CrashFs, len: u32) -> Result[u64, FsError]
-    var h = fs.start("create", 3 + C_ALLOC)
+    var h = fs.start("create", 3 + C_ALLOC + C_DIR_ADD)
     val r = make_file_in(fs, &h, len)
     fs.stop(&h)
     r
 
 private make_file_in(fs: *CrashFs, h: *Handle, len: u32) -> Result[u64, FsError]
     val ino = alloc_inode(fs, h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO))?
+    name_in_root(fs, h, ino, S_IFREG)?
     change_inode(fs, h, ino, (n) -> n.size = u64(len) * u64(BLOCK_SIZE))?
     val run = alloc_blocks(fs, h, 0, len, 0)?
     insert(fs, h, extent_tree(ino, 0), Extent(0, run.len, run.first, false))?
@@ -180,10 +181,11 @@ private put_one_in(fs: *CrashFs, h: *Handle, ino: u64, l: u64) -> Result[unit, F
 // A file with a narrow tree of `count` single-block extents at 0, 2, 4, ...; committed and
 // checkpointed. Answers the inode.
 private narrow_file(fs: *CrashFs, count: u64) -> u64
-    var h = fs.start("create", 3)
+    var h = fs.start("create", 3 + C_DIR_ADD)
     val ino = alloc_inode(fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)) match
         Ok(i) -> i
         Err(_) -> panic("no inode")
+    must(name_in_root(fs, &h, ino, S_IFREG))
     cover_all(fs, &h, ino)
     fs.stop(&h)
     narrow_root(fs, ino)
@@ -287,7 +289,7 @@ crash_checkpoint()
         assert_eq(fs.logged_count(), 3)
         cd.arm()
         val _ = fs.checkpoint_all())
-    // The first checkpoints with nothing left on its list (its four buffers are the third's now): its
-    // journal superblock; the second, block 1 and the journal superblock; the third, its four buffers
-    // and the journal superblock.
-    assert_eq(l.writes, 8)
+    // The first checkpoints with nothing left on its list (its five buffers are the third's now): its
+    // journal superblock; the second, block 1 and the journal superblock; the third, its five buffers
+    // (the allocation's four and the root's leaf, which its name goes in) and the journal superblock.
+    assert_eq(l.writes, 9)

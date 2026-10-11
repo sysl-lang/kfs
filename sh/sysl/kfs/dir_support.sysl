@@ -6,7 +6,7 @@ import sysl.buf.{Buf, buf}
 
 // Helpers the directory tests share.
 
-// A new empty directory, a child of the root; the root's own name for it is stage 8's.
+// A new empty directory, a child of the root, named `i<ino>` there.
 new_dir[D: BlockDevice](fs: *Fs[D, HostPlatform]) -> u64 = new_inode(fs, S_IFDIR | 0o755, 0)
 
 // Name `i` of a family: `prefix`, then `i` in decimal, then `pad` bytes of 'x', then `tail` as its last
@@ -50,13 +50,13 @@ must_listing(r: Result[Listing, FsError]) -> Listing
         Ok(l) -> l
         Err(_) -> panic("a read_dir failed")
 
-// Add `name` -> `ino` as a regular file, as uid 0; must succeed.
+// Add `name` -> `ino`, a non-directory, as a link made by uid 0; must succeed.
 add[D: BlockDevice](fs: *Fs[D, HostPlatform], dir: u64, name: []const u8, ino: u64)
-    must(add_name(fs, dir, name, ino, DT_REG, 0))
+    must(link(fs, ino, dir, name, Caller(0, 0)))
 
-// Remove `name`; must succeed.
+// Unlink `name`; must succeed.
 take_out[D: BlockDevice](fs: *Fs[D, HostPlatform], dir: u64, name: []const u8)
-    val _ = must_entry(remove_name(fs, dir, name))
+    must(unlink(fs, dir, name))
 
 // Whether `name` is found.
 has[D: BlockDevice](fs: *Fs[D, HostPlatform], dir: u64, name: []const u8) -> bool

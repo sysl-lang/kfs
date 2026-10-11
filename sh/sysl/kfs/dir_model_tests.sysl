@@ -50,7 +50,7 @@ private run_model(seed: u64, ops: u64, ids: u64, cap: u64) -> Run
             if k < ids then id = (id + k) % ids
         val name = pool_name(id)
         if insert
-            val got = fails_dir(add_name(&fs, d, name.view(), f, DT_REG, 0))
+            val got = fails_dir(link(&fs, f, d, name.view(), Caller(0, 0)))
             if present[usize(id)]
                 assert_eq(got, 20)
                 r.refused += 1
@@ -60,9 +60,9 @@ private run_model(seed: u64, ops: u64, ids: u64, cap: u64) -> Run
                 count += 1
                 r.inserts += 1
         else
-            val got = remove_name(&fs, d, name.view())
+            val got = unlink(&fs, d, name.view())
             if present[usize(id)]
-                assert_eq(must_entry(got).ino, f)
+                assert_eq(fails_dir(got), 0)
                 present[usize(id)] = false
                 count -= 1
                 r.removes += 1

@@ -66,10 +66,11 @@ clean_images()
     assert_eq(rep.claimed.len(), 1)
     assert_eq(rep.claimed[0], root_leaf(&dev))
     var fs = mounted(&dev)
-    var h = fs.start("create", 3 + C_ALLOC)
+    var h = fs.start("create", 3 + C_ALLOC + C_DIR_ADD)
     val ino = alloc_inode(&fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)) match
         Ok(i) -> i
         Err(_) -> panic("no inode")
+    must(name_in_root(&fs, &h, ino, S_IFREG))
     cover_all(&fs, &h, ino)
     val run = alloc_blocks(&fs, &h, 0, 5, 0) match
         Ok(r) -> r
@@ -177,10 +178,11 @@ pass1_node_blocks()
     for which in 0..<3
         var dev = small_device()
         var fs = mounted(&dev)
-        var h = fs.start("create", 3)
+        var h = fs.start("create", 3 + C_DIR_ADD)
         val ino = alloc_inode(&fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)) match
             Ok(i) -> i
             Err(_) -> panic("no inode")
+        must(name_in_root(&fs, &h, ino, S_IFREG))
         cover_all(&fs, &h, ino)
         fs.stop(&h)
         // Nine one-block extents overflow the root's seven: the tree grows a node block.
