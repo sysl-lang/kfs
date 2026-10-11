@@ -1,0 +1,299 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// Removal and the four shrinking rules of kfs/SPEC.md section 10, each at its boundary and one short of
+// it; the honest continuation mark; draining a directory to empty. Leaves are laid out exactly with the
+// forced-hash hook: names ending 'b' take X, names ending 'a' take Y (X < Y).
+
+private const X_RAW: u64 = 0x4000_0000_0000_0000
+private const Y_RAW: u64 = 0x8000_0000_0000_0000
+
+// A directory converted with 7 X names of 255 bytes in its first leaf and 8 Y names of 255 bytes in its
+// second: the split falls on the boundary (keys 0 and Y). The hook is left set.
+private xy_dir(fs: *RamFs, f: u64) -> u64
+    force_raw_hashes([X_RAW, Y_RAW])
+    val d = new_dir(fs)
+    for i in 0..<7
+        add(fs, d, long_name(u64(i), 255, u8('b')).view(), f)
+    for i in 0..<8
+        add(fs, d, long_name(u64(i), 255, u8('a')).view(), f)
+    val s = shape(fs, d)
+    assert(s.keys.len() == 2 && s.keys[1] == Y_RAW && s.leaves[0] == 1 && s.leaves[1] == 2)
+    assert(leaf_live_at(fs, d, 1) == 7 * 272 && leaf_live_at(fs, d, 2) == 8 * 272)
+    d
+
+// Rule 2 into the left leaf: the second leaf ends with a Y name of `last_live` bytes and "ya"; the eight
+// big Y names go first (the pair never fits half a leaf on the way), then "ya". Answers the directory.
+private merge_left_case(fs: *RamFs, f: u64, last_live: usize) -> u64
+    val d = xy_dir(fs, f)
+    val last = long_name(100, last_live - 12, u8('a'))
+    add(fs, d, last.view(), f)
+    add(fs, d, "ya".bytes, f)
+    for i in 0..<8
+        take_out(fs, d, long_name(u64(i), 255, u8('a')).view())
+        assert_eq(shape(fs, d).keys.len(), 2)
+    assert_eq(leaf_live_at(fs, d, 1) + leaf_live_at(fs, d, 2), 7 * 272 + last_live + 16)
+    take_out(fs, d, "ya".bytes)
+    d
+
+@test("§10 rule 2 at its boundary: a leaf and the one before it holding 2032 live bytes together merge into the left, the right freed")
+merge_left_at_boundary()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = merge_left_case(&fs, f, 128)
+    val s = shape(&fs, d)
+    assert(s.keys.len() == 1 && s.leaves[0] == 1)
+    assert_eq(leaf_live_at(&fs, d, 1), 2032)
+    // The right leaf was the last block: the directory shrinks to the root and the left leaf.
+    assert(dir_phys(&fs, d, 2) == 0 && dir_inode(&fs, d).size == 2 * 4096)
+    for i in 0..<7
+        assert(has(&fs, d, long_name(u64(i), 255, u8('b')).view()))
+    assert(has(&fs, d, long_name(100, 116, u8('a')).view()))
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 rule 2 one short: 2040 live bytes together do not fit half a leaf, and both leaves stay")
+merge_left_one_short()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = merge_left_case(&fs, f, 136)
+    assert_eq(shape(&fs, d).keys.len(), 2)
+    assert_eq(leaf_live_at(&fs, d, 1) + leaf_live_at(&fs, d, 2), 2040)
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+// Rule 2 with the right sibling: the first leaf gains "xb", the second a Y name of `last_live` bytes; the
+// big Y names go, then "xb" — a removal from the first leaf.
+private merge_right_case(fs: *RamFs, f: u64, last_live: usize) -> u64
+    val d = xy_dir(fs, f)
+    add(fs, d, "xb".bytes, f)
+    add(fs, d, long_name(100, last_live - 12, u8('a')).view(), f)
+    for i in 0..<8
+        take_out(fs, d, long_name(u64(i), 255, u8('a')).view())
+        assert_eq(shape(fs, d).keys.len(), 2)
+    take_out(fs, d, "xb".bytes)
+    d
+
+@test("§10 rule 2 at its boundary with the right sibling: its records move into the leaf, the sibling freed")
+merge_right_at_boundary()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = merge_right_case(&fs, f, 128)
+    val s = shape(&fs, d)
+    assert(s.keys.len() == 1 && s.leaves[0] == 1 && dir_phys(&fs, d, 2) == 0)
+    assert(holds_name(leaf_names_at(&fs, d, 1), long_name(100, 116, u8('a')).view()))
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 rule 2 one short with the right sibling: 2040 bytes, no merge")
+merge_right_one_short()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = merge_right_case(&fs, f, 136)
+    assert_eq(shape(&fs, d).keys.len(), 2)
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 rule 1, entry i > 0: a leaf's last name frees it and its entry goes, its range joining the leaf before; one name short it stays")
+empty_leaf_middle()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    force_raw_hash(X_RAW)
+    for i in 0..<29
+        add(&fs, d, long_name(u64(i), 255, u8('b')).view(), f)
+    val s = shape(&fs, d)
+    assert(s.keys.len() == 3)
+    val mid = s.leaves[1]
+    val names = leaf_names_at(&fs, d, mid)
+    val size = dir_inode(&fs, d).size
+    for k in 0..<(names.len() - 1)
+        take_out(&fs, d, names[k].view())
+    // One name left: the leaf stays.
+    assert(shape(&fs, d).keys.len() == 3 && dir_phys(&fs, d, mid) != 0)
+    take_out(&fs, d, names[names.len() - 1].view())
+    val t = shape(&fs, d)
+    assert(t.keys.len() == 2 && t.leaves[0] == s.leaves[0] && t.leaves[1] == s.leaves[2])
+    // The run still spans the two leaves left, so the mark stays.
+    assert(t.keys[1] == X_RAW | 1)
+    // The freed leaf was not the last block: a hole, the size kept.
+    assert(dir_phys(&fs, d, mid) == 0 && dir_inode(&fs, d).size == size)
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 rule 1, entry 0: the first leaf's last name frees it and the next leaf takes key 0; one name short it stays")
+empty_leaf_first()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = xy_dir(&fs, f)
+    for i in 0..<6
+        take_out(&fs, d, long_name(u64(i), 255, u8('b')).view())
+    assert_eq(shape(&fs, d).keys.len(), 2)
+    take_out(&fs, d, long_name(6, 255, u8('b')).view())
+    val s = shape(&fs, d)
+    assert(s.keys.len() == 1 && s.keys[0] == 0 && s.leaves[0] == 2 && s.levels == 1)
+    assert(dir_phys(&fs, d, 1) == 0 && dir_inode(&fs, d).size == 3 * 4096)
+    for i in 0..<8
+        assert(has(&fs, d, long_name(u64(i), 255, u8('a')).view()))
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 the honest mark: the leaf before a key h | 1 losing its last name of hash h turns the key into h; one name short the mark stays")
+mark_turned_off()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    force_raw_hashes([X_RAW, Y_RAW])
+    val d = new_dir(&fs)
+    // "xb" (16 bytes) and fifteen Y names of 255: no boundary fits, so the conversion splits Y's run.
+    add(&fs, d, "xb".bytes, f)
+    for i in 0..<15
+        add(&fs, d, long_name(u64(i), 255, u8('a')).view(), f)
+    var s = shape(&fs, d)
+    assert(s.keys.len() == 2 && s.keys[1] == Y_RAW | 1)
+    // Fill both leaves with Y names, so no removal below can merge them.
+    for i in 15..<28
+        add(&fs, d, long_name(u64(i), 255, u8('a')).view(), f)
+    s = shape(&fs, d)
+    assert(s.keys.len() == 2)
+    var ys: Buf[Buf[u8]] = buf()
+    for n in leaf_names_at(&fs, d, s.leaves[0]).view()
+        if n[n.len() - 1] == u8('a') then ys.push(n)
+    assert(ys.len() > 2)
+    for k in 0..<(ys.len() - 1)
+        take_out(&fs, d, ys[k].view())
+    assert_eq(shape(&fs, d).keys[1], Y_RAW | 1)
+    val _ = dir_clean(&fs)
+    take_out(&fs, d, ys[ys.len() - 1].view())
+    s = shape(&fs, d)
+    assert(s.keys.len() == 2 && s.keys[1] == Y_RAW)
+    assert(has(&fs, d, "xb".bytes))
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+// The names of `d` from `from` on, in hash order (ascending, or descending).
+private by_hash(fs: *RamFs, d: u64, n: u64, len: usize, descending: bool) -> Buf[Buf[u8]]
+    var hs: Buf[u64] = buf()
+    var names: Buf[Buf[u8]] = buf()
+    for i in 0..<n
+        val name = long_name(i, len, u8('-'))
+        hs.push(hash_of(fs, name.view()))
+        names.push(name)
+    for i in 1..<names.len()
+        var j = i
+        while j > 0 && ((!descending && hs[j - 1] > hs[j]) || (descending && hs[j - 1] < hs[j]))
+            val th = hs[j]
+            hs[j] = hs[j - 1]
+            hs[j - 1] = th
+            val tn = names[j]
+            names[j] = names[j - 1]
+            names[j - 1] = tn
+            j -= 1
+    names
+
+@test("§10 rule 3 at its boundary: the removal that leaves the root one entry over an index block absorbs it; never a root of one such entry")
+root_absorbs_child()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 3
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    var n: u64 = 0
+    while shape(&fs, d).levels < 2
+        add(&fs, d, long_name(n, 120, u8('-')).view(), f)
+        n += 1
+    var s = shape(&fs, d)
+    assert(s.levels == 2 && s.root_count == 2)
+    var absorbed = 0
+    for name in by_hash(&fs, d, n, 120, true).view()
+        take_out(&fs, d, name.view())
+        val t = shape(&fs, d)
+        if t.levels >= 2 then assert(t.root_count >= 2)
+        if t.levels < s.levels && s.levels >= 2
+            // One short: the shape before had a root of two entries.
+            assert(s.root_count == 2 && t.levels == s.levels - 1)
+            absorbed += 1
+        s = t
+    assert(absorbed >= 1)
+    assert_eq(dir_inode(&fs, d).size, 0)
+    val _ = dir_clean(&fs)
+
+@test("§10 rule 4: the last name of a linear directory frees its leaf (size 0, no blocks); one short it stays")
+last_name_linear()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    add(&fs, d, "a".bytes, f)
+    add(&fs, d, "b".bytes, f)
+    take_out(&fs, d, "a".bytes)
+    assert(dir_inode(&fs, d).size == 4096 && dir_inode(&fs, d).blocks == 1)
+    take_out(&fs, d, "b".bytes)
+    val node = dir_inode(&fs, d)
+    assert(node.size == 0 && node.blocks == 0 && node.flags & INODE_INDEXED == 0 && dir_phys(&fs, d, 0) == 0)
+    val _ = dir_clean(&fs)
+
+@test("§10 rule 4 and drain: an indexed directory of three levels drained name by name frees every block and accepts names again")
+drain_to_empty()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 4
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    must(fs.commit())
+    val free0 = free_total(&fs)
+    val n: u64 = 500
+    for i in 0..<n
+        add(&fs, d, long_name(i, 120, u8('-')).view(), f)
+    assert(shape(&fs, d).levels == 3)
+    for i in 0..<(n - 1)
+        take_out(&fs, d, long_name(i, 120, u8('-')).view())
+        if i % 50 == 0 then val _ = dir_clean(&fs)
+    // One short: one name, still indexed.
+    assert(indexed(&fs, d) && dir_inode(&fs, d).blocks > 0)
+    take_out(&fs, d, long_name(n - 1, 120, u8('-')).view())
+    val node = dir_inode(&fs, d)
+    assert(node.size == 0 && node.blocks == 0 && node.flags & INODE_INDEXED == 0)
+    must(fs.commit())
+    assert_eq(free_total(&fs), free0)
+    val _ = dir_clean(&fs)
+    // And it takes names again, from a linear leaf.
+    add(&fs, d, "again".bytes, f)
+    assert(has(&fs, d, "again".bytes) && !indexed(&fs, d) && dir_inode(&fs, d).size == 4096)
+    val _ = dir_clean(&fs)
+
+@test("§10 removal in hash order from the front: first entries removed at every level, their keys carried down the spine; from the back: the size shrinks")
+remove_in_hash_order()
+    for descending in [false, true]
+        var dev = small_device()
+        var fs = mounted(&dev)
+        fs.index_max = 4
+        val f = new_file(&fs, 0)
+        val d = new_dir(&fs)
+        val n: u64 = 400
+        for i in 0..<n
+            add(&fs, d, long_name(i, 120, u8('-')).view(), f)
+        assert(shape(&fs, d).levels == 3)
+        var gone: u64 = 0
+        var last_size = dir_inode(&fs, d).size
+        var shrank = false
+        for name in by_hash(&fs, d, n, 120, descending).view()
+            take_out(&fs, d, name.view())
+            gone += 1
+            val size = dir_inode(&fs, d).size
+            if size < last_size then shrank = true
+            last_size = size
+            if gone % 40 == 0
+                val _ = dir_clean(&fs)
+                assert_eq(scan_all(&fs, d, 1 << 20).len(), usize(n - gone) + 2)
+        assert(dir_inode(&fs, d).size == 0 && (shrank || !descending))
+        val _ = dir_clean(&fs)

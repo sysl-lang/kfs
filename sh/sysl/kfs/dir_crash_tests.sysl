@@ -1,0 +1,281 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The every-write loop of kfs/SPEC.md section 27 over directory changes: an insert that splits a leaf,
+// one that converts a linear directory, one that splits an interior index block, one that grows the root
+// a level; removals that merge two leaves, that free a leaf and absorb the root's child, and that empty
+// an indexed directory. Each is one transaction, so after a crash at any write, in every mode — drop
+// after N, the Nth torn three ways, two seeded reorders — the recovered image must check clean and be
+// exactly the state before or the state after.
+//
+// The visible state is file_crash_tests.sysl's: the superblock but for what every mount writes, the
+// descriptors, the bitmaps and inode tables, and every block an inode claims — the directory's blocks
+// among them.
+
+private struct Tally
+    writes: u64
+    points: u64
+    before: u64
+    after: u64
+
+private state_of(cd: *CrashDevice[RamDevice]) -> Buf[u64]
+    var fs = mounted(cd)
+    assert(!fs.read_only())
+    must(fs.checkpoint_all())
+    val rep = checked_clean(cd)
+    var out: Buf[u64] = buf()
+    var sb = raw(cd, 1)
+    mask_mount_fields(sb.view())
+    out.push(digest(sb.view()))
+    val g = fs.geo
+    for t in 0..<u64(g.gdt_blocks)
+        out.push(digest(raw(cd, 2 + t).view()))
+    for grp in 0..<g.group_count
+        out.push(digest(raw(cd, g.block_bitmap(grp)).view()))
+        out.push(digest(raw(cd, g.inode_bitmap(grp)).view()))
+        for t in 0..<u64(g.itable_blocks())
+            out.push(digest(raw(cd, g.inode_table(grp) + t).view()))
+    for b in rep.claimed.view()
+        out.push(b)
+        out.push(digest(raw(cd, b).view()))
+    out
+
+private rewind_all(cd: *CrashDevice[RamDevice], base: *RamDevice)
+    assert(cd.rewind().is_ok())
+    base.reset_counters()
+
+private crash_plan(n: u64, mode: u32, total: u64) -> Option[CrashMode]
+    mode match
+        0 -> if n < total then Some(CrashMode.DropAfter(n)) else None
+        1 -> Some(CrashMode.Tear(n, 0x01))
+        2 -> Some(CrashMode.Tear(n, 0xFE))
+        3 -> Some(CrashMode.Tear(n, u8((n * 0x9E37 + 0x5B) & 0xFF)))
+        4 -> Some(CrashMode.Reorder(n, n * 7919 + 1))
+        _ -> Some(CrashMode.Reorder(n, n * 104729 + 3))
+
+private outcome(base: *RamDevice, cd: *CrashDevice[RamDevice], op: &Fn(*CrashDevice[RamDevice]) -> unit, plan: CrashMode) -> Buf[u64]
+    cd.plan = plan
+    op(cd)
+    cd.disarm()
+    val r = state_of(cd)
+    rewind_all(cd, base)
+    r
+
+// Count the operation's writes on a clean run, then crash at every one in every mode: the image must be
+// the state before or the state after, and the checker clean.
+private every_crash(name: string, base: *RamDevice, op: &Fn(*CrashDevice[RamDevice]) -> unit) -> Tally
+    var cd = crash_device(base)
+    cd.mark()
+    val after = outcome(base, &cd, op, CrashMode.Off)
+    val before = outcome(base, &cd, op, CrashMode.DropAfter(0))
+    assert(before != after)
+    cd.plan = CrashMode.Off
+    op(&cd)
+    val total = cd.counted
+    assert(!cd.crashed && total > 0)
+    cd.disarm()
+    rewind_all(&cd, base)
+    var t = Tally(total, 0, 0, 0)
+    for n in 1..<(total + 1)
+        for mode in 0u32..<6
+            crash_plan(n, mode, total) match
+                None -> ()
+                Some(p) ->
+                    cd.plan = p
+                    op(&cd)
+                    cd.disarm()
+                    val s = state_of(&cd)
+                    if s == before then t.before += 1
+                    else if s == after then t.after += 1
+                    else panic(s"$name: a crash at write $n left a state that is neither before nor after")
+                    t.points += 1
+                    rewind_all(&cd, base)
+    print(s"$name: $total writes, ${t.points} crash points: ${t.before} before, ${t.after} after")
+    assert(t.before > 0 && t.after > 0)
+    t
+
+private nm(i: u64) -> Buf[u8] = long_name(i, 120, u8('-'))
+
+// What an insert of name `i` does to the index.
+private enum Event
+    Converts
+    SplitsLeaf
+    SplitsInterior
+    GrowsRoot
+    Other
+
+private event_of(a: Shape, b: Shape, was_indexed: bool, now_indexed: bool) -> Event
+    if !was_indexed && now_indexed then return Event.Converts
+    if b.levels > a.levels then return Event.GrowsRoot
+    if b.levels == a.levels && b.levels >= 2 && b.index_blocks > a.index_blocks then return Event.SplitsInterior
+    if b.levels == a.levels && b.levels >= 1 && b.index_blocks == a.index_blocks && b.leaves.len() > a.leaves.len() then return Event.SplitsLeaf
+    Event.Other
+
+private same_event(a: Event, b: Event) -> bool
+    a match
+        Event.Converts -> b match
+            Event.Converts -> true
+            _ -> false
+        Event.SplitsLeaf -> b match
+            Event.SplitsLeaf -> true
+            _ -> false
+        Event.SplitsInterior -> b match
+            Event.SplitsInterior -> true
+            _ -> false
+        Event.GrowsRoot -> b match
+            Event.GrowsRoot -> true
+            _ -> false
+        Event.Other -> false
+
+// The first name whose insert, after names 0 ... k - 1, does `want` (index max 3): found on a dry run of
+// the same image, which is deterministic.
+private first_insert(want: Event) -> u64
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 3
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    var k: u64 = 0
+    loop
+        val a = shape(&fs, d)
+        val was = indexed(&fs, d)
+        add(&fs, d, nm(k).view(), f)
+        if same_event(event_of(a, shape(&fs, d), was, indexed(&fs, d)), want) then return k
+        k += 1
+        assert(k < 3000)
+
+// A base image holding file 12 and directory 13 with names 0 ... k - 1, unmounted.
+private base_with(k: u64) -> RamDevice
+    var base = small_device()
+    var fs = mounted(&base)
+    fs.index_max = 3
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    assert(f == 12 && d == 13)
+    for i in 0..<k
+        add(&fs, d, nm(i).view(), f)
+    must(fs.unmount())
+    base
+
+private insert_loop(name: string, want: Event)
+    val k = first_insert(want)
+    var base = base_with(k)
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        fs.index_max = 3
+        cd.arm()
+        val _ = add_name(&fs, 13, nm(k).view(), 12, DT_REG, 0)
+        val _ = fs.commit()
+    val _ = every_crash(name, &base, op)
+
+@test("§27 every write of an insert that converts a linear directory: before or after, never between")
+crash_convert()
+    insert_loop("convert", Event.Converts)
+
+@test("§27 every write of an insert that splits a leaf: before or after")
+crash_split_leaf()
+    insert_loop("split a leaf", Event.SplitsLeaf)
+
+@test("§27 every write of an insert that splits an interior index block: before or after")
+crash_split_interior()
+    insert_loop("split an interior block", Event.SplitsInterior)
+
+@test("§27 every write of an insert that grows the root a level: before or after")
+crash_grow_root()
+    insert_loop("grow the root", Event.GrowsRoot)
+
+private const X_RAW: u64 = 0x4000_0000_0000_0000
+private const Y_RAW: u64 = 0x8000_0000_0000_0000
+
+@test("§27 every write of a removal that merges two leaves (rule 2): before or after")
+crash_merge()
+    force_raw_hashes([X_RAW, Y_RAW])
+    var base = small_device()
+    var fs = mounted(&base)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    for i in 0..<7
+        add(&fs, d, long_name(u64(i), 255, u8('b')).view(), f)
+    for i in 0..<8
+        add(&fs, d, long_name(u64(i), 255, u8('a')).view(), f)
+    add(&fs, d, long_name(100, 116, u8('a')).view(), f)
+    add(&fs, d, "ya".bytes, f)
+    for i in 0..<8
+        take_out(&fs, d, long_name(u64(i), 255, u8('a')).view())
+    assert_eq(shape(&fs, d).keys.len(), 2)
+    must(fs.unmount())
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        cd.arm()
+        val _ = remove_name(&fs, d, "ya".bytes)
+        val _ = fs.commit()
+    val _ = every_crash("merge", &base, op)
+    clear_raw_hash()
+
+@test("§27 every write of a removal that frees a leaf, empties an index block and absorbs the root's child (rules 1 and 3): before or after")
+crash_absorb()
+    // A dry run finds the removal, in descending hash order, that lowers the levels from two to one; the
+    // base image has every removal before it done.
+    var n: u64 = 0
+    var dry = small_device()
+    var fs = mounted(&dry)
+    fs.index_max = 3
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    while shape(&fs, d).levels < 2
+        add(&fs, d, nm(n).view(), f)
+        n += 1
+    var order: Buf[u64] = buf()
+    var hs: Buf[u64] = buf()
+    for i in 0..<n
+        order.push(i)
+        hs.push(hash_of(&fs, nm(i).view()))
+    for i in 1..<order.len()
+        var j = i
+        while j > 0 && hs[j - 1] < hs[j]
+            val th = hs[j]
+            hs[j] = hs[j - 1]
+            hs[j - 1] = th
+            val to = order[j]
+            order[j] = order[j - 1]
+            order[j - 1] = to
+            j -= 1
+    var cut: usize = 0
+    while shape(&fs, d).levels == 2
+        take_out(&fs, d, nm(order[cut]).view())
+        cut += 1
+    val last = order[cut - 1]
+    var base = base_with(n)
+    var bfs = mounted(&base)
+    bfs.index_max = 3
+    for k in 0..<(cut - 1)
+        take_out(&bfs, 13, nm(order[k]).view())
+    assert_eq(shape(&bfs, 13).levels, 2)
+    must(bfs.unmount())
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        fs.index_max = 3
+        cd.arm()
+        val _ = remove_name(&fs, 13, nm(last).view())
+        val _ = fs.commit()
+    val _ = every_crash("absorb", &base, op)
+
+@test("§27 every write of the removal of an indexed directory's last name (rule 4): before or after")
+crash_last_name()
+    var base = base_with(40)
+    var fs = mounted(&base)
+    fs.index_max = 3
+    assert(indexed(&fs, 13))
+    for i in 1u64..<40
+        take_out(&fs, 13, nm(i).view())
+    assert(indexed(&fs, 13))
+    must(fs.unmount())
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        cd.arm()
+        val _ = remove_name(&fs, 13, nm(0).view())
+        val _ = fs.commit()
+    val _ = every_crash("last name", &base, op)

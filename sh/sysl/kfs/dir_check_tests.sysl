@@ -1,0 +1,423 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The checker's pass 2 (kfs/SPEC.md section 23) over directories broken on purpose, one rule at a time,
+// and the operations' refusal of the same blocks (section 10: every block checked as it is read; a
+// failure is corruption, which aborts the journal, section 22).
+
+private const X_RAW: u64 = 0x4000_0000_0000_0000
+private const Y_RAW: u64 = 0x8000_0000_0000_0000
+
+private fault_no(f: DirFault) -> u64
+    f match
+        DirFault.Checksum -> 1
+        DirFault.Magic -> 2
+        DirFault.Owner -> 3
+        DirFault.Generation -> 4
+        DirFault.Header -> 5
+        DirFault.Records -> 6
+        DirFault.Keys -> 7
+        DirFault.Missing -> 8
+
+// A pass-2 problem as a string that tells every variant and payload apart; other problems by their
+// description.
+private code_of(p: Problem) -> string
+    p match
+        Problem.DirBlock(i, b, f) -> s"block $i $b ${fault_no(f)}"
+        Problem.DirName(i, b) -> s"name $i $b"
+        Problem.DirTarget(i, t) -> s"target $i $t"
+        Problem.DirType(i, t) -> s"type $i $t"
+        Problem.DirDuplicate(i) -> s"duplicate $i"
+        Problem.DirRange(i, b) -> s"range $i $b"
+        Problem.DirMark(i, b) -> s"mark $i $b"
+        Problem.DirReach(i, b) -> s"reach $i $b"
+        Problem.DirShape(i) -> s"shape $i"
+        _ -> describe(p)
+
+// The checker over the device finds exactly `want` and nothing else.
+private only(dev: *RamDevice, want: Problem)
+    val rep = check(dev)
+    for p in rep.problems.view()
+        print("checker: " + code_of(p))
+    assert(rep.problems.len() == 1 && code_of(rep.problems[0]) == code_of(want))
+
+// The checker finds `want` among its problems.
+private among(dev: *RamDevice, want: Problem)
+    val rep = check(dev)
+    var found = false
+    for p in rep.problems.view()
+        if code_of(p) == code_of(want) then found = true
+    if !found
+        for p in rep.problems.view()
+            print("checker: " + code_of(p))
+    assert(found)
+
+// How an operation refused a broken directory block: 100 x the block + the fault; 0 for success, 1 for
+// another error.
+private refusal[T](r: Result[T, FsError]) -> u64
+    r match
+        Ok(_) -> 0
+        Err(FsError.Corrupt(Corruption.Directory(_, b, f))) -> b * 100 + fault_no(f)
+        Err(_) -> 1
+
+// The operations refuse the block: lookup of `name` names block `l` and fault `f`, and the journal aborts.
+private refused(fs: *RamFs, d: u64, name: []const u8, l: u64, f: DirFault)
+    assert_eq(refusal(lookup_name(fs, d, name)), l * 100 + fault_no(f))
+    assert(fs.aborted())
+
+// A linear directory of three names.
+private linear(fs: *RamFs, f: u64) -> u64
+    val d = new_dir(fs)
+    add(fs, d, "one".bytes, f)
+    add(fs, d, "two".bytes, f)
+    add(fs, d, "three".bytes, f)
+    d
+
+// The X/Y directory of the shrink tests: X names in leaf 1, Y names in leaf 2, keys 0 and Y. The hook
+// stays set.
+private xy(fs: *RamFs, f: u64) -> u64
+    force_raw_hashes([X_RAW, Y_RAW])
+    val d = new_dir(fs)
+    for i in 0..<7
+        add(fs, d, long_name(u64(i), 255, u8('b')).view(), f)
+    for i in 0..<8
+        add(fs, d, long_name(u64(i), 255, u8('a')).view(), f)
+    d
+
+private y_name() -> Buf[u8] = long_name(0, 255, u8('a'))
+private x_name() -> Buf[u8] = long_name(0, 255, u8('b'))
+
+private set_u32(b: []u8, at: usize, v: u32) = put_le32(b, at, v)
+
+private set_u16(b: []u8, at: usize, v: u16)
+    b[at] = u8(v & 0xFF)
+    b[at + 1] = u8(v >> 8)
+
+private set_key(b: []u8, i: usize, key: u64) = put_le64(b, 16 + 16 * i, key)
+private set_child(b: []u8, i: usize, child: u32) = put_le32(b, 16 + 16 * i + 8, child)
+
+@test("§23 pass 2 clean: a fresh image's root and lost+found, linear and indexed directories, and an emptied one")
+pass2_clean()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val a = linear(&fs, f)
+    val b = xy(&fs, f)
+    val c = new_dir(&fs)
+    add(&fs, c, "gone".bytes, f)
+    take_out(&fs, c, "gone".bytes)
+    val rep = dir_clean(&fs)
+    assert(rep.inodes >= 5)
+    clear_raw_hash()
+
+@test("§23 pass 2 and §10: a leaf with a bad checksum, wrong magic, another directory's owner or an old generation is refused")
+leaf_identity()
+    for kind in 0u32..<4
+        var dev = small_device()
+        var fs = mounted(&dev)
+        val f = new_file(&fs, 0)
+        val d = xy(&fs, f)
+        val other = new_dir(&fs)
+        poke_dir(&fs, d, 2, kind != 0, (b) ->
+            kind match
+                0 -> b[100] = b[100] ^ 0x40
+                1 -> set_u32(b, 0, EXTENT_MAGIC)
+                2 -> put_le64(b, TAIL_OFFSET, other)
+                _ -> put_le32(b, TAIL_OFFSET + 8, le32(b, TAIL_OFFSET + 8) + 1))
+        val fault = kind match
+            0 -> DirFault.Checksum
+            1 -> DirFault.Magic
+            2 -> DirFault.Owner
+            _ -> DirFault.Generation
+        only(&dev, Problem.DirBlock(d, 2, fault))
+        refused(&fs, d, y_name().view(), 2, fault)
+        clear_raw_hash()
+
+@test("§23 pass 2 and §10: an index block with a bad checksum, wrong magic, another directory's owner or an old generation is refused")
+index_identity()
+    for kind in 0u32..<4
+        var dev = small_device()
+        var fs = mounted(&dev)
+        val f = new_file(&fs, 0)
+        val d = xy(&fs, f)
+        val other = new_dir(&fs)
+        poke_dir(&fs, d, 0, kind != 0, (b) ->
+            kind match
+                0 -> b[20] = b[20] ^ 0x01
+                1 -> set_u32(b, 0, DIR_LEAF_MAGIC)
+                2 -> put_le64(b, TAIL_OFFSET, other)
+                _ -> put_le32(b, TAIL_OFFSET + 8, 77))
+        val fault = kind match
+            0 -> DirFault.Checksum
+            1 -> DirFault.Magic
+            2 -> DirFault.Owner
+            _ -> DirFault.Generation
+        only(&dev, Problem.DirBlock(d, 0, fault))
+        refused(&fs, d, x_name().view(), 0, fault)
+        clear_raw_hash()
+
+@test("§23 pass 2: a leaf's records — count not the live records, a record past the tail, rec_len not a multiple of 8, a free record not first, an empty name")
+leaf_records_broken()
+    for kind in 0u32..<5
+        var dev = small_device()
+        var fs = mounted(&dev)
+        val f = new_file(&fs, 0)
+        val d = linear(&fs, f)
+        poke_dir(&fs, d, 0, true, (b) ->
+            val recs = leaf_records(b) match
+                Ok(r) -> r
+                Err(_) -> panic("the leaf was already broken")
+            kind match
+                0 -> set_u16(b, 4, 4)
+                1 -> set_u16(b, recs[2].off + 8, u16(recs[2].rec_len + 8))
+                2 -> set_u16(b, recs[0].off + 8, u16(recs[0].rec_len + 4))
+                3 -> put_le64(b, recs[1].off, 0)
+                _ -> b[recs[1].off + 10] = 0)
+        val fault = if kind == 0 || kind == 3 then DirFault.Header else DirFault.Records
+        // A free record not first also leaves `count` one high: Header comes first only for kind 0.
+        val want = if kind == 3 then DirFault.Records else fault
+        only(&dev, Problem.DirBlock(d, 0, want))
+        refused(&fs, d, "one".bytes, 0, want)
+
+@test("§23 pass 2: an index block's header — max 0, max past 254, count past max, a level the place does not give, a reserved byte")
+index_header_broken()
+    for kind in 0u32..<5
+        var dev = small_device()
+        var fs = mounted(&dev)
+        val f = new_file(&fs, 0)
+        val d = xy(&fs, f)
+        poke_dir(&fs, d, 0, true, (b) ->
+            kind match
+                0 -> set_u16(b, 6, 0)
+                1 -> set_u16(b, 6, 255)
+                2 -> set_u16(b, 6, 1)
+                3 -> b[8] = 3
+                _ -> b[12] = 1)
+        only(&dev, Problem.DirBlock(d, 0, DirFault.Header))
+        refused(&fs, d, x_name().view(), 0, DirFault.Header)
+        clear_raw_hash()
+
+@test("§23 pass 2: index keys out of order, the root's entry 0 not keyed 0, an interior block's entry 0 not its parent's key")
+index_keys_broken()
+    for kind in 0u32..<2
+        var dev = small_device()
+        var fs = mounted(&dev)
+        val f = new_file(&fs, 0)
+        val d = xy(&fs, f)
+        poke_dir(&fs, d, 0, true, (b) ->
+            if kind == 0 then set_key(b, 1, 0) else set_key(b, 0, 2))
+        only(&dev, Problem.DirBlock(d, 0, DirFault.Keys))
+        refused(&fs, d, y_name().view(), 0, DirFault.Keys)
+        clear_raw_hash()
+    // Two levels: an interior block's first key changed.
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 3
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    var n: u64 = 0
+    while shape(&fs, d).levels < 2
+        add(&fs, d, long_name(n, 120, u8('-')).view(), f)
+        n += 1
+    val root = dir_bytes(&fs, d, 0)
+    val second = u64(le32(root.view(), 16 + 16 + 8))
+    val key = le64(root.view(), 16 + 16)
+    poke_dir(&fs, d, second, true, (b) -> set_key(b, 0, key + 2))
+    among(&dev, Problem.DirBlock(d, second, DirFault.Keys))
+
+@test("§23 pass 2: a name outside its leaf's range — a key raised above the names it leads")
+name_out_of_range()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = xy(&fs, f)
+    poke_dir(&fs, d, 0, true, (b) -> set_key(b, 1, Y_RAW + 2))
+    only(&dev, Problem.DirRange(d, 2))
+    clear_raw_hash()
+
+@test("§23 pass 2: a broken continuation — a mark on a key the leaf before does not begin, and a run split without its mark")
+broken_continuation()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = xy(&fs, f)
+    poke_dir(&fs, d, 0, true, (b) -> set_key(b, 1, Y_RAW | 1))
+    only(&dev, Problem.DirMark(d, 2))
+    clear_raw_hash()
+    // One hash over two leaves: the key X | 1 written as X leaves the first leaf's names past its range.
+    var dev2 = small_device()
+    var fs2 = mounted(&dev2)
+    val f2 = new_file(&fs2, 0)
+    val e = new_dir(&fs2)
+    force_raw_hash(X_RAW)
+    for i in 0..<15
+        add(&fs2, e, long_name(u64(i), 255, u8('b')).view(), f2)
+    assert_eq(shape(&fs2, e).keys[1], X_RAW | 1)
+    poke_dir(&fs2, e, 0, true, (b) -> set_key(b, 1, X_RAW))
+    only(&dev2, Problem.DirRange(e, 1))
+    clear_raw_hash()
+
+@test("§23 pass 2 and §10: an index entry pointing at a block the directory does not map (a free block) is refused")
+index_points_at_free_block()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = xy(&fs, f)
+    poke_dir(&fs, d, 0, true, (b) -> set_child(b, 1, 9))
+    val rep = check(&dev)
+    var missing = false
+    var unreached = false
+    for p in rep.problems.view()
+        if code_of(p) == code_of(Problem.DirBlock(d, 9, DirFault.Missing)) then missing = true
+        if code_of(p) == code_of(Problem.DirReach(d, 2)) then unreached = true
+    assert(missing && unreached)
+    refused(&fs, d, y_name().view(), 9, DirFault.Missing)
+    clear_raw_hash()
+
+@test("§23 pass 2: a leaf reached by two index entries, and a mapped block nothing reaches")
+reached_twice_or_never()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = xy(&fs, f)
+    poke_dir(&fs, d, 0, true, (b) -> set_child(b, 1, 1))
+    among(&dev, Problem.DirReach(d, 1))
+    among(&dev, Problem.DirReach(d, 2))
+    clear_raw_hash()
+
+@test("§23 pass 2: names no directory may hold — `.`, `..`, one with `/`, one with NUL")
+bad_names()
+    for kind in 0u32..<4
+        var dev = small_device()
+        var fs = mounted(&dev)
+        val f = new_file(&fs, 0)
+        val d = new_dir(&fs)
+        add(&fs, d, "ab".bytes, f)
+        add(&fs, d, "keep".bytes, f)
+        force_raw_hash(X_RAW)
+        poke_dir(&fs, d, 0, true, (b) ->
+            kind match
+                0 ->
+                    b[8 + 10] = 1
+                    b[8 + 12] = u8('.')
+                1 ->
+                    b[8 + 12] = u8('.')
+                    b[8 + 13] = u8('.')
+                2 -> b[8 + 13] = u8('/')
+                _ -> b[8 + 13] = 0)
+        // The hook keeps every hash the same, so only the name itself is wrong.
+        val rep = check(&dev)
+        var named = false
+        for p in rep.problems.view()
+            if code_of(p) == code_of(Problem.DirName(d, 0)) then named = true
+        assert(named)
+        clear_raw_hash()
+
+@test("§23 pass 2: a name naming a reserved inode, one past the last, a free one; a file type that is not the inode's")
+bad_targets()
+    for kind in 0u32..<4
+        var dev = small_device()
+        var fs = mounted(&dev)
+        val f = new_file(&fs, 0)
+        val d = new_dir(&fs)
+        add(&fs, d, "victim".bytes, f)
+        val count = fs.sb.inode_count
+        val target = kind match
+            0 -> 5u64
+            1 -> count + 1
+            2 -> count - 3
+            _ -> f
+        poke_dir(&fs, d, 0, true, (b) ->
+            if kind == 3 then b[8 + 11] = DT_DIR else put_le64(b, 8, target))
+        val want = if kind == 3 then Problem.DirType(d, f) else Problem.DirTarget(d, target)
+        only(&dev, want)
+
+@test("§23 pass 2: a name held twice")
+duplicate_name()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    force_raw_hash(X_RAW)
+    add(&fs, d, "aaaa".bytes, f)
+    add(&fs, d, "bbbb".bytes, f)
+    poke_dir(&fs, d, 0, true, (b) ->
+        val recs = leaf_records(b) match
+            Ok(r) -> r
+            Err(_) -> panic("the leaf was already broken")
+        for k in 0..<recs[1].name_len
+            b[recs[1].off + 12 + k] = u8('a'))
+    only(&dev, Problem.DirDuplicate(d))
+    clear_raw_hash()
+
+// Edit inode `ino`'s slot on the device and in the cache, resealed.
+private poke_inode(fs: *RamFs, ino: u64, edit: &Fn(*Inode) -> unit)
+    must(fs.checkpoint_all())
+    val loc = fs.inode_location(ino)
+    val id = must_id(fs.buffer(loc.block))
+    val bytes = fs.bytes(id)
+    edit(at(bytes, loc.offset))
+    seal_inode(fs.seed, ino, bytes[loc.offset..<loc.offset + INODE_SIZE])
+    raw_put(fs.dev, loc.block, bytes)
+
+@test("§23 pass 2: shape — an empty directory marked indexed, a size that is not the blocks' end, a linear leaf left empty, a linear directory with a second block")
+shape_broken()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val e = new_dir(&fs)
+    poke_inode(&fs, e, (n) -> n.flags = n.flags | INODE_INDEXED)
+    only(&dev, Problem.DirShape(e))
+    poke_inode(&fs, e, (n) -> n.flags = n.flags & ~INODE_INDEXED)
+    val d = linear(&fs, f)
+    poke_inode(&fs, d, (n) -> n.size = 8192)
+    only(&dev, Problem.DirShape(d))
+    poke_inode(&fs, d, (n) -> n.size = 4096)
+    val _ = checked_clean(&dev)
+    poke_dir(&fs, d, 0, true, (b) -> pack_leaf(b, buf()))
+    only(&dev, Problem.DirShape(d))
+
+@test("§23 pass 2: a root above level 0 with one entry, which rule 3 never leaves")
+root_of_one_entry()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 3
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    var n: u64 = 0
+    while shape(&fs, d).levels < 2
+        add(&fs, d, long_name(n, 120, u8('-')).view(), f)
+        n += 1
+    assert_eq(shape(&fs, d).root_count, 2)
+    poke_dir(&fs, d, 0, true, (b) -> set_u16(b, 4, 1))
+    among(&dev, Problem.DirShape(d))
+
+@test("§23 pass 2: a block the directory maps beyond its index is unreachable")
+mapped_unreachable()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = xy(&fs, f)
+    var h = fs.start("map", C_INODE + C_ALLOC)
+    val run = must_run(alloc_blocks(&fs, &h, 0, 1, 0))
+    must(insert(&fs, &h, extent_tree(d, 0), Extent(3, 1, run.first, false)))
+    must(change_inode(&fs, &h, d, (n) -> n.size = 4 * 4096))
+    fs.stop(&h)
+    // Give the block a valid leaf of its own, so nothing but its reachability is wrong.
+    val gen = dir_inode(&fs, d).generation
+    var blk = block_buf()
+    pack_leaf(blk.view(), buf())
+    set_tail(blk.view(), d, gen)
+    seal_block(fs.seed, blk.view())
+    must(fs.checkpoint_all())
+    raw_put(&dev, run.first, blk.view())
+    only(&dev, Problem.DirReach(d, 3))
+    clear_raw_hash()
+
+private must_run(r: Result[Run, FsError]) -> Run
+    r match
+        Ok(x) -> x
+        Err(_) -> panic("an allocation failed")

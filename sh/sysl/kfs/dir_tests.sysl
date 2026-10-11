@@ -1,0 +1,315 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// Directories (kfs/SPEC.md section 10): names, `.` and `..`, the errors, linear leaves and their records
+// in place, conversion to an index, and the directory's inode. Index growth, shrinking, readdir, pass 2
+// and crashes have files of their own.
+
+// How a directory call failed: 0 for success; Exists 20, NotFound 21, NameTooLong 22, NotDirectory 23,
+// Invalid 3, NoSpace 1, Corrupt 6.
+fails_dir[T](r: Result[T, FsError]) -> i64
+    r match
+        Ok(_) -> 0
+        Err(FsError.Exists) -> 20
+        Err(FsError.NotFound) -> 21
+        Err(FsError.NameTooLong) -> 22
+        Err(FsError.NotDirectory) -> 23
+        Err(FsError.Invalid) -> 3
+        Err(FsError.NoSpace) -> 1
+        Err(FsError.Corrupt(_)) -> 6
+        Err(_) -> 9
+
+private bytes_of(xs: []const u8) -> Buf[u8] = copy_of(xs)
+
+@test("§10 names: 1 byte, 255 bytes and non-ASCII UTF-8 are stored, found and listed byte for byte")
+names_at_the_edges()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    val one = bytes_of("a".bytes)
+    val longest = long_name(1, 255, u8('z'))
+    assert_eq(longest.len(), 255)
+    val utf8 = bytes_of("ñandú — 東京 ✓".bytes)
+    assert(utf8.len() > 12)
+    add(&fs, d, one.view(), f)
+    add(&fs, d, longest.view(), f)
+    add(&fs, d, utf8.view(), f)
+    assert_eq(must_entry(lookup_name(&fs, d, one.view())).ino, f)
+    assert_eq(must_entry(lookup_name(&fs, d, longest.view())).ino, f)
+    assert_eq(must_entry(lookup_name(&fs, d, utf8.view())).ino, f)
+    // A name one byte different is another name.
+    var near = copy_of(longest.view())
+    near.view()[254] = u8('q')
+    assert(!has(&fs, d, near.view()))
+    val all = scan_all(&fs, d, 65536)
+    assert_eq(all.len(), 5)
+    assert(times_listed(all, one.view()) == 1 && times_listed(all, longest.view()) == 1 && times_listed(all, utf8.view()) == 1)
+    // The record holds the name's length and bytes exactly.
+    assert(holds_name(leaf_names_at(&fs, d, 0), longest.view()))
+    val _ = dir_clean(&fs)
+
+@test("§10 names refused: 0 bytes and anything with `/` or NUL are Invalid, 256 bytes is NameTooLong — for add, lookup and remove")
+names_refused()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    add(&fs, d, "kept".bytes, f)
+    val empty: Buf[u8] = buf()
+    val too_long = long_name(2, 256, u8('z'))
+    var slash = bytes_of("a/b".bytes)
+    var nul = bytes_of("ab".bytes)
+    nul.push(0)
+    nul.push(u8('c'))
+    val lone_slash = bytes_of("/".bytes)
+    assert_eq(fails_dir(add_name(&fs, d, empty.view(), f, DT_REG, 0)), 3)
+    assert_eq(fails_dir(add_name(&fs, d, too_long.view(), f, DT_REG, 0)), 22)
+    assert_eq(fails_dir(add_name(&fs, d, slash.view(), f, DT_REG, 0)), 3)
+    assert_eq(fails_dir(add_name(&fs, d, lone_slash.view(), f, DT_REG, 0)), 3)
+    assert_eq(fails_dir(add_name(&fs, d, nul.view(), f, DT_REG, 0)), 3)
+    assert_eq(fails_dir(lookup_name(&fs, d, empty.view())), 3)
+    assert_eq(fails_dir(lookup_name(&fs, d, too_long.view())), 22)
+    assert_eq(fails_dir(lookup_name(&fs, d, slash.view())), 3)
+    assert_eq(fails_dir(lookup_name(&fs, d, nul.view())), 3)
+    assert_eq(fails_dir(remove_name(&fs, d, empty.view())), 3)
+    assert_eq(fails_dir(remove_name(&fs, d, too_long.view())), 22)
+    assert_eq(fails_dir(remove_name(&fs, d, nul.view())), 3)
+    // Nothing changed: still the one name.
+    assert_eq(scan_all(&fs, d, 4096).len(), 3)
+    assert_eq(dir_inode(&fs, d).size, 4096)
+    // An inode number of 0 is no name at all.
+    assert_eq(fails_dir(add_name(&fs, d, "zero".bytes, 0, DT_REG, 0)), 3)
+    val _ = dir_clean(&fs)
+
+@test("§10 `.` and `..`: looked up from the inode without a block, never stored, refused to insert (Exists) and remove (Invalid)")
+dots()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val d = new_dir(&fs)
+    // An empty directory has no blocks; `.` and `..` need none.
+    assert_eq(dir_inode(&fs, d).blocks, 0)
+    val dot = must_entry(lookup_name(&fs, d, ".".bytes))
+    assert(dot.ino == d && dot.file_type == DT_DIR)
+    val up = must_entry(lookup_name(&fs, d, "..".bytes))
+    assert(up.ino == ROOT_INO && up.file_type == DT_DIR)
+    assert_eq(fails_dir(add_name(&fs, d, ".".bytes, d, DT_DIR, 0)), 20)
+    assert_eq(fails_dir(add_name(&fs, d, "..".bytes, d, DT_DIR, 0)), 20)
+    assert_eq(fails_dir(remove_name(&fs, d, ".".bytes)), 3)
+    assert_eq(fails_dir(remove_name(&fs, d, "..".bytes)), 3)
+    assert_eq(dir_inode(&fs, d).blocks, 0)
+    // Names that only start with dots are ordinary.
+    val f = new_file(&fs, 0)
+    add(&fs, d, "...".bytes, f)
+    add(&fs, d, ".hidden".bytes, f)
+    add(&fs, d, "..x".bytes, f)
+    assert(has(&fs, d, "...".bytes) && has(&fs, d, ".hidden".bytes) && has(&fs, d, "..x".bytes))
+    // `..` follows the inode's parent field.
+    val p = dir_inode(&fs, d).parent
+    assert_eq(p, ROOT_INO)
+    // The root's `..` is the root.
+    assert_eq(must_entry(lookup_name(&fs, ROOT_INO, "..".bytes)).ino, ROOT_INO)
+    val _ = dir_clean(&fs)
+
+@test("§10 errors: a second insert of a name is Exists, a missing name NotFound for lookup and remove, an empty directory NotFound")
+exists_and_missing()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val g = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    assert_eq(fails_dir(lookup_name(&fs, d, "x".bytes)), 21)
+    assert_eq(fails_dir(remove_name(&fs, d, "x".bytes)), 21)
+    add(&fs, d, "x".bytes, f)
+    assert_eq(fails_dir(add_name(&fs, d, "x".bytes, g, DT_REG, 0)), 20)
+    // The refused insert left the first name's inode in place.
+    assert_eq(must_entry(lookup_name(&fs, d, "x".bytes)).ino, f)
+    assert_eq(fails_dir(remove_name(&fs, d, "y".bytes)), 21)
+    assert_eq(fails_dir(lookup_name(&fs, d, "X".bytes)), 21)
+    assert_eq(must_entry(remove_name(&fs, d, "x".bytes)).ino, f)
+    assert_eq(fails_dir(remove_name(&fs, d, "x".bytes)), 21)
+    val _ = dir_clean(&fs)
+
+@test("§10 a directory call on an inode that is not a directory is NotDirectory")
+not_a_directory()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    assert_eq(fails_dir(add_name(&fs, f, "x".bytes, f, DT_REG, 0)), 23)
+    assert_eq(fails_dir(lookup_name(&fs, f, "x".bytes)), 23)
+    assert_eq(fails_dir(remove_name(&fs, f, "x".bytes)), 23)
+    assert_eq(fails_dir(read_dir(&fs, f, 0, 4096)), 23)
+
+@test("§10 the first name gives an empty directory its leaf at block 0: one record over the whole area, linear, size 4096")
+first_name_makes_a_leaf()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    assert(dir_inode(&fs, d).size == 0 && dir_phys(&fs, d, 0) == 0)
+    must(add_name(&fs, d, "only".bytes, f, DT_FIFO, 0))
+    val node = dir_inode(&fs, d)
+    assert(node.size == 4096 && node.blocks == 1 && node.flags & INODE_INDEXED == 0)
+    val b = dir_bytes(&fs, d, 0)
+    val head: *DirLeafHeader = at(b.view(), 0)
+    assert(head.magic == DIR_LEAF_MAGIC && head.count == 1 && head.reserved == 0)
+    val rec: *DirRecordHeader = at(b.view(), 8)
+    assert(rec.ino == f && rec.rec_len == 4072 && rec.name_len == 4 && rec.file_type == DT_FIFO)
+    assert(verify_owned_block(fs.seed, b.view(), d, node.generation))
+    // The type comes back from the record, not the inode.
+    assert_eq(must_entry(lookup_name(&fs, d, "only".bytes)).file_type, DT_FIFO)
+
+@test("§10 records in place: a second name splits the first record's slack; a removal gives its space to the record before")
+slack_split_and_join()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    add(&fs, d, "first".bytes, f)
+    add(&fs, d, "second-name".bytes, f)
+    add(&fs, d, "third".bytes, f)
+    var b = dir_bytes(&fs, d, 0)
+    var recs = must_recs(b.view())
+    // first: 12 + 5 -> 24 live; second: 12 + 11 -> 24; third takes the rest.
+    assert_eq(recs.len(), 3)
+    assert(recs[0].off == 8 && recs[0].rec_len == 24)
+    assert(recs[1].off == 32 && recs[1].rec_len == 24)
+    assert(recs[2].off == 56 && recs[2].rec_len == 4080 - 56)
+    take_out(&fs, d, "second-name".bytes)
+    b = dir_bytes(&fs, d, 0)
+    recs = must_recs(b.view())
+    assert_eq(recs.len(), 2)
+    assert(recs[0].rec_len == 48 && recs[1].off == 56)
+    // The removed record's bytes are gone, not just skipped.
+    for i in 32usize..<56
+        assert_eq(b[i], 0)
+    val _ = dir_clean(&fs)
+
+@test("§10 slack reuse: the first record removed becomes free (ino 0) and takes the next name that fits it; a bigger one goes into slack")
+free_first_record_reused()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    add(&fs, d, "abcdefghijk".bytes, f)
+    add(&fs, d, "two".bytes, f)
+    take_out(&fs, d, "abcdefghijk".bytes)
+    var b = dir_bytes(&fs, d, 0)
+    var recs = must_recs(b.view())
+    assert(recs[0].ino == 0 && recs[0].rec_len == 24 && recs[1].ino == f)
+    val head: *DirLeafHeader = at(b.view(), 0)
+    assert_eq(head.count, 1)
+    // A 12-byte name needs 24: it takes the free record whole.
+    add(&fs, d, "twelve-bytes".bytes, f)
+    b = dir_bytes(&fs, d, 0)
+    recs = must_recs(b.view())
+    assert(recs[0].ino == f && recs[0].rec_len == 24 && recs[0].name_len == 12)
+    take_out(&fs, d, "twelve-bytes".bytes)
+    // A 13-byte name needs 32 and does not fit the free 24: it goes into the second record's slack.
+    add(&fs, d, "thirteen-byte".bytes, f)
+    b = dir_bytes(&fs, d, 0)
+    recs = must_recs(b.view())
+    assert(recs[0].ino == 0 && recs.len() == 3 && recs[2].name_len == 13)
+    val _ = dir_clean(&fs)
+
+private must_recs(bytes: []u8) -> Buf[Rec]
+    leaf_records(bytes) match
+        Ok(r) -> r
+        Err(_) -> panic("a leaf failed its checks")
+
+// Fill directory `d`'s linear leaf to exactly 4072 live bytes: 253 records of 16 and one of 24.
+private fill_leaf(fs: *RamFs, d: u64, f: u64)
+    for i in 0..<253
+        add(fs, d, short_name(u64(i)).view(), f)
+    add(fs, d, "a-24-byte".bytes, f)
+
+// A name of at most 4 bytes (a 16-byte record): `i` in base 36, at most three digits, after `s`.
+private short_name(i: u64) -> Buf[u8]
+    val digits = "0123456789abcdefghijklmnopqrstuvwxyz".bytes
+    var out: Buf[u8] = buf()
+    out.push(u8('s'))
+    out.push(digits[usize(i / 1296 % 36)])
+    out.push(digits[usize(i / 36 % 36)])
+    out.push(digits[usize(i % 36)])
+    out
+
+@test("§10 a linear leaf holds exactly 4072 live bytes; the next name converts the directory: two new leaves, block 0 a root of level 0")
+conversion_at_the_boundary()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    fill_leaf(&fs, d, f)
+    assert(!indexed(&fs, d))
+    assert_eq(leaf_live_at(&fs, d, 0), 4072)
+    assert_eq(dir_inode(&fs, d).size, 4096)
+    add(&fs, d, "one-more".bytes, f)
+    val node = dir_inode(&fs, d)
+    assert(node.flags & INODE_INDEXED != 0 && node.size == 3 * 4096)
+    val s = shape(&fs, d)
+    assert(s.levels == 1 && s.index_blocks == 1 && s.keys.len() == 2)
+    assert(s.keys[0] == 0 && s.leaves[0] == 1 && s.leaves[1] == 2)
+    // Every name, the new one too, is found, and the leaves hold them all once.
+    for i in 0..<253
+        assert(has(&fs, d, short_name(u64(i)).view()))
+    assert(has(&fs, d, "a-24-byte".bytes) && has(&fs, d, "one-more".bytes))
+    assert_eq(leaf_names_at(&fs, d, 1).len() + leaf_names_at(&fs, d, 2).len(), 255)
+    // The root's header.
+    val r = dir_bytes(&fs, d, 0)
+    val head: *IndexHeader = at(r.view(), 0)
+    assert(head.magic == DIR_INDEX_MAGIC && head.level == 0 && head.count == 2 && usize(head.max) == DIR_INDEX_SLOTS)
+    val _ = dir_clean(&fs)
+
+@test("§10 a leaf with 8 bytes left cannot take even a 16-byte record: the 1-byte name converts the directory")
+conversion_eight_bytes_short()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    for i in 0..<254
+        add(&fs, d, short_name(u64(i)).view(), f)
+    // 254 x 16 = 4064: 8 bytes left, too few for a record.
+    assert_eq(leaf_live_at(&fs, d, 0), 4064)
+    assert(!indexed(&fs, d))
+    add(&fs, d, "z".bytes, f)
+    assert(indexed(&fs, d))
+    val _ = dir_clean(&fs)
+
+@test("§10 the directory's inode: size from its blocks, mtime and ctime moved by every add and remove")
+inode_times_and_size()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    val t0 = dir_inode(&fs, d)
+    fs.plat.clock += 10
+    add(&fs, d, "a".bytes, f)
+    val t1 = dir_inode(&fs, d)
+    assert(t1.mtime_sec >= t0.mtime_sec + 10 && t1.ctime_sec == t1.mtime_sec)
+    fs.plat.clock += 10
+    take_out(&fs, d, "a".bytes)
+    val t2 = dir_inode(&fs, d)
+    assert(t2.mtime_sec >= t1.mtime_sec + 10 && t2.ctime_sec == t2.mtime_sec && t2.size == 0 && t2.blocks == 0)
+    // A refused change moves nothing.
+    fs.plat.clock += 10
+    assert_eq(fails_dir(remove_name(&fs, d, "a".bytes)), 21)
+    assert_eq(dir_inode(&fs, d).mtime_sec, t2.mtime_sec)
+
+@test("§10 file types: every DT_* value a record may carry comes back from lookup and readdir")
+file_types_round_trip()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val d = new_dir(&fs)
+    val types: [7]u8 = [DT_FIFO, DT_CHR, DT_DIR, DT_BLK, DT_REG, DT_LNK, DT_SOCK]
+    for i in 0..<7
+        val n = name_of("t", u64(i), 0, u8('.'))
+        must(add_name(&fs, d, n.view(), FIRST_INO, types[i], 0))
+        assert_eq(must_entry(lookup_name(&fs, d, n.view())).file_type, types[i])
+    val all = scan_all(&fs, d, 65536)
+    for x in all.view()
+        if x.pos > DIR_POS_DOTDOT
+            val want = must_entry(lookup_name(&fs, d, x.name.view())).file_type
+            assert_eq(x.file_type, want)

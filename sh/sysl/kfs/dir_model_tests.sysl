@@ -1,0 +1,103 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// Thousands of inserts and removals against a model (kfs/SPEC.md section 10): phases that grow the
+// directory and phases that shrink it, alternating, so splits, promotions, merges, frees and absorbs all
+// happen many times over; every answer (including Exists and NotFound) checked against the model, every
+// name found and listed once at intervals, and the checker clean.
+
+private const X_RAW: u64 = 0x4000_0000_0000_0000
+private const Y_RAW: u64 = 0x8000_0000_0000_0000
+
+// Name `id` of the pool: its length varies from 5 to over 200 bytes, its last byte alternates 'a'/'b'.
+private pool_name(id: u64) -> Buf[u8] = name_of("m", id, usize((id * 37) % 200), if id % 2 == 0 then u8('b') else u8('a'))
+
+private struct Run
+    inserts: u64
+    removes: u64
+    refused: u64
+    most: u64
+
+private run_model(seed: u64, ops: u64, ids: u64, cap: u64) -> Run
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 4
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    var present: Buf[bool] = buf()
+    for _ in 0..<ids
+        present.push(false)
+    var count: u64 = 0
+    var r = Run(0, 0, 0, 0)
+    var rng = seed
+    for op in 0..<ops
+        rng = rng * 6364136223846793005 + 1442695040888963407
+        val growing = (op / 400) % 2 == 0
+        val roll = (rng >> 33) % 4
+        val insert = if growing then roll != 0 && count < cap else roll == 0
+        rng = rng * 6364136223846793005 + 1442695040888963407
+        // Three times in four the id is one the operation can act on (absent for an insert, present for
+        // a removal): the nearest such after a random one. The fourth is any id, so Exists and NotFound
+        // come up too.
+        var id = (rng >> 33) % ids
+        if (rng >> 20) % 4 != 0
+            var k: u64 = 0
+            while k < ids && present[usize((id + k) % ids)] == insert
+                k += 1
+            if k < ids then id = (id + k) % ids
+        val name = pool_name(id)
+        if insert
+            val got = fails_dir(add_name(&fs, d, name.view(), f, DT_REG, 0))
+            if present[usize(id)]
+                assert_eq(got, 20)
+                r.refused += 1
+            else
+                assert_eq(got, 0)
+                present[usize(id)] = true
+                count += 1
+                r.inserts += 1
+        else
+            val got = remove_name(&fs, d, name.view())
+            if present[usize(id)]
+                assert_eq(must_entry(got).ino, f)
+                present[usize(id)] = false
+                count -= 1
+                r.removes += 1
+            else
+                assert_eq(fails_dir(got), 21)
+                r.refused += 1
+        if count > r.most then r.most = count
+        if op % 250 == 249
+            for k in 0..<ids
+                assert_eq(has(&fs, d, pool_name(k).view()), present[usize(k)])
+            assert_eq(scan_all(&fs, d, 1 << 20).len(), usize(count) + 2)
+        if op % 1000 == 999 then val _ = dir_clean(&fs)
+    // Then drain what is left: the directory ends with no blocks.
+    for k in 0..<ids
+        if present[usize(k)] then take_out(&fs, d, pool_name(k).view())
+    assert(dir_inode(&fs, d).blocks == 0 && dir_inode(&fs, d).size == 0)
+    val _ = dir_clean(&fs)
+    print(s"model: ${r.inserts} inserts, ${r.removes} removals, ${r.refused} refused, at most ${r.most} names")
+    r
+
+@test("§10 model, keyed hash: 4000 alternating inserts and removals of names 5-200 bytes, index max 4")
+model_natural()
+    val r = run_model(11, 4000, 1200, 700)
+    assert(r.inserts > 1000 && r.removes > 1000 && r.most > 300)
+
+@test("§10 model, two colliding hashes: 4000 alternating inserts and removals, runs splitting and draining all the way")
+model_two_hashes()
+    force_raw_hashes([X_RAW, Y_RAW])
+    val r = run_model(5, 4000, 900, 400)
+    assert(r.inserts > 1000 && r.removes > 1000 && r.most > 200)
+    clear_raw_hash()
+
+@test("§10 model, one hash for every name: 3000 alternating inserts and removals over one run of many leaves")
+model_one_hash()
+    force_raw_hash(X_RAW)
+    val r = run_model(3, 3000, 600, 300)
+    assert(r.inserts > 700 && r.removes > 700 && r.most > 150)
+    clear_raw_hash()

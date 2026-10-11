@@ -1,0 +1,375 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The hash index (kfs/SPEC.md section 10): the split rule, runs of one hash across leaves and index
+// blocks with the continuation mark, promotion to more levels, interior splits, the level limit, and
+// out-of-space splits. Collisions come from the forced-hash hook (hash.sysl): every name one hash, or
+// names on two hashes by their last byte.
+
+private const X_RAW: u64 = 0x4000_0000_0000_0000
+private const Y_RAW: u64 = 0x8000_0000_0000_0000
+
+private nm(hash: u64, len: usize) -> DirName
+    var name: Buf[u8] = buf()
+    for _ in 0..<len
+        name.push(u8('n'))
+    DirName(FIRST_INO, DT_REG, hash, name)
+
+// Names of `len` bytes (16-byte records for len <= 4) with the given hashes.
+private names_with(hashes: []const u64, len: usize) -> Buf[DirName]
+    var out: Buf[DirName] = buf()
+    for h in hashes
+        out.push(nm(h, len))
+    out
+
+@test("§10 split rule: at s when the hashes on either side differ")
+split_at_s()
+    val c = split_point(names_with([10u64, 20, 30, 40], 4))
+    assert(c.at == 2 && c.key == 30)
+
+@test("§10 split rule: s is where the names before it reach half the live bytes, the first name alone may be it")
+split_s_first_name()
+    var names: Buf[DirName] = buf()
+    names.push(nm(10, 255))
+    names.push(nm(20, 1))
+    val c = split_point(names)
+    assert(c.at == 1 && c.key == 20)
+
+@test("§10 split rule: equal hashes at s move the split to the nearest boundary, above")
+split_moves_up()
+    val c = split_point(names_with([10u64, 20, 20, 20, 30], 4))
+    assert(c.at == 4 && c.key == 30)
+
+@test("§10 split rule: equal hashes at s move the split to the nearest boundary, below")
+split_moves_down()
+    val c = split_point(names_with([10u64, 10, 20, 20, 20, 20], 4))
+    assert(c.at == 2 && c.key == 20)
+
+@test("§10 split rule: two boundaries equally near, the split goes toward the end")
+split_tie_toward_end()
+    val c = split_point(names_with([10u64, 20, 20, 20, 20, 30], 4))
+    assert(c.at == 5 && c.key == 30)
+
+@test("§10 split rule: every name one hash splits at s with the key h | 1")
+split_one_hash_marks()
+    val c = split_point(names_with([20u64, 20, 20, 20, 20], 4))
+    assert(c.at == 3 && c.key == 21)
+
+@test("§10 split rule: a boundary whose halves would not both fit a leaf is passed over")
+split_boundary_must_fit()
+    var names: Buf[DirName] = buf()
+    names.push(nm(10, 255))
+    for _ in 0..<15
+        names.push(nm(20, 255))
+    // The only boundary, after the first name, leaves 15 x 272 = 4080 bytes above it: too many.
+    val c = split_point(names)
+    assert(c.at == 8 && c.key == 21)
+
+// Fill `d` with `n` names of `len` bytes on the forced hash (the last byte 'b' picks the first value).
+private colliding(fs: *RamFs, d: u64, f: u64, from: u64, n: u64, len: usize, tail: u8)
+    for i in from..<from + n
+        add(fs, d, long_name(i, len, tail).view(), f)
+
+private all_found(fs: *RamFs, d: u64, from: u64, n: u64, len: usize, tail: u8)
+    for i in from..<from + n
+        assert(has(fs, d, long_name(i, len, tail).view()))
+
+@test("§10 one hash over two leaves: 15 names of 255 bytes convert the directory, the second leaf keyed h | 1")
+run_over_two_leaves()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    force_raw_hash(X_RAW)
+    colliding(&fs, d, f, 0, 14, 255, u8('b'))
+    assert(!indexed(&fs, d))
+    colliding(&fs, d, f, 14, 1, 255, u8('b'))
+    val s = shape(&fs, d)
+    assert(s.levels == 1 && s.keys.len() == 2 && s.keys[0] == 0 && s.keys[1] == X_RAW | 1)
+    assert_eq(marks_exact(&fs, d), 1)
+    all_found(&fs, d, 0, 15, 255, u8('b'))
+    // Both leaves fill before a third is made: 28 names, still two leaves.
+    colliding(&fs, d, f, 15, 13, 255, u8('b'))
+    assert_eq(shape(&fs, d).keys.len(), 2)
+    all_found(&fs, d, 0, 28, 255, u8('b'))
+    assert_eq(fails_dir(add_name(&fs, d, long_name(3, 255, u8('b')).view(), f, DT_REG, 0)), 20)
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 one hash over three leaves: the 29th name splits the last leaf of the run, both later keys h | 1")
+run_over_three_leaves()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    force_raw_hash(X_RAW)
+    colliding(&fs, d, f, 0, 29, 255, u8('b'))
+    val s = shape(&fs, d)
+    assert(s.keys.len() == 3 && s.keys[1] == X_RAW | 1 && s.keys[2] == X_RAW | 1)
+    assert_eq(marks_exact(&fs, d), 2)
+    all_found(&fs, d, 0, 29, 255, u8('b'))
+    // Lookup scans past leaves that do not hold the name: the last name lies in the last leaf.
+    assert(holds_name(leaf_names_at(&fs, d, s.leaves[2]), long_name(28, 255, u8('b')).view()) || holds_name(leaf_names_at(&fs, d, s.leaves[1]), long_name(28, 255, u8('b')).view()))
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 one hash over many leaves and across index blocks: every name found after every insert, every key after the first h | 1")
+run_over_many_leaves()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 4
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    force_raw_hash(X_RAW)
+    val n: u64 = 250
+    for i in 0..<n
+        add(&fs, d, long_name(i, 255, u8('b')).view(), f)
+        if i % 25 == 24 then all_found(&fs, d, 0, i + 1, 255, u8('b'))
+    val s = shape(&fs, d)
+    // 250 names in leaves of 7 to 14 make about 20 leaves: past one index block of 4, so three levels.
+    assert(s.leaves.len() >= 18 && s.levels == 3 && s.index_blocks > 4)
+    assert(s.keys[0] == 0)
+    for i in 1..<s.keys.len()
+        assert_eq(s.keys[i], X_RAW | 1)
+    assert_eq(marks_exact(&fs, d), u32(s.keys.len() - 1))
+    all_found(&fs, d, 0, n, 255, u8('b'))
+    // A name not in the run is looked for in every leaf of it, and not found.
+    assert(!has(&fs, d, long_name(9999, 255, u8('b')).view()))
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 two hashes alternating: runs of each split across leaves, the mark exactly at run splits, a boundary key between them")
+two_hashes_alternating()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 4
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    force_raw_hashes([X_RAW, Y_RAW])
+    // A last byte of 'b' (98, even) picks X, 'a' (97, odd) picks Y.
+    for i in 0..<60
+        add(&fs, d, long_name(u64(i), 200, u8('b')).view(), f)
+        add(&fs, d, long_name(u64(i), 200, u8('a')).view(), f)
+    assert(hash_of(&fs, "xb".bytes) == X_RAW && hash_of(&fs, "xa".bytes) == Y_RAW)
+    val marked = marks_exact(&fs, d)
+    val s = shape(&fs, d)
+    // Every key but the first and the one where X's run gives way to Y's is a continuation.
+    assert(marked >= u32(s.keys.len()) - 2 && marked > 4)
+    var y_marked = 0
+    for k in s.keys.view()
+        if k == Y_RAW | 1 then y_marked += 1
+    assert(y_marked > 0)
+    all_found(&fs, d, 0, 60, 200, u8('b'))
+    all_found(&fs, d, 0, 60, 200, u8('a'))
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 promotion: linear, then one index level, then two, then three; interior blocks split while the levels hold")
+promotion_to_three_levels()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 3
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    var seen_levels: Buf[u32] = buf()
+    var interior_split = false
+    var last = shape(&fs, d)
+    var i: u64 = 0
+    while last.levels < 3
+        add(&fs, d, long_name(i, 120, u8('-')).view(), f)
+        i += 1
+        val s = shape(&fs, d)
+        if s.levels != last.levels then seen_levels.push(s.levels)
+        else if s.levels >= 2 && s.index_blocks > last.index_blocks then interior_split = true
+        last = s
+        assert(i < 5000)
+    assert(seen_levels.len() == 3 && seen_levels[0] == 1 && seen_levels[1] == 2 && seen_levels[2] == 3)
+    assert(interior_split)
+    for k in 0..<i
+        assert(has(&fs, d, long_name(k, 120, u8('-')).view()))
+    val _ = dir_clean(&fs)
+
+@test("§10 DIR_MAX_LEVELS: a split that would grow the root past three levels answers NoSpace and leaves the directory as it was")
+level_limit()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 2
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    var i: u64 = 0
+    var refused = false
+    while !refused
+        val r = add_name(&fs, d, long_name(i, 200, u8('-')).view(), f, DT_REG, 0)
+        if fails_dir(r) == 1 then refused = true else must(r)
+        i += 1
+        assert(i < 2000)
+    val s = shape(&fs, d)
+    assert(s.levels == 3)
+    val before = scan_all(&fs, d, 1 << 20)
+    val node = dir_inode(&fs, d)
+    // The refused name is not there, everything else is, and the blocks and size did not move.
+    assert(!has(&fs, d, long_name(i - 1, 200, u8('-')).view()))
+    for k in 0..<(i - 1)
+        assert(has(&fs, d, long_name(k, 200, u8('-')).view()))
+    val again = dir_inode(&fs, d)
+    assert(again.size == node.size && again.blocks == node.blocks)
+    assert_eq(scan_all(&fs, d, 1 << 20).len(), before.len())
+    val _ = dir_clean(&fs)
+
+@test("§10 delete then reinsert after promotion: every other name out, all back in, the index still sound")
+delete_and_reinsert()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 3
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    val n: u64 = 400
+    for i in 0..<n
+        add(&fs, d, long_name(i, 100, u8('-')).view(), f)
+    assert(shape(&fs, d).levels >= 2)
+    for i in 0..<n
+        if i % 2 == 0 then take_out(&fs, d, long_name(i, 100, u8('-')).view())
+    for i in 0..<n
+        assert_eq(has(&fs, d, long_name(i, 100, u8('-')).view()), i % 2 == 1)
+    val _ = dir_clean(&fs)
+    for i in 0..<n
+        if i % 2 == 0 then add(&fs, d, long_name(i, 100, u8('-')).view(), f)
+    for i in 0..<n
+        assert(has(&fs, d, long_name(i, 100, u8('-')).view()))
+    assert_eq(scan_all(&fs, d, 1 << 20).len(), usize(n) + 2)
+    val _ = dir_clean(&fs)
+
+@test("§10 thousands of names on the keyed hash: all found, all listed once, the checker clean")
+many_natural_names()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    val n: u64 = 3000
+    for i in 0..<n
+        add(&fs, d, name_of("file", i, 0, u8('.')).view(), f)
+    for i in 0..<n
+        assert(has(&fs, d, name_of("file", i, 0, u8('.')).view()))
+    val all = scan_all(&fs, d, 4096)
+    assert_eq(all.len(), usize(n) + 2)
+    assert_eq(marks_exact(&fs, d), 0)
+    val _ = dir_clean(&fs)
+
+// Use up the free blocks until `leave` are left, in a file of uid 0 (so the reserve goes too); the
+// checker stays clean.
+private fill_disk(fs: *RamFs, leave: u64)
+    val big = new_file(fs, 0)
+    val bs = u64(BLOCK_SIZE)
+    var off: u64 = 0
+    loop
+        val free = free_total(fs)
+        if free <= leave then break
+        val want = if free - leave > 16 then free - leave - 8 else 1
+        must(fallocate(fs, big, Falloc.Allocate, off * bs, want * bs, 0))
+        off += want
+    assert_eq(free_total(fs), leave)
+
+// The directory's names, blocks and size, to compare across a refused change.
+private struct Snapshot
+    names: u64
+    size: u64
+    blocks: u64
+    levels: u32
+
+private snapshot(fs: *RamFs, d: u64) -> Snapshot
+    val node = dir_inode(fs, d)
+    Snapshot(u64(scan_all(fs, d, 1 << 20).len()), node.size, node.blocks, shape(fs, d).levels)
+
+private same_snapshot(a: Snapshot, b: Snapshot) -> bool = a.names == b.names && a.size == b.size && a.blocks == b.blocks && a.levels == b.levels
+
+@test("§10 ENOSPC during a conversion: with one block left the second allocation fails, the first is given back, the directory intact")
+conversion_out_of_space()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    for i in 0..<14
+        add(&fs, d, long_name(u64(i), 255, u8('-')).view(), f)
+    val before = snapshot(&fs, d)
+    fill_disk(&fs, 1)
+    val big = long_name(99, 255, u8('-'))
+    assert_eq(fails_dir(add_name(&fs, d, big.view(), f, DT_REG, 0)), 1)
+    assert(same_snapshot(before, snapshot(&fs, d)) && !indexed(&fs, d))
+    for i in 0..<14
+        assert(has(&fs, d, long_name(u64(i), 255, u8('-')).view()))
+    assert(!has(&fs, d, big.view()))
+    // A name that fits the leaf needs no block: it goes in with the disk full.
+    add(&fs, d, "fits".bytes, f)
+    assert(has(&fs, d, "fits".bytes))
+    val _ = dir_clean(&fs)
+
+@test("§10 ENOSPC during a leaf split and during a split that needs an index block: refused, the directory intact")
+split_out_of_space()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.index_max = 3
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    force_raw_hash(X_RAW)
+    // Three leaves of one run fill the root's three entries: the next split needs a leaf and the root's
+    // growth, three blocks.
+    colliding(&fs, d, f, 0, 42, 255, u8('b'))
+    assert(shape(&fs, d).keys.len() == 3 && shape(&fs, d).levels == 1)
+    val before = snapshot(&fs, d)
+    fill_disk(&fs, 2)
+    assert_eq(fails_dir(add_name(&fs, d, long_name(500, 255, u8('b')).view(), f, DT_REG, 0)), 1)
+    assert(same_snapshot(before, snapshot(&fs, d)))
+    all_found(&fs, d, 0, 42, 255, u8('b'))
+    val _ = dir_clean(&fs)
+    clear_raw_hash()
+
+@test("§10 a split for a caller other than root stops at the reserve, and root's goes through")
+split_respects_reserve()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    for i in 0..<14
+        add(&fs, d, long_name(u64(i), 255, u8('-')).view(), f)
+    fill_disk(&fs, fs.sb.reserved_blocks)
+    assert_eq(fails_dir(add_name(&fs, d, long_name(98, 255, u8('a')).view(), f, DT_REG, 1000)), 1)
+    assert(!indexed(&fs, d))
+    must(add_name(&fs, d, long_name(98, 255, u8('r')).view(), f, DT_REG, 0))
+    assert(indexed(&fs, d))
+    val _ = dir_clean(&fs)
+
+@test("§10 a new directory block takes the lowest hole: a leaf freed in the middle is the next split's block")
+new_block_fills_hole()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val f = new_file(&fs, 0)
+    val d = new_dir(&fs)
+    for i in 0..<80
+        add(&fs, d, long_name(u64(i), 255, u8('-')).view(), f)
+    val size = dir_inode(&fs, d).size
+    val end = size / 4096
+    // Empty a leaf in the middle: its names out one by one (merges may free a neighbour instead).
+    val s = shape(&fs, d)
+    val victim = s.leaves[s.leaves.len() / 2]
+    for n in leaf_names_at(&fs, d, victim).view()
+        take_out(&fs, d, n.view())
+    var lowest: u64 = end
+    var holes: u64 = 0
+    for l in 0..<end
+        if dir_phys(&fs, d, l) == 0
+            holes += 1
+            if l < lowest then lowest = l
+    // Some leaf below the last block was freed, and the size kept.
+    assert(holes > 0 && lowest < end - 1 && dir_inode(&fs, d).size == size)
+    // New names until a block is added: it is the lowest hole, and the size does not move.
+    val blocks = dir_inode(&fs, d).blocks
+    var i: u64 = 1000
+    while dir_inode(&fs, d).blocks == blocks
+        add(&fs, d, long_name(i, 255, u8('-')).view(), f)
+        i += 1
+        assert(i < 1400)
+    assert(dir_phys(&fs, d, lowest) != 0 && dir_inode(&fs, d).size == size)
+    val _ = dir_clean(&fs)
