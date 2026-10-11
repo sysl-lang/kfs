@@ -16,7 +16,7 @@ private filled(fill: u8, n: usize) -> Buf[u8]
         b.push(fill)
     b
 
-private image(path: string, blocks: u64) -> FileDevice
+private image(path: string, blocks: u64) -> FileDevice[fs.File]
     create_image(path, blocks) match
         Ok(d) -> d
         Err(_) -> panic("could not create the image")
@@ -28,7 +28,7 @@ private kind(r: Result[unit, DeviceError]) -> i64
         Err(DeviceError.BadLength) -> 2
         Err(DeviceError.Io) -> 3
 
-private open_kind(r: Result[FileDevice, DeviceError]) -> i64
+private open_kind(r: Result[FileDevice[fs.File], DeviceError]) -> i64
     r match
         Ok(d) ->
             var dev = d
@@ -179,3 +179,47 @@ filedev_create_replaces()
     assert_eq(again.blocks(), 2)
     assert(again.close())
     assert(fs.remove_file(path).is_ok())
+
+// A file that records a failed write or read as `fs.File` does -- it answers the call normally and says so
+// afterwards through `broken` -- and whose flush succeeds.
+private struct FailingFile
+    private bad_writes: bool
+    private bad_reads: bool
+    private failed_now: bool
+
+impl ImageFile for FailingFile
+    seek_to(*self, to: long) -> bool = true
+    fill(*self, out: []u8) -> usize
+        if self.bad_reads then self.failed_now = true
+        out.len
+    put(*self, data: []const u8)
+        if self.bad_writes then self.failed_now = true
+    sync(*self) -> bool = true
+    broken(*self) -> bool = self.failed_now
+    release(*self) -> bool = true
+
+@test("a write the file records as failed is an Io error, though the flush succeeds")
+filedev_failed_write_is_io()
+    var d = device_over(FailingFile(true, false, false), 4)
+    val data = filled(7, BLOCK_SIZE)
+    assert_eq(kind(d.write(1, data.view())), 3)
+
+@test("a read the file records as failed is an Io error")
+filedev_failed_read_is_io()
+    var d = device_over(FailingFile(false, true, false), 4)
+    var out = filled(0, BLOCK_SIZE)
+    assert_eq(kind(d.read(1, out.view())), 3)
+
+@test("a file that has failed makes the next flush an Io error")
+filedev_failed_flush_is_io()
+    var d = device_over(FailingFile(false, false, true), 4)
+    assert_eq(kind(d.flush()), 3)
+
+@test("a healthy file's write, read and flush are all Ok through the same seam")
+filedev_healthy_seam_ok()
+    var d = device_over(FailingFile(false, false, false), 4)
+    val data = filled(7, BLOCK_SIZE)
+    var out = filled(0, BLOCK_SIZE)
+    assert_eq(kind(d.write(1, data.view())), 0)
+    assert_eq(kind(d.read(1, out.view())), 0)
+    assert_eq(kind(d.flush()), 0)

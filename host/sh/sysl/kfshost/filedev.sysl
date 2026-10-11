@@ -10,38 +10,67 @@ import sysl.time
 // A block device over an image file: block `b` is bytes `b * 4096 ..< (b + 1) * 4096` of the file. Every
 // write is handed to the operating system before it returns, so a flush has nothing left to wait for
 // beyond what the host's own cache decides.
-struct FileDevice
-    private file: fs.File
+//
+// The file is a type parameter so that a test can hand the device one whose writes fail; the real one
+// is `fs.File`.
+struct FileDevice[F: ImageFile]
+    private file: F
     private count: u64
 
     // Hand back the file descriptor; further use of the device fails.
-    close(*self) -> bool = self.file.close().is_ok()
+    close(*self) -> bool = self.file.release()
 
-impl BlockDevice for FileDevice
+// What the device needs of its file. `fs.File` records a failed read or write instead of answering it,
+// so `broken` is how the device learns that one happened.
+trait ImageFile
+    seek_to(*self, to: long) -> bool
+    fill(*self, out: []u8) -> usize
+    put(*self, data: []const u8)
+    sync(*self) -> bool
+    broken(*self) -> bool
+    release(*self) -> bool
+
+impl ImageFile for fs.File
+    seek_to(*self, to: long) -> bool = self.seek(to).is_ok()
+    fill(*self, out: []u8) -> usize = self.read(out).len
+    put(*self, data: []const u8)
+        self.write(data)
+    sync(*self) -> bool = self.flush().is_ok()
+    broken(*self) -> bool = self.failed()
+    release(*self) -> bool = self.close().is_ok()
+
+impl[F: ImageFile] BlockDevice for FileDevice[F]
     blocks(self) -> u64 = self.count
 
     read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
         if out.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
         if b >= self.count then return Err(DeviceError.OutOfRange)
-        if self.file.seek(long(b) * long(BLOCK_SIZE)).is_err() then return Err(DeviceError.Io)
-        val got = self.file.read(out)
-        if got.len != BLOCK_SIZE then return Err(DeviceError.Io)
+        if !self.file.seek_to(long(b) * long(BLOCK_SIZE)) then return Err(DeviceError.Io)
+        val got = self.file.fill(out)
+        if self.file.broken() then return Err(DeviceError.Io)
+        if got != BLOCK_SIZE then return Err(DeviceError.Io)
         Ok(())
 
     write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
         if data.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
         if b >= self.count then return Err(DeviceError.OutOfRange)
-        if self.file.seek(long(b) * long(BLOCK_SIZE)).is_err() then return Err(DeviceError.Io)
-        self.file.write(data)
-        if self.file.flush().is_err() then return Err(DeviceError.Io)
+        if !self.file.seek_to(long(b) * long(BLOCK_SIZE)) then return Err(DeviceError.Io)
+        self.file.put(data)
+        if self.file.broken() then return Err(DeviceError.Io)
+        if !self.file.sync() then return Err(DeviceError.Io)
+        if self.file.broken() then return Err(DeviceError.Io)
         Ok(())
 
     flush(*self) -> Result[unit, DeviceError]
-        if self.file.flush().is_err() then return Err(DeviceError.Io)
+        if !self.file.sync() then return Err(DeviceError.Io)
+        if self.file.broken() then return Err(DeviceError.Io)
         Ok(())
 
+// A device over any file of `blocks` blocks; what a test uses to hand it a file that fails.
+device_over[F: ImageFile](file: F, blocks: u64) -> FileDevice[F] = FileDevice(file, blocks)
+
 // Open an existing image. It has to be a whole number of blocks.
-open_image(path: string) -> Result[FileDevice, DeviceError]
+open_image(path: string) -> Result[FileDevice[fs.File], DeviceError]
     var f = fs.open_update(path) match
         Ok(f) -> f
         Err(_) -> return Err(DeviceError.Io)
@@ -52,7 +81,7 @@ open_image(path: string) -> Result[FileDevice, DeviceError]
     Ok(FileDevice(f, u64(size) / u64(BLOCK_SIZE)))
 
 // Make a new, zero-filled image of `blocks` blocks, replacing any file there.
-create_image(path: string, blocks: u64) -> Result[FileDevice, DeviceError]
+create_image(path: string, blocks: u64) -> Result[FileDevice[fs.File], DeviceError]
     var f = fs.create_update(path) match
         Ok(f) -> f
         Err(_) -> return Err(DeviceError.Io)

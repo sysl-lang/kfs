@@ -18,7 +18,7 @@ private entropy() -> Buf[u8]
         e.push(u8(i))
     e
 
-private made(path: string, blocks: u64) -> FileDevice
+private made(path: string, blocks: u64) -> FileDevice[fs.File]
     create_image(path, blocks) match
         Ok(d) -> d
         Err(_) -> panic("could not create the image")
