@@ -1,14 +1,198 @@
 module keel.kfs
 
-// A linear directory's leaf block (kfs/SPEC.md section 10), the smallest writer there can be: a leaf
-// holding one entry. The formatter needs exactly this to put `lost+found` in the root.
+import sysl.buf.{Buf, buf}
+
+// A directory's leaf block (kfs/SPEC.md section 10) as bytes: an 8-byte header, records tiling the 4072
+// bytes from 8 to the tail, the tail. These are codecs only — reading, placing, removing and packing
+// records — shared by the directory operations (dir.sysl) and the checker, which must agree on them.
+//
+// **Records in place.** A name goes into a free first record big enough for it, else into the slack of a
+// live record (the live record's `rec_len` is cut to its live bytes and the rest becomes the new record);
+// a removed record's space joins the record before it, or, for the first record, the record is marked
+// free (`ino` 0). A leaf rewritten whole (a split, a merge, a conversion) is packed: records one after
+// the other in hash order, the last one's `rec_len` reaching the tail.
+
+// Where the records begin, how many bytes they tile, and half of that: two leaves whose live bytes fit
+// in half a leaf are merged (section 10, "Shrinking", rule 2).
+const LEAF_RECORDS: usize = 8
+const LEAF_AREA: usize = TAIL_OFFSET - LEAF_RECORDS
+const LEAF_HALF: usize = LEAF_AREA / 2
+
+// What is wrong with a directory block (section 10): the checks the operations make on every block they
+// read, and the checker's pass 2 makes on every block of every directory.
+enum DirFault
+    // The checksum does not verify.
+    Checksum
+    // The magic is not "KFSD" for a leaf or "KFSH" for an index block.
+    Magic
+    // The tail names another inode.
+    Owner
+    // The tail names a previous generation of this inode.
+    Generation
+    // A header field out of range: a leaf's `count` not its live records, or its reserved bytes not 0; an
+    // index block's `max` 0 or above 254, `count` 0 or above `max`, `level` not the one its place gives,
+    // or a reserved byte not 0.
+    Header
+    // The records do not tile the block: a `rec_len` under 16, not a multiple of 8, or past the tail; a
+    // live record whose name does not fit its `rec_len` or is empty; a free record that is not the first.
+    Records
+    // An index block's keys out of order, its entry 0's key not its parent entry's, or an entry's
+    // reserved word not 0.
+    Keys
+    // An index entry names a block the directory does not map.
+    Missing
 
 // The bytes a record with a `name_len`-byte name really uses: its 12-byte header and the name, rounded up
 // to 8.
 record_live_bytes(name_len: usize) -> usize = (12 + name_len + 7) / 8 * 8
 
+// One record as it lies in a leaf: where it starts and its header's fields.
+struct Rec
+    off: usize
+    ino: u64
+    rec_len: usize
+    name_len: usize
+    file_type: u8
+
+    // The bytes it really uses (a live record).
+    live(self) -> usize = record_live_bytes(self.name_len)
+
+// A name with what its record says and its hash.
+struct DirName
+    ino: u64
+    file_type: u8
+    hash: u64
+    name: Buf[u8]
+
+private rec_at(bytes: []u8, off: usize) -> Rec
+    val r: *DirRecordHeader = at(bytes, off)
+    Rec(off, r.ino, usize(r.rec_len), usize(r.name_len), r.file_type)
+
+// Record `r`'s name.
+rec_name(bytes: []u8, r: Rec) -> []u8 = bytes[r.off + 12..<r.off + 12 + r.name_len]
+
+// The records of the leaf in `bytes`, in the order they lie, checked against section 10's rules: the
+// magic, the reserved bytes, records tiling the area exactly, each `rec_len` a multiple of 8 and at least
+// 16, a live record's name non-empty and inside its `rec_len`, a free record only first, and `count` the
+// live records. The checksum and the tail are the caller's.
+leaf_records(bytes: []u8) -> Result[Buf[Rec], DirFault]
+    val head: *DirLeafHeader = at(bytes, 0)
+    if head.magic != DIR_LEAF_MAGIC then return Err(DirFault.Magic)
+    if head.reserved != 0 then return Err(DirFault.Header)
+    var out: Buf[Rec] = buf()
+    var off = LEAF_RECORDS
+    var live: usize = 0
+    while off < TAIL_OFFSET
+        if TAIL_OFFSET - off < 16 then return Err(DirFault.Records)
+        val r = rec_at(bytes, off)
+        if r.rec_len < 16 || r.rec_len % 8 != 0 || r.rec_len > TAIL_OFFSET - off then return Err(DirFault.Records)
+        if r.ino == 0
+            if off != LEAF_RECORDS then return Err(DirFault.Records)
+        else
+            if r.name_len == 0 || r.live() > r.rec_len then return Err(DirFault.Records)
+            live += 1
+        out.push(r)
+        off += r.rec_len
+    if usize(head.count) != live then return Err(DirFault.Header)
+    Ok(out)
+
+// The live bytes of the live records among `recs`.
+live_bytes(recs: Buf[Rec]) -> usize
+    var n: usize = 0
+    for r in recs.view()
+        if r.ino != 0 then n += r.live()
+    n
+
+// The live bytes of `names`.
+names_bytes(names: Buf[DirName]) -> usize
+    var n: usize = 0
+    for x in names.view()
+        n += record_live_bytes(x.name.len())
+    n
+
+// Write a record for `n` at `off`, `rec_len` long; its bytes past the name are zeroed.
+private put_record(bytes: []u8, off: usize, rec_len: usize, n: DirName)
+    for k in off..<off + rec_len
+        bytes[k] = 0
+    val r: *DirRecordHeader = at(bytes, off)
+    r.ino = n.ino
+    r.rec_len = u16(rec_len)
+    r.name_len = u8(n.name.len())
+    r.file_type = n.file_type
+    for i in 0..<n.name.len()
+        bytes[off + 12 + i] = n.name[i]
+
+private set_rec_len(bytes: []u8, off: usize, rec_len: usize)
+    val r: *DirRecordHeader = at(bytes, off)
+    r.rec_len = u16(rec_len)
+
+private add_count(bytes: []u8, delta: i32)
+    val head: *DirLeafHeader = at(bytes, 0)
+    head.count = u16(i32(head.count) + delta)
+
+// Which of `recs` a record of `need` live bytes goes in (section 10, "Insert"): the free first record
+// if it is big enough, else the first live record whose slack holds it; None when none does.
+record_room(recs: Buf[Rec], need: usize) -> Option[usize]
+    for i in 0..<recs.len()
+        val r = recs[i]
+        if r.ino == 0
+            if r.rec_len >= need then return Some(i)
+        else if r.rec_len - r.live() >= need
+            return Some(i)
+    None
+
+// Put `n` into record `r` in place: a free record takes it whole; a live one gives up its slack.
+place_record(bytes: []u8, r: Rec, n: DirName)
+    if r.ino == 0
+        put_record(bytes, r.off, r.rec_len, n)
+    else
+        set_rec_len(bytes, r.off, r.live())
+        put_record(bytes, r.off + r.live(), r.rec_len - r.live(), n)
+    add_count(bytes, 1)
+
+// What a directory block's checksum and tail say is wrong with it, if anything: it must verify and
+// name directory `owner` at `generation`.
+dir_block_fault(seed: u32, bytes: []u8, owner: u64, generation: u32) -> Option[DirFault]
+    if !verify_block(seed, bytes) then return Some(DirFault.Checksum)
+    if le64(bytes, TAIL_OFFSET) != owner then return Some(DirFault.Owner)
+    if le32(bytes, TAIL_OFFSET + 8) != generation then return Some(DirFault.Generation)
+    None
+
+// Remove record `k` of `recs` in place (section 10, "Leaf block"): its space joins the record before
+// it, or, when it is the first, it becomes a free record of the same length. Its bytes are zeroed.
+drop_record(bytes: []u8, recs: Buf[Rec], k: usize)
+    val r = recs[k]
+    if k == 0
+        for i in r.off..<r.off + r.rec_len
+            bytes[i] = 0
+        set_rec_len(bytes, r.off, r.rec_len)
+    else
+        for i in r.off..<r.off + r.rec_len
+            bytes[i] = 0
+        set_rec_len(bytes, recs[k - 1].off, recs[k - 1].rec_len + r.rec_len)
+    add_count(bytes, -1)
+
+// Make the record area and header of `bytes` a leaf holding `names`, packed in the order given; no names
+// is one free record over the whole area. The tail is the caller's.
+pack_leaf(bytes: []u8, names: Buf[DirName])
+    for k in 0..<TAIL_OFFSET
+        bytes[k] = 0
+    val head: *DirLeafHeader = at(bytes, 0)
+    head.magic = DIR_LEAF_MAGIC
+    head.count = u16(names.len())
+    if names.len() == 0
+        set_rec_len(bytes, LEAF_RECORDS, LEAF_AREA)
+        return
+    var off = LEAF_RECORDS
+    for i in 0..<names.len()
+        val n = names[i]
+        val len = if i + 1 == names.len() then TAIL_OFFSET - off else record_live_bytes(n.name.len())
+        put_record(bytes, off, len, n)
+        off += len
+
 // Make `block`, which is all zeros, a leaf of directory `owner` (at `generation`) holding one entry. The
-// record's `rec_len` spans the whole record area, so the records tile it exactly.
+// record's `rec_len` spans the whole record area, so the records tile it exactly. The formatter needs
+// exactly this to put `lost+found` in the root.
 single_entry_leaf(block: []u8, seed: u32, owner: u64, generation: u32, ino: u64, file_type: u8, name: []const u8)
     val head: *DirLeafHeader = at(block, 0)
     head.magic = DIR_LEAF_MAGIC
@@ -22,3 +206,47 @@ single_entry_leaf(block: []u8, seed: u32, owner: u64, generation: u32, ino: u64,
         block[8 + 12 + i] = name[i]
     set_tail(block, owner, generation)
     seal_block(seed, block)
+
+// -- Index blocks --------------------------------------------------------------------------------------
+
+// An index block's header fields and entries.
+struct IndexBlock
+    level: u8
+    max: u16
+    entries: Buf[IndexEntry]
+
+// Whether `b` may follow `a` in an index block: a greater key, or the same key with the continuation
+// mark (a run of one hash over three or more leaves gives each leaf after the first the key `h | 1`).
+key_follows(a: u64, b: u64) -> bool = b > a || (b == a && b & 1 == 1)
+
+// The index block in `bytes`, checked: the magic, 1 <= `max` <= 254, 1 <= `count` <= `max`, `level`
+// below DIR_MAX_LEVELS, reserved bytes zero, every entry's reserved word zero, and keys in order
+// (`key_follows`). The checksum, the tail, the level its place gives and entry 0's key are the caller's.
+index_block(bytes: []u8) -> Result[IndexBlock, DirFault]
+    val head: *IndexHeader = at(bytes, 0)
+    if head.magic != DIR_INDEX_MAGIC then return Err(DirFault.Magic)
+    if head.max == 0 || usize(head.max) > DIR_INDEX_SLOTS || head.count == 0 || head.count > head.max then return Err(DirFault.Header)
+    if usize(head.level) >= DIR_MAX_LEVELS then return Err(DirFault.Header)
+    for k in 0..<7
+        if head.reserved[k] != 0 then return Err(DirFault.Header)
+    var entries: Buf[IndexEntry] = buf()
+    for i in 0..<usize(head.count)
+        val e: *IndexEntry = at(bytes, sizeof(IndexHeader) + i * sizeof(IndexEntry))
+        if e.reserved != 0 then return Err(DirFault.Keys)
+        if i > 0 && !key_follows(entries[i - 1].key, e.key) then return Err(DirFault.Keys)
+        entries.push(*e)
+    Ok(IndexBlock(head.level, head.max, entries))
+
+// Make the header and entry area of `bytes` an index block; unused entry slots are zero. The tail is the
+// caller's.
+lay_out_index(bytes: []u8, level: u8, max: u16, entries: Buf[IndexEntry])
+    for k in 0..<TAIL_OFFSET
+        bytes[k] = 0
+    val head: *IndexHeader = at(bytes, 0)
+    head.magic = DIR_INDEX_MAGIC
+    head.count = u16(entries.len())
+    head.max = max
+    head.level = level
+    for i in 0..<entries.len()
+        val e: *IndexEntry = at(bytes, sizeof(IndexHeader) + i * sizeof(IndexEntry))
+        *e = IndexEntry(entries[i].key, entries[i].child, 0)

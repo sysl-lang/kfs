@@ -1,0 +1,240 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The checker's pass 2 (kfs/SPEC.md section 23): every directory pass 1 found sound, read from the
+// device through the format's codecs alone.
+//
+// - **Every block**: its checksum, its tail (this directory, this generation), its magic and its own
+//   rules (dirleaf.sysl's `leaf_records` and `index_block`).
+// - **Leaves**: every live name 1-255 bytes with no `/` or NUL and not `.` or `..`; naming an allocated
+//   inode that is neither reserved nor past the last; with that inode's `DT_*` type. No name twice in
+//   the directory.
+// - **Shape**: an empty directory has no blocks, size 0 and no `INDEXED`; a linear one has one leaf, at
+//   block 0, with a name in it; an indexed one's block 0 is a root, its levels descend by one, every
+//   leaf holds a name, and a root above level 0 has two entries or more — the shrinking rules leave no
+//   empty leaf and no root of one entry over an index block. The size is its blocks' end; no extent is
+//   unwritten.
+// - **The index**: keys in order across the whole index (each above the one before, or equal with the
+//   mark: `key_follows`), the root's entry 0 keyed 0 and every interior block's entry 0 keyed as its
+//   parent's entry; every leaf's hashes inside its range — `[key & ~1, next & ~1]`, closed above only
+//   when the next key carries the mark; a marked key `h | 1` only after a leaf holding a name of hash
+//   `h`; every index entry naming a mapped block; every block reached once, and every mapped block
+//   reached.
+
+// Where one logical block of the directory is, and whether the walk has reached it.
+private struct Mapped
+    logical: u64
+    phys: u64
+    reached: bool
+
+// A leaf of the index, in key order.
+private struct LeafSeen
+    logical: u64
+    key: u64
+
+// A name the directory holds.
+private struct NameSeen
+    hash: u64
+    name: Buf[u8]
+
+private problem(rep: Report, p: Problem) = rep.problems.push(p)
+
+private[kfs] pass2[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit, DeviceError]
+    for d in c.seen.view()
+        check_dir(dev, c, rep, d)?
+    Ok(())
+
+private index_of(maps: Buf[Mapped], l: u64) -> Option[usize]
+    for i in 0..<maps.len()
+        if maps[i].logical == l then return Some(i)
+    None
+
+private check_dir[D: BlockDevice](dev: *D, c: *Checker, rep: Report, d: DirSeen) -> Result[unit, DeviceError]
+    var maps: Buf[Mapped] = buf()
+    var last: u64 = 0
+    for e in d.extents.view()
+        if e.flags & EXTENT_UNWRITTEN != 0
+            problem(rep, Problem.DirShape(d.ino))
+            return Ok(())
+        for k in 0..<u64(e.len)
+            maps.push(Mapped(u64(e.logical) + k, e.physical + k, false))
+            if u64(e.logical) + k + 1 > last then last = u64(e.logical) + k + 1
+    val indexed = d.flags & INODE_INDEXED != 0
+    if maps.len() == 0
+        if d.size != 0 || indexed then problem(rep, Problem.DirShape(d.ino))
+        return Ok(())
+    if d.size != last * u64(BLOCK_SIZE) then problem(rep, Problem.DirShape(d.ino))
+    var names: Buf[NameSeen] = buf()
+    if !indexed
+        if maps.len() != 1 || maps[0].logical != 0
+            problem(rep, Problem.DirShape(d.ino))
+            return Ok(())
+        val got = check_leaf(dev, c, rep, d, maps, 0, names)?
+        got match
+            Some(hashes) -> if hashes.len() == 0 then problem(rep, Problem.DirShape(d.ino))
+            None -> ()
+    else
+        var leaves: Buf[LeafSeen] = buf()
+        if !walk_index(dev, c, rep, d, maps, 0, -1, 0, leaves)? then return Ok(())
+        // A leaf that fails its own checks is skipped, and so is the mark check of the leaf after it;
+        // the rest are still judged.
+        var prev: Option[Buf[u64]] = None
+        for i in 0..<leaves.len()
+            val lf = leaves[i]
+            if i > 0 && !key_follows(leaves[i - 1].key, lf.key)
+                problem(rep, Problem.DirBlock(d.ino, lf.logical, DirFault.Keys))
+                return Ok(())
+            val got = check_leaf(dev, c, rep, d, maps, lf.logical, names)?
+            val hashes = got match
+                Some(x) -> x
+                None ->
+                    prev = None
+                    continue
+            if hashes.len() == 0 then problem(rep, Problem.DirShape(d.ino))
+            val lo = if i == 0 then 0 else lf.key & ~u64(1)
+            var hi: u64 = 0xFFFF_FFFF_FFFF_FFFF
+            var closed = true
+            if i + 1 < leaves.len()
+                hi = leaves[i + 1].key & ~u64(1)
+                closed = leaves[i + 1].key & 1 == 1
+            for x in hashes.view()
+                if x < lo || x > hi || (x == hi && !closed)
+                    problem(rep, Problem.DirRange(d.ino, lf.logical))
+                    break
+            if i > 0 && lf.key & 1 == 1
+                prev match
+                    Some(before) ->
+                        var begun = false
+                        for x in before.view()
+                            if x == lf.key & ~u64(1) then begun = true
+                        if !begun then problem(rep, Problem.DirMark(d.ino, lf.logical))
+                    None -> ()
+            prev = Some(hashes)
+    for m in maps.view()
+        if !m.reached then problem(rep, Problem.DirReach(d.ino, m.logical))
+    duplicates(rep, d.ino, names)
+    Ok(())
+
+// Mark logical block `l` reached and answer its physical block; None (with the problem reported) when
+// the directory does not map it or it was reached before.
+private reach(rep: Report, d: DirSeen, maps: Buf[Mapped], l: u64) -> Option[u64]
+    val i = index_of(maps, l) match
+        Some(i) -> i
+        None ->
+            problem(rep, Problem.DirBlock(d.ino, l, DirFault.Missing))
+            return None
+    if maps[i].reached
+        problem(rep, Problem.DirReach(d.ino, l))
+        return None
+    maps.view()[i].reached = true
+    Some(maps[i].phys)
+
+// Read block `l` and check its checksum and tail; None (with the problem reported) when they fail.
+private owned_block[D: BlockDevice](dev: *D, c: *Checker, rep: Report, d: DirSeen, maps: Buf[Mapped], l: u64) -> Result[Option[Buf[u8]], DeviceError]
+    val phys = reach(rep, d, maps, l) match
+        Some(p) -> p
+        None -> return Ok(None)
+    var blk = block_buf()
+    dev.read(phys, blk.view())?
+    dir_block_fault(c.m.seed, blk.view(), d.ino, d.generation) match
+        Some(f) ->
+            problem(rep, Problem.DirBlock(d.ino, l, f))
+            Ok(None)
+        None -> Ok(Some(blk))
+
+// The index block at `l` and everything under it: its own rules, its level (`level`, or any for the
+// root, asked with -1), its entry 0's key (`key`); its leaves appended to `leaves` in key order. False
+// when a problem stops the walk.
+private walk_index[D: BlockDevice](dev: *D, c: *Checker, rep: Report, d: DirSeen, maps: Buf[Mapped], l: u64, level: i32, key: u64, leaves: Buf[LeafSeen]) -> Result[bool, DeviceError]
+    val blk = owned_block(dev, c, rep, d, maps, l)? match
+        Some(b) -> b
+        None -> return Ok(false)
+    val ib = index_block(blk.view()) match
+        Ok(x) -> x
+        Err(f) ->
+            problem(rep, Problem.DirBlock(d.ino, l, f))
+            return Ok(false)
+    if level >= 0 && i32(ib.level) != level
+        problem(rep, Problem.DirBlock(d.ino, l, DirFault.Header))
+        return Ok(false)
+    if ib.entries[0].key != key
+        problem(rep, Problem.DirBlock(d.ino, l, DirFault.Keys))
+        return Ok(false)
+    // Rule 3 of section 10 leaves no root of one entry over an index block.
+    if level < 0 && ib.level > 0 && ib.entries.len() == 1 then problem(rep, Problem.DirShape(d.ino))
+    for e in ib.entries.view()
+        if ib.level == 0
+            leaves.push(LeafSeen(u64(e.child), e.key))
+        else if !walk_index(dev, c, rep, d, maps, u64(e.child), i32(ib.level) - 1, e.key, leaves)?
+            return Ok(false)
+    Ok(true)
+
+private bad_name(name: []const u8) -> bool
+    if name.len == 0 then return true
+    if name.len == 1 && name[0] == u8('.') then return true
+    if name.len == 2 && name[0] == u8('.') && name[1] == u8('.') then return true
+    for b in name
+        if b == u8('/') || b == 0 then return true
+    false
+
+// The leaf at `l`: its block, its records, and each name; answers the names' hashes, or None when the
+// block itself failed. The names are added to `names`.
+private check_leaf[D: BlockDevice](dev: *D, c: *Checker, rep: Report, d: DirSeen, maps: Buf[Mapped], l: u64, names: Buf[NameSeen]) -> Result[Option[Buf[u64]], DeviceError]
+    val blk = owned_block(dev, c, rep, d, maps, l)? match
+        Some(b) -> b
+        None -> return Ok(None)
+    val bytes = blk.view()
+    val recs = leaf_records(bytes) match
+        Ok(r) -> r
+        Err(f) ->
+            problem(rep, Problem.DirBlock(d.ino, l, f))
+            return Ok(None)
+    var hashes: Buf[u64] = buf()
+    var named_bad = false
+    val count = c.m.sb.inode_count
+    for r in recs.view()
+        if r.ino == 0 then continue
+        val name = rec_name(bytes, r)
+        if bad_name(name) && !named_bad
+            problem(rep, Problem.DirName(d.ino, l))
+            named_bad = true
+        val reserved = r.ino == 1 || (r.ino >= 3 && r.ino < FIRST_INO)
+        if reserved || r.ino > count || !c.allocated[usize(r.ino)]
+            problem(rep, Problem.DirTarget(d.ino, r.ino))
+        else if c.types[usize(r.ino)] != r.file_type
+            problem(rep, Problem.DirType(d.ino, r.ino))
+        val h = dir_hash(c.m.sb.hash_seed[0..<16], name)
+        hashes.push(h)
+        var copy: Buf[u8] = buf()
+        for b in name
+            copy.push(b)
+        names.push(NameSeen(h, copy))
+    Ok(Some(hashes))
+
+private same_bytes(a: Buf[u8], b: Buf[u8]) -> bool
+    if a.len() != b.len() then return false
+    for i in 0..<a.len()
+        if a[i] != b[i] then return false
+    true
+
+// No name twice: names of one hash compared pairwise.
+private duplicates(rep: Report, ino: u64, names: Buf[NameSeen])
+    for i in 1..<names.len()
+        var j = i
+        while j > 0 && names[j - 1].hash > names[j].hash
+            val t = names[j]
+            names[j] = names[j - 1]
+            names[j - 1] = t
+            j -= 1
+    var a: usize = 0
+    while a < names.len()
+        var b = a
+        while b < names.len() && names[b].hash == names[a].hash
+            b += 1
+        for x in a..<b
+            for y in (x + 1)..<b
+                if same_bytes(names[x].name, names[y].name)
+                    problem(rep, Problem.DirDuplicate(ino))
+                    return
+        a = b

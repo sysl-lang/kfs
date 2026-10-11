@@ -1,0 +1,825 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// Directories (kfs/SPEC.md section 10): lookup, insert, removal and `readdir`, over linear directories
+// (one leaf at block 0) and indexed ones (a hash index of up to DIR_MAX_LEVELS levels over leaves).
+//
+// **Reading.** Every block is read through its buffer and checked before use: mapped, its checksum, the
+// tail naming this directory at its generation, then its own rules (dirleaf.sysl's codecs). A block that
+// fails is corruption, which aborts the journal (section 22).
+//
+// **The index in memory.** An operation on an indexed directory probes from the root (`probe`), keeping
+// the path — every index block from the root down, with the entry it followed — so that the next leaf in
+// key order (`next_leaf`) can be found even under another index block. A change is made on the path in
+// memory and each changed block is then declared and written whole.
+//
+// **Insert** probes for the name's hash and visits the leaves of its run (the first leaf that can hold
+// the hash, then each next leaf keyed `h | 1`), refusing a name already there; the name goes into the
+// first visited leaf with room, else the last visited leaf is split. A split counts the blocks it needs
+// (the new leaf, and an index block for each one on the path that overflows: two for the root) and
+// allocates them all before anything changes, so a refusal — `NoSpace`, or a root already at
+// DIR_MAX_LEVELS — leaves the directory as it was. A linear directory whose leaf is full is converted.
+//
+// **Removal** applies section 10's shrinking rules in the same transaction, then keeps the continuation
+// mark honest (`fix_mark`), then frees what it emptied: unmapped with the reserve's right (uid 0) — a
+// freed block can split an extent, and a removal must not fail for want of space — and revoked.
+//
+// The callers hold the directory's inode lock (section 19); `dir_add` and `dir_remove` take the caller's
+// handle, with C_DIR_ADD and C_DIR_DEL credits for their part. `add_name` and `remove_name` are the same
+// with a handle of their own; `lookup_name` and `read_dir` take the lock themselves.
+
+// What a name names.
+struct DirEntry
+    ino: u64
+    file_type: u8
+
+// One entry of a `read_dir` listing: its name, inode and type, its position, and the position of the
+// entry after it (`d_off`).
+struct Listed
+    name: Buf[u8]
+    ino: u64
+    file_type: u8
+    pos: u64
+    next: u64
+
+// What `read_dir` answers: the entries, and the position the next call starts from (DIR_POS_END when the
+// directory is done).
+struct Listing
+    entries: Buf[Listed]
+    next: u64
+
+// The bytes a `getdents64` record takes for a name of `name_len` bytes: Linux's `linux_dirent64`, 19
+// bytes, the name and its NUL, rounded up to 8.
+dirent_size(name_len: usize) -> usize = (19 + name_len + 1 + 7) / 8 * 8
+
+// A directory as an operation sees it: empty when `size` is 0.
+private struct Dir
+    ino: u64
+    generation: u32
+    indexed: bool
+    size: u64
+    parent: u64
+
+// One index block on a path: where it is, its header, its entries, the entry the path follows, and
+// whether memory has changed it.
+private struct Hop
+    logical: u64
+    phys: u64
+    level: u8
+    max: u16
+    entries: Buf[IndexEntry]
+    slot: usize
+    dirty: bool
+
+// A leaf as read: where it is, its records as they lie, and its live names in that order with each
+// one's record.
+private struct Leaf
+    logical: u64
+    phys: u64
+    recs: Buf[Rec]
+    names: Buf[DirName]
+    rec_of: Buf[usize]
+
+// A block of the directory: its logical and physical numbers.
+private struct Placed
+    logical: u64
+    phys: u64
+
+// A leaf a probe visited, with the path to it.
+private struct Visited
+    path: Buf[Hop]
+    leaf: Leaf
+
+// The leaves a name's probe visits, and where the name was found (an index into the last leaf's names).
+private struct Visit
+    leaves: Buf[Visited]
+    found: Option[usize]
+
+// Where a split puts the upper half: the first name it takes, and the new leaf's key.
+struct Cut
+    at: usize
+    key: u64
+
+// -- Names --------------------------------------------------------------------------------------------
+
+private is_dot(name: []const u8) -> bool = name.len == 1 && name[0] == u8('.')
+private is_dotdot(name: []const u8) -> bool = name.len == 2 && name[0] == u8('.') && name[1] == u8('.')
+
+// Section 10's rule for a stored name: 1 to NAME_MAX bytes (`NameTooLong` past it), none of them `/` or
+// NUL.
+private valid_name(name: []const u8) -> Result[unit, FsError]
+    if name.len > NAME_MAX then return Err(FsError.NameTooLong)
+    if name.len == 0 then return Err(FsError.Invalid)
+    for b in name
+        if b == u8('/') || b == 0 then return Err(FsError.Invalid)
+    Ok(())
+
+private copy_name(name: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for b in name
+        out.push(b)
+    out
+
+private same_name(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// The name's hash under this filesystem's seed.
+private name_hash[D: BlockDevice, P: Platform](fs: *Fs[D, P], name: []const u8) -> u64 = dir_hash(fs.sb.hash_seed[0..<16], name)
+
+// `names` in hash order; names of one hash keep their order.
+sort_by_hash(names: Buf[DirName])
+    for i in 1..<names.len()
+        var j = i
+        while j > 0 && names[j - 1].hash > names[j].hash
+            val t = names[j]
+            names[j] = names[j - 1]
+            names[j - 1] = t
+            j -= 1
+
+private sorted(names: Buf[DirName]) -> Buf[DirName]
+    var out: Buf[DirName] = buf()
+    out.extend(names.view())
+    sort_by_hash(out)
+    out
+
+// Section 10's split of `names` (in hash order, at least two): `s` is the first index whose names before
+// it hold at least half the live bytes (the last index when none does). Split there when the hashes on
+// either side differ; else at the nearest index where they differ and both halves fit a leaf — fewest
+// names moved, ties toward the end; else, every name one hash around `s`, at `s` with the key `h | 1`.
+split_point(names: Buf[DirName]) -> Cut
+    val n = names.len()
+    var pre: Buf[usize] = buf()
+    pre.push(0)
+    for i in 0..<n
+        pre.push(pre[i] + record_live_bytes(names[i].name.len()))
+    val total = pre[n]
+    var s = n - 1
+    var i: usize = 1
+    while i < n
+        if 2 * pre[i] >= total
+            s = i
+            break
+        i += 1
+    if names[s - 1].hash != names[s].hash then return Cut(s, names[s].hash)
+    var best: Option[usize] = None
+    for j in 1..<n
+        if names[j - 1].hash != names[j].hash && pre[j] <= LEAF_AREA && total - pre[j] <= LEAF_AREA
+            best match
+                None -> best = Some(j)
+                Some(b) -> if distance(j, s) <= distance(b, s) then best = Some(j)
+    best match
+        Some(j) -> Cut(j, names[j].hash)
+        None -> Cut(s, names[s].hash | 1)
+
+private distance(a: usize, b: usize) -> usize = if a > b then a - b else b - a
+
+private part(names: Buf[DirName], from: usize, to: usize) -> Buf[DirName]
+    var out: Buf[DirName] = buf()
+    for i in from..<to
+        out.push(names[i])
+    out
+
+// -- Blocks -------------------------------------------------------------------------------------------
+
+private load_dir[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Dir, FsError]
+    val n = read_inode(fs, ino)?
+    if n.mode & S_IFMT != S_IFDIR then return Err(FsError.NotDirectory)
+    Ok(Dir(ino, n.generation, n.flags & INODE_INDEXED != 0, n.size, n.parent))
+
+private broken[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, l: u64, f: DirFault) -> FsError
+    fs.corrupt(Corruption.Directory(d.ino, l, f))
+
+// Block `l` of `d`: mapped, and its checksum and tail right.
+private dir_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, l: u64) -> Result[Placed, FsError]
+    val phys = lookup(fs, d.ino, l)? match
+        Mapping.Mapped(b, _, false) -> b
+        _ -> return Err(broken(fs, d, l, DirFault.Missing))
+    val id = fs.buffer(phys)?
+    fs.plat.lock(LockId.Buffer(phys))
+    val fault = dir_block_fault(fs.seed, fs.bytes(id), d.ino, d.generation)
+    fs.plat.unlock(LockId.Buffer(phys))
+    fault match
+        Some(f) -> Err(broken(fs, d, l, f))
+        None -> Ok(Placed(l, phys))
+
+private read_leaf[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, l: u64) -> Result[Leaf, FsError]
+    val p = dir_block(fs, d, l)?
+    val id = fs.buffer(p.phys)?
+    var names: Buf[DirName] = buf()
+    var rec_of: Buf[usize] = buf()
+    fs.plat.lock(LockId.Buffer(p.phys))
+    val bytes = fs.bytes(id)
+    val r = leaf_records(bytes)
+    r match
+        Ok(recs) ->
+            for k in 0..<recs.len()
+                val rec = recs[k]
+                if rec.ino != 0
+                    val name = rec_name(bytes, rec)
+                    names.push(DirName(rec.ino, rec.file_type, name_hash(fs, name), copy_name(name)))
+                    rec_of.push(k)
+        Err(_) -> ()
+    fs.plat.unlock(LockId.Buffer(p.phys))
+    r match
+        Ok(recs) -> Ok(Leaf(l, p.phys, recs, names, rec_of))
+        Err(f) -> Err(broken(fs, d, l, f))
+
+// Index block `l`, which must be at `level` (the root, asked with -1, at any level below
+// DIR_MAX_LEVELS) and whose entry 0 must have key `key`.
+private read_hop[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, l: u64, level: i32, key: u64) -> Result[Hop, FsError]
+    val p = dir_block(fs, d, l)?
+    val id = fs.buffer(p.phys)?
+    fs.plat.lock(LockId.Buffer(p.phys))
+    val r = index_block(fs.bytes(id))
+    fs.plat.unlock(LockId.Buffer(p.phys))
+    val ib = r match
+        Ok(x) -> x
+        Err(f) -> return Err(broken(fs, d, l, f))
+    if level >= 0 && i32(ib.level) != level then return Err(broken(fs, d, l, DirFault.Header))
+    if ib.entries[0].key != key then return Err(broken(fs, d, l, DirFault.Keys))
+    Ok(Hop(l, p.phys, ib.level, ib.max, ib.entries, 0, false))
+
+private declare_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64) -> Result[usize, FsError]
+    val id = fs.buffer(b)?
+    fs.plat.lock(LockId.Buffer(b))
+    val r = fs.write_access(h, id)
+    fs.plat.unlock(LockId.Buffer(b))
+    r?
+    Ok(id)
+
+// Write block `phys` of `d` whole as a leaf of `names`, packed in hash order.
+private write_leaf[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, phys: u64, names: Buf[DirName]) -> Result[unit, FsError]
+    if names_bytes(names) > LEAF_AREA then return Err(FsError.Bug)
+    val id = declare_block(fs, h, phys)?
+    fs.plat.lock(LockId.Buffer(phys))
+    val bytes = fs.bytes(id)
+    pack_leaf(bytes, sorted(names))
+    set_tail(bytes, d.ino, d.generation)
+    seal_block(fs.seed, bytes)
+    fs.plat.unlock(LockId.Buffer(phys))
+    Ok(())
+
+private write_hop[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, hop: Hop) -> Result[unit, FsError]
+    val id = declare_block(fs, h, hop.phys)?
+    fs.plat.lock(LockId.Buffer(hop.phys))
+    val bytes = fs.bytes(id)
+    lay_out_index(bytes, hop.level, hop.max, hop.entries)
+    set_tail(bytes, d.ino, d.generation)
+    seal_block(fs.seed, bytes)
+    fs.plat.unlock(LockId.Buffer(hop.phys))
+    Ok(())
+
+private write_path[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, path: Buf[Hop]) -> Result[unit, FsError]
+    for hop in path.view()
+        if hop.dirty then write_hop(fs, h, d, hop)?
+    Ok(())
+
+// Map a new block into `d` (section 10, "A new directory block"): the lowest logical block that is a
+// hole, else the one just past the end, allocated next to the directory's last block.
+private new_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, uid: u32) -> Result[Placed, FsError]
+    var l: u64 = 0
+    var hole = false
+    while !hole
+        lookup(fs, d.ino, l)? match
+            Mapping.Hole -> hole = true
+            Mapping.Mapped(_, run, _) -> l += u64(run)
+    val last = last_extent(fs, d.ino)? match
+        Some(e) -> e.physical + u64(e.len) - 1
+        None -> 0
+    val run = alloc_blocks(fs, h, goal_for(fs, d.ino, last), 1, uid)?
+    insert(fs, h, ExtentTree(d.ino, uid, fs.node_max), Extent(l, 1, run.first, false)) match
+        Ok(_) -> Ok(Placed(l, run.first))
+        Err(e) ->
+            free_blocks(fs, h, run.first, 1)?
+            Err(e)
+
+// Unmap and free block `p` of `d`. The reserve may be used: freeing a block in the middle of an extent
+// splits it, which may need a node.
+private free_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, p: Placed, revoke: bool) -> Result[unit, FsError]
+    val _ = remove(fs, h, ExtentTree(d.ino, 0, fs.node_max), p.logical, p.logical + 1, 1)?
+    if revoke then fs.revoke(h, p.phys)
+    Ok(())
+
+// `count` new blocks, or none: a failure gives back the ones already mapped.
+private new_blocks[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, count: usize, uid: u32) -> Result[Buf[Placed], FsError]
+    var out: Buf[Placed] = buf()
+    while out.len() < count
+        new_block(fs, h, d, uid) match
+            Ok(p) -> out.push(p)
+            Err(e) ->
+                for p in out.view()
+                    free_block(fs, h, d, p, false)?
+                return Err(e)
+    Ok(out)
+
+// The size a directory's blocks give it: up to the end of its last mapped block.
+private dir_end[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[u64, FsError]
+    last_extent(fs, ino)? match
+        Some(e) -> Ok((e.logical + u64(e.len)) * u64(BLOCK_SIZE))
+        None -> Ok(0)
+
+// The directory's inode after a change: its size from its blocks, flags set and cleared, `mtime` and
+// `ctime`.
+private finish_change[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, set: u32, clear: u32) -> Result[unit, FsError]
+    val end = dir_end(fs, d.ino)?
+    val now = fs.plat.now()
+    change_inode(fs, h, d.ino, (n) ->
+        n.size = end
+        n.flags = (n.flags | set) & ~clear
+        set_mtime(n, now)
+        set_ctime(n, now))?
+    note_change(fs, d.ino, h.seq, true)
+    Ok(())
+
+// -- The index ----------------------------------------------------------------------------------------
+
+// The last entry whose key is at most `h`, comparing all 64 bits; entry 0 when none is.
+private last_at_most(entries: Buf[IndexEntry], h: u64) -> usize
+    var lo: usize = 0
+    var hi = entries.len()
+    while lo < hi
+        val mid = (lo + hi) / 2
+        if entries[mid].key <= h then lo = mid + 1 else hi = mid
+    if lo == 0 then 0 else lo - 1
+
+// The entry the path's last index block follows: the leaf's key and block.
+private at_leaf(path: Buf[Hop]) -> IndexEntry
+    val hop = path[path.len() - 1]
+    hop.entries[hop.slot]
+
+// The path from the root to the first leaf that can hold hash `h` (section 10, "Probe"): at each index
+// block the last entry whose key is at most `h`, which is never a continuation entry `h | 1`.
+private probe[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, h: u64) -> Result[Buf[Hop], FsError]
+    var path: Buf[Hop] = buf()
+    var hop = read_hop(fs, d, 0, -1, 0)?
+    loop
+        hop.slot = last_at_most(hop.entries, h)
+        path.push(hop)
+        if hop.level == 0 then return Ok(path)
+        val e = hop.entries[hop.slot]
+        hop = read_hop(fs, d, u64(e.child), i32(hop.level) - 1, e.key)?
+
+// Down from the path's last index block along first entries to a leaf.
+private down_first[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, path: Buf[Hop]) -> Result[unit, FsError]
+    loop
+        val top = path[path.len() - 1]
+        if top.level == 0 then return Ok(())
+        val e = top.entries[top.slot]
+        path.push(read_hop(fs, d, u64(e.child), i32(top.level) - 1, e.key)?)
+
+// Move `path` to the next leaf in key order — the in-order successor, which may sit under another index
+// block; false (and the path unchanged) at the last leaf.
+private next_leaf[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, path: Buf[Hop]) -> Result[bool, FsError]
+    var k = path.len()
+    while k > 0
+        k -= 1
+        val hop = path[k]
+        if hop.slot + 1 < hop.entries.len()
+            path.truncate(k + 1)
+            path.view()[k].slot = hop.slot + 1
+            down_first(fs, d, path)?
+            return Ok(true)
+    Ok(false)
+
+private clone_path(path: Buf[Hop]) -> Buf[Hop]
+    var out: Buf[Hop] = buf()
+    for hop in path.view()
+        var e: Buf[IndexEntry] = buf()
+        e.extend(hop.entries.view())
+        out.push(Hop(hop.logical, hop.phys, hop.level, hop.max, e, hop.slot, hop.dirty))
+    out
+
+private find_in(leaf: Leaf, name: []const u8) -> Option[usize]
+    for i in 0..<leaf.names.len()
+        if same_name(leaf.names[i].name.view(), name) then return Some(i)
+    None
+
+// The leaves `name` (hash `h`) may be in (section 10, "Lookup"): a linear directory's one leaf; else the
+// first leaf that can hold `h`, then each next leaf in key order while its key is `h | 1` — stopping at
+// the leaf that holds the name.
+private visit[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, name: []const u8, h: u64) -> Result[Visit, FsError]
+    var out = Visit(buf(), None)
+    if d.size == 0 then return Ok(out)
+    if !d.indexed
+        val leaf = read_leaf(fs, d, 0)?
+        out.leaves.push(Visited(buf(), leaf))
+        out.found = find_in(leaf, name)
+        return Ok(out)
+    val path = probe(fs, d, h)?
+    loop
+        val leaf = read_leaf(fs, d, u64(at_leaf(path).child))?
+        out.leaves.push(Visited(clone_path(path), leaf))
+        out.found = find_in(leaf, name)
+        if out.found.is_some() then return Ok(out)
+        if !next_leaf(fs, d, path)? then return Ok(out)
+        if at_leaf(path).key != h | 1 then return Ok(out)
+
+// -- Lookup -------------------------------------------------------------------------------------------
+
+// What `name` names in directory `dir`: `.` and `..` from the inode, without reading a block; else its
+// entry, or `NotFound`.
+lookup_name[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[DirEntry, FsError]
+    fs.plat.lock(LockId.Inode(dir))
+    val r = lookup_locked(fs, dir, name)
+    fs.plat.unlock(LockId.Inode(dir))
+    r
+
+private lookup_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[DirEntry, FsError]
+    val d = load_dir(fs, dir)?
+    if is_dot(name) then return Ok(DirEntry(dir, DT_DIR))
+    if is_dotdot(name) then return Ok(DirEntry(d.parent, DT_DIR))
+    valid_name(name)?
+    val v = visit(fs, d, name, name_hash(fs, name))?
+    v.found match
+        Some(i) ->
+            val n = v.leaves[v.leaves.len() - 1].leaf.names[i]
+            Ok(DirEntry(n.ino, n.file_type))
+        None -> Err(FsError.NotFound)
+
+// -- Insert -------------------------------------------------------------------------------------------
+
+// Add `name` for inode `ino` of type `file_type` to directory `dir` in `h` (section 10, "Insert"), for a
+// caller of uid `uid` (new blocks come from outside the reserve unless it is 0). `.` and `..` exist
+// already; a name already there is `Exists`. The caller holds the directory's lock.
+dir_add[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, dir: u64, name: []const u8, ino: u64, file_type: u8, uid: u32) -> Result[unit, FsError]
+    if is_dot(name) || is_dotdot(name) then return Err(FsError.Exists)
+    valid_name(name)?
+    if ino == 0 then return Err(FsError.Invalid)
+    val d = load_dir(fs, dir)?
+    val hh = name_hash(fs, name)
+    val v = visit(fs, d, name, hh)?
+    if v.found.is_some() then return Err(FsError.Exists)
+    val n = DirName(ino, file_type, hh, copy_name(name))
+    var set: u32 = 0
+    if d.size == 0
+        val p = new_block(fs, h, d, uid)?
+        var one: Buf[DirName] = buf()
+        one.push(n)
+        write_leaf(fs, h, d, p.phys, one)?
+    else if !d.indexed
+        val leaf = v.leaves[0].leaf
+        if !place_in(fs, h, d, leaf, n)?
+            convert(fs, h, d, leaf, n, uid)?
+            set = INODE_INDEXED
+    else
+        var placed = false
+        var k: usize = 0
+        while !placed && k < v.leaves.len()
+            placed = place_in(fs, h, d, v.leaves[k].leaf, n)?
+            k += 1
+        if !placed
+            val last = v.leaves[v.leaves.len() - 1]
+            split_leaf(fs, h, d, last.path, last.leaf, n, uid)?
+    finish_change(fs, h, d, set, 0)
+
+// `dir_add` in a handle of its own, under the directory's lock: the directory's half of a link.
+add_name[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8, ino: u64, file_type: u8, uid: u32) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Inode(dir))
+    var h = fs.start("add name", C_INODE + C_DIR_ADD)
+    val r = dir_add(fs, &h, dir, name, ino, file_type, uid)
+    fs.stop(&h)
+    fs.plat.unlock(LockId.Inode(dir))
+    r
+
+// Put `n` into `leaf` in place if a record has room for it; false when none has.
+private place_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, leaf: Leaf, n: DirName) -> Result[bool, FsError]
+    val k = record_room(leaf.recs, record_live_bytes(n.name.len())) match
+        Some(k) -> k
+        None -> return Ok(false)
+    val id = declare_block(fs, h, leaf.phys)?
+    fs.plat.lock(LockId.Buffer(leaf.phys))
+    val bytes = fs.bytes(id)
+    place_record(bytes, leaf.recs[k], n)
+    seal_block(fs.seed, bytes)
+    fs.plat.unlock(LockId.Buffer(leaf.phys))
+    Ok(true)
+
+// A linear directory whose leaf is full becomes indexed (section 10, "Converting"): two new leaves take
+// the names and the new one, split by the rule, and block 0 becomes a root of level 0 over them.
+private convert[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, leaf: Leaf, n: DirName, uid: u32) -> Result[unit, FsError]
+    if fs.index_max < 2 then return Err(FsError.Invalid)
+    var names = sorted(leaf.names)
+    names.push(n)
+    sort_by_hash(names)
+    val cut = split_point(names)
+    val fresh = new_blocks(fs, h, d, 2, uid)?
+    write_leaf(fs, h, d, fresh[0].phys, part(names, 0, cut.at))?
+    write_leaf(fs, h, d, fresh[1].phys, part(names, cut.at, names.len()))?
+    var entries: Buf[IndexEntry] = buf()
+    entries.push(IndexEntry(0, u32(fresh[0].logical), 0))
+    entries.push(IndexEntry(cut.key, u32(fresh[1].logical), 0))
+    write_hop(fs, h, d, Hop(0, leaf.phys, 0, fs.index_max, entries, 0, true))
+
+private entries_of(from: Buf[IndexEntry], a: usize, b: usize) -> Buf[IndexEntry]
+    var out: Buf[IndexEntry] = buf()
+    for i in a..<b
+        out.push(from[i])
+    out
+
+// How many new blocks a split of the leaf at the end of `path` needs: the new leaf, and one for each
+// index block that overflows on the way up (two for the root, which grows a level). `NoSpace` when the
+// root would grow past DIR_MAX_LEVELS.
+private blocks_for_split(path: Buf[Hop]) -> Result[usize, FsError]
+    var needed: usize = 1
+    var k = path.len()
+    while k > 0
+        k -= 1
+        val hop = path[k]
+        if hop.entries.len() + 1 <= usize(hop.max) then return Ok(needed)
+        if k == 0
+            if usize(hop.level) + 1 >= DIR_MAX_LEVELS then return Err(FsError.NoSpace)
+            return Ok(needed + 2)
+        needed += 1
+    Ok(needed)
+
+// Split `leaf` (at the end of `path`) to take `n` (section 10, "Split"): the lower half stays, the
+// upper half goes to a new leaf whose entry follows the old one's in its parent; an index block over its
+// `max` splits by count, the new block's first key going into its parent; a full root moves its entries
+// into two new blocks one level down.
+private split_leaf[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, path: Buf[Hop], leaf: Leaf, n: DirName, uid: u32) -> Result[unit, FsError]
+    var names = sorted(leaf.names)
+    names.push(n)
+    sort_by_hash(names)
+    val cut = split_point(names)
+    val needed = blocks_for_split(path)?
+    val fresh = new_blocks(fs, h, d, needed, uid)?
+    var used: usize = 1
+    write_leaf(fs, h, d, leaf.phys, part(names, 0, cut.at))?
+    write_leaf(fs, h, d, fresh[0].phys, part(names, cut.at, names.len()))?
+    var made: Buf[Hop] = buf()
+    var entry = IndexEntry(cut.key, u32(fresh[0].logical), 0)
+    var k = path.len() - 1
+    var rising = true
+    while rising
+        val hop = path[k]
+        hop.entries.insert(hop.slot + 1, entry)
+        path.view()[k].dirty = true
+        val c = hop.entries.len()
+        if c <= usize(hop.max)
+            rising = false
+        else if k == 0
+            val a = fresh[used]
+            val b = fresh[used + 1]
+            used += 2
+            val half = (c + 1) / 2
+            val lo = entries_of(hop.entries, 0, half)
+            val hi = entries_of(hop.entries, half, c)
+            made.push(Hop(a.logical, a.phys, hop.level, fs.index_max, lo, 0, true))
+            made.push(Hop(b.logical, b.phys, hop.level, fs.index_max, hi, 0, true))
+            hop.entries.clear()
+            hop.entries.push(IndexEntry(0, u32(a.logical), 0))
+            hop.entries.push(IndexEntry(hi[0].key, u32(b.logical), 0))
+            path.view()[0].level = hop.level + 1
+            rising = false
+        else
+            val b = fresh[used]
+            used += 1
+            val half = (c + 1) / 2
+            val hi = entries_of(hop.entries, half, c)
+            hop.entries.truncate(half)
+            made.push(Hop(b.logical, b.phys, hop.level, fs.index_max, hi, 0, true))
+            entry = IndexEntry(hi[0].key, u32(b.logical), 0)
+            k -= 1
+    if used != needed then return Err(FsError.Bug)
+    write_path(fs, h, d, path)?
+    for hop in made.view()
+        write_hop(fs, h, d, hop)?
+    Ok(())
+
+// -- Removal ------------------------------------------------------------------------------------------
+
+// Remove `name` from directory `dir` in `h` (section 10, "Shrinking"), answering what it named. `.` and
+// `..` are not stored and cannot be removed (`Invalid`); a name not there is `NotFound`. The caller holds
+// the directory's lock.
+dir_remove[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, dir: u64, name: []const u8) -> Result[DirEntry, FsError]
+    if is_dot(name) || is_dotdot(name) then return Err(FsError.Invalid)
+    valid_name(name)?
+    val d = load_dir(fs, dir)?
+    val hh = name_hash(fs, name)
+    val v = visit(fs, d, name, hh)?
+    val i = v.found match
+        Some(i) -> i
+        None -> return Err(FsError.NotFound)
+    val vis = v.leaves[v.leaves.len() - 1]
+    val leaf = vis.leaf
+    val gone = DirEntry(leaf.names[i].ino, leaf.names[i].file_type)
+    var frees: Buf[Placed] = buf()
+    var clear: u32 = 0
+    if !d.indexed
+        // Rule 4 for a linear directory: its one leaf goes with its last name.
+        if leaf.names.len() == 1 then frees.push(Placed(0, leaf.phys)) else drop_in(fs, h, d, leaf, i)?
+    else if shrink(fs, h, d, vis.path, leaf, i, frees)?
+        // Rule 4: the last name is gone, every leaf and index block below the root with it.
+        frees.push(Placed(0, vis.path[0].phys))
+        clear = INODE_INDEXED
+    else
+        fix_mark(fs, h, d, hh)?
+        absorb(fs, h, d, frees)?
+    for p in frees.view()
+        free_block(fs, h, d, p, true)?
+    finish_change(fs, h, d, 0, clear)?
+    Ok(gone)
+
+// `dir_remove` in a handle of its own, under the directory's lock: the directory's half of an unlink.
+remove_name[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[DirEntry, FsError]
+    fs.plat.lock(LockId.Inode(dir))
+    var h = fs.start("remove name", C_INODE + C_DIR_DEL)
+    val r = dir_remove(fs, &h, dir, name)
+    fs.stop(&h)
+    fs.plat.unlock(LockId.Inode(dir))
+    r
+
+// Remove name `i` from `leaf` in place.
+private drop_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, leaf: Leaf, i: usize) -> Result[unit, FsError]
+    val id = declare_block(fs, h, leaf.phys)?
+    fs.plat.lock(LockId.Buffer(leaf.phys))
+    val bytes = fs.bytes(id)
+    drop_record(bytes, leaf.recs, leaf.rec_of[i])
+    seal_block(fs.seed, bytes)
+    fs.plat.unlock(LockId.Buffer(leaf.phys))
+    Ok(())
+
+// `leaf`'s names without name `i`.
+private without(leaf: Leaf, i: usize) -> Buf[DirName]
+    var out: Buf[DirName] = buf()
+    for k in 0..<leaf.names.len()
+        if k != i then out.push(leaf.names[k])
+    out
+
+private joined(a: Buf[DirName], b: Buf[DirName]) -> Buf[DirName]
+    var out: Buf[DirName] = buf()
+    out.extend(a.view())
+    out.extend(b.view())
+    out
+
+// Remove name `i` from `leaf` (at the end of `path`) under rules 1 and 2: a leaf left empty is freed and
+// its entry leaves its parent; else the leaf merges with its right sibling, or else its left one, when
+// their live bytes together fit in half a leaf; else the record is removed in place. True when the root
+// is left with no entries (the directory is empty: rule 4 is the caller's).
+private shrink[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, path: Buf[Hop], leaf: Leaf, i: usize, frees: Buf[Placed]) -> Result[bool, FsError]
+    val k = path.len() - 1
+    if leaf.names.len() == 1
+        frees.push(Placed(leaf.logical, leaf.phys))
+        val empty = drop_entry(fs, h, d, path, k, frees)?
+        if !empty then write_path(fs, h, d, path)?
+        return Ok(empty)
+    val rest = without(leaf, i)
+    val hop = path[k]
+    if hop.slot + 1 < hop.entries.len()
+        val right = read_leaf(fs, d, u64(hop.entries[hop.slot + 1].child))?
+        if names_bytes(rest) + names_bytes(right.names) <= LEAF_HALF
+            write_leaf(fs, h, d, leaf.phys, joined(rest, right.names))?
+            frees.push(Placed(right.logical, right.phys))
+            path.view()[k].slot = hop.slot + 1
+            drop_entry(fs, h, d, path, k, frees)?
+            write_path(fs, h, d, path)?
+            return Ok(false)
+    if hop.slot > 0
+        val left = read_leaf(fs, d, u64(hop.entries[hop.slot - 1].child))?
+        if names_bytes(rest) + names_bytes(left.names) <= LEAF_HALF
+            write_leaf(fs, h, d, left.phys, joined(left.names, rest))?
+            frees.push(Placed(leaf.logical, leaf.phys))
+            drop_entry(fs, h, d, path, k, frees)?
+            write_path(fs, h, d, path)?
+            return Ok(false)
+    drop_in(fs, h, d, leaf, i)?
+    Ok(false)
+
+// Take the entry the path follows out of index block `k` (rule 1): entry i > 0 simply goes, its range
+// joining entry i - 1's; when entry 0 goes, entry 1 takes its key, and so does the first entry of every
+// index block below entry 1 down to the leaves. An index block left with no entries is freed and leaves
+// its own parent the same way. True when the root is left with none.
+private drop_entry[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, path: Buf[Hop], k: usize, frees: Buf[Placed]) -> Result[bool, FsError]
+    var at = k
+    loop
+        val hop = path[at]
+        val old = hop.entries[hop.slot]
+        hop.entries.remove(hop.slot)
+        path.view()[at].dirty = true
+        if hop.entries.len() == 0
+            if at == 0 then return Ok(true)
+            frees.push(Placed(hop.logical, hop.phys))
+            path.view()[at].dirty = false
+            at -= 1
+        else
+            if hop.slot == 0
+                val moved = hop.entries[0]
+                hop.entries[0] = IndexEntry(old.key, moved.child, 0)
+                if hop.level > 0 then retag(fs, h, d, u64(moved.child), hop.level - 1, moved.key, old.key)?
+            return Ok(false)
+
+// Give the first entries down the spine from index block `l` (at `level`, entry 0 keyed `was`) the key
+// `key`.
+private retag[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, l: u64, level: u8, was: u64, key: u64) -> Result[unit, FsError]
+    var at = l
+    var lv = level
+    loop
+        val hop = read_hop(fs, d, at, i32(lv), was)?
+        val first = hop.entries[0]
+        hop.entries[0] = IndexEntry(key, first.child, 0)
+        write_hop(fs, h, d, hop)?
+        if lv == 0 then return Ok(())
+        at = u64(first.child)
+        lv -= 1
+
+// Keep the continuation mark honest after a name of hash `r` left (section 10): a key `r | 1` says the
+// leaf before it holds a name of hash `r`. If the first leaf that can hold `r` holds none and the next
+// leaf is keyed `r | 1`, that key becomes `r` — and so does every entry above it that it is the first of.
+private fix_mark[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, r: u64) -> Result[unit, FsError]
+    val path = probe(fs, d, r)?
+    val x = read_leaf(fs, d, u64(at_leaf(path).child))?
+    for nm in x.names.view()
+        if nm.hash == r then return Ok(())
+    if !next_leaf(fs, d, path)? then return Ok(())
+    if at_leaf(path).key != r | 1 then return Ok(())
+    var k = path.len() - 1
+    loop
+        val hop = path[k]
+        hop.entries[hop.slot] = IndexEntry(r, hop.entries[hop.slot].child, 0)
+        write_hop(fs, h, d, hop)?
+        if hop.slot != 0 || k == 0 then return Ok(())
+        k -= 1
+
+// Rule 3: a root with one entry whose child is an index block absorbs the child, one level fewer, for
+// as long as that holds.
+private absorb[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, frees: Buf[Placed]) -> Result[unit, FsError]
+    var root = read_hop(fs, d, 0, -1, 0)?
+    var changed = false
+    while root.level > 0 && root.entries.len() == 1
+        val e = root.entries[0]
+        val c = read_hop(fs, d, u64(e.child), i32(root.level) - 1, e.key)?
+        frees.push(Placed(c.logical, c.phys))
+        root = Hop(0, root.phys, c.level, root.max, c.entries, 0, true)
+        changed = true
+    if changed then write_hop(fs, h, d, root)?
+    Ok(())
+
+// -- readdir ------------------------------------------------------------------------------------------
+
+// What a listing has gathered: whole runs of one position, never part of one.
+private struct Lister
+    items: Buf[Listed]
+    used: usize
+    room: usize
+    run: Buf[Listed]
+    // Where the next call starts, once a run did not fit.
+    stopped: Option[u64]
+
+    add(*self, x: Listed)
+        if self.stopped.is_some() then return
+        if self.run.len() > 0 && self.run[0].pos != x.pos then self.flush()
+        if self.stopped.is_none() then self.run.push(x)
+
+    flush(*self)
+        if self.run.len() == 0 || self.stopped.is_some() then return
+        var need: usize = 0
+        for x in self.run.view()
+            need += dirent_size(x.name.len())
+        if self.used + need > self.room
+            self.stopped = Some(self.run[0].pos)
+        else
+            self.items.extend(self.run.view())
+            self.used += need
+        self.run.clear()
+
+private listed(name: []const u8, ino: u64, file_type: u8, pos: u64) -> Listed = Listed(copy_name(name), ino, file_type, pos, 0)
+
+// The entries of directory `dir` from position `pos` on (section 10, "readdir positions"), as many whole
+// runs as fit `room` bytes of `getdents64` records: `.` at 1, `..` at 2, then every name whose position
+// (its hash halved) is at least `pos`, in hash order. A run of one position is never cut: if the first
+// does not fit, `Invalid` (EINVAL).
+read_dir[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, pos: u64, room: usize) -> Result[Listing, FsError]
+    fs.plat.lock(LockId.Inode(dir))
+    val r = read_dir_locked(fs, dir, pos, room)
+    fs.plat.unlock(LockId.Inode(dir))
+    r
+
+private read_dir_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, pos: u64, room: usize) -> Result[Listing, FsError]
+    val d = load_dir(fs, dir)?
+    var ls = Lister(buf(), 0, room, buf(), None)
+    if pos <= DIR_POS_DOT then ls.add(listed(".".bytes, dir, DT_DIR, DIR_POS_DOT))
+    if pos <= DIR_POS_DOTDOT then ls.add(listed("..".bytes, d.parent, DT_DIR, DIR_POS_DOTDOT))
+    val from = if pos < DIR_POS_FIRST then DIR_POS_FIRST else pos
+    if from < DIR_POS_END && d.size != 0
+        if !d.indexed
+            for n in sorted(read_leaf(fs, d, 0)?.names).view()
+                if n.hash >> 1 >= from then ls.add(listed(n.name.view(), n.ino, n.file_type, n.hash >> 1))
+        else
+            val path = probe(fs, d, from << 1)?
+            var more = true
+            while more && ls.stopped.is_none()
+                for n in sorted(read_leaf(fs, d, u64(at_leaf(path).child))?.names).view()
+                    if n.hash >> 1 >= from then ls.add(listed(n.name.view(), n.ino, n.file_type, n.hash >> 1))
+                more = next_leaf(fs, d, path)?
+    ls.flush()
+    val next = ls.stopped match
+        Some(p) -> p
+        None -> DIR_POS_END
+    if ls.stopped.is_some() && ls.items.len() == 0 then return Err(FsError.Invalid)
+    for i in 0..<ls.items.len()
+        ls.items.view()[i].next = if i + 1 < ls.items.len() then ls.items[i + 1].pos else next
+    Ok(Listing(ls.items, next))

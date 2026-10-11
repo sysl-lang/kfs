@@ -60,6 +60,19 @@ const C_PUNCH_STEP: u32 = C_TRUNCATE_STEP + C_EXT + C_GROUP
 // Delete's last transaction: the inode's own block, its group's bitmap and descriptor, the orphan
 // list's predecessor (an inode or the superblock), and the xattr block's group.
 const C_DELETE_LAST: u32 = C_INODE + C_GROUP + C_INODE + C_GROUP
+// A directory's half of an operation (section 14, "Credits"): inserting a name walks an index path of
+// up to DIR_MAX_LEVELS blocks to a leaf and may add up to DIR_MAX_LEVELS + 1 blocks, each allocated and
+// mapped; removing one changes the path, the leaf and a sibling, and may free as many blocks, each
+// unmapped, with a revoke.
+const C_DIR_ADD: u32 = u32(DIR_MAX_LEVELS) + 1 + (u32(DIR_MAX_LEVELS) + 1) * C_ALLOC
+const C_DIR_DEL: u32 = u32(DIR_MAX_LEVELS) + 2 + (u32(DIR_MAX_LEVELS) + 1) * (C_GROUP + C_EXT) + 1
+
+// Directory positions (section 10, "readdir positions"): `.`, `..`, and the end; an entry's is its
+// hash halved, which lies between them.
+const DIR_POS_DOT: u64 = 1
+const DIR_POS_DOTDOT: u64 = 2
+const DIR_POS_FIRST: u64 = 4
+const DIR_POS_END: u64 = 0x7FFF_FFFF_FFFF_FFFF
 
 // The largest file: 2^32 blocks of 4 KiB, 16 TiB (section 3).
 const MAX_FILE_SIZE: u64 = LOGICAL_BLOCKS * 4096

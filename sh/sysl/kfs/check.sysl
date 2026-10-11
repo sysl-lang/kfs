@@ -23,13 +23,15 @@ import sysl.buf.{Buf, buf}
 //   a regular file (an inode on the orphan list is exempt: freeing those blocks is the work the list
 //   records); and the tail of a written last block zero from `size` on. A free inode's slot with a
 //   mode is a warning.
+// - **Pass 2** (checkdir.sysl) — every directory whose inode and tree pass 1 found sound: its blocks
+//   under section 10's rules, its names, and its index.
 // - **Pass 5** — each group's block bitmap against what it must be (metadata, the journal, the bits
 //   past the group's end, and the claimed blocks, nothing else), the inode bitmap against the slots in
 //   use, the descriptor's free counts, `directories` and both bitmap checksums, and the superblock's
 //   totals when `CLEAN` says they are exact. Then the orphan list from the superblock's head: every
 //   member an allocated inode with `ORPHAN`, no cycle, and no `ORPHAN` on an inode the list misses.
 //
-// Not yet checked, because nothing writes them yet: directories (stage 7), xattr blocks (stage 8).
+// Not yet checked, because nothing writes them yet: xattr blocks.
 
 enum Problem
     // Pass 0.
@@ -74,6 +76,26 @@ enum Problem
     OrphanCycle(ino: u64)
     // `ino` has `ORPHAN` and the list does not reach it.
     OrphanFlag(ino: u64)
+    // Pass 2: directory `ino`'s block at logical `block` fails a check of its own.
+    DirBlock(ino: u64, block: u64, fault: DirFault)
+    // A name in the leaf at `block` that is empty, holds `/` or NUL, or is `.` or `..`.
+    DirName(ino: u64, block: u64)
+    // A name naming inode `target`, which is reserved, past the last inode, or free.
+    DirTarget(ino: u64, target: u64)
+    // A name whose `file_type` is not inode `target`'s type.
+    DirType(ino: u64, target: u64)
+    // A name the directory holds twice.
+    DirDuplicate(ino: u64)
+    // A name in the leaf at `block` whose hash lies outside the leaf's range.
+    DirRange(ino: u64, block: u64)
+    // The leaf at `block` is keyed `h | 1` and the leaf before it holds no name of hash `h`.
+    DirMark(ino: u64, block: u64)
+    // A block the index reaches twice, or one the directory maps and nothing reaches.
+    DirReach(ino: u64, block: u64)
+    // The directory's shape: blocks without names, an empty leaf, a root of one entry over an index
+    // block, a linear directory with a block other than block 0, an unwritten extent, or a size that is
+    // not its blocks' end.
+    DirShape(ino: u64)
 
 struct Report
     problems: Buf[Problem]
@@ -123,6 +145,15 @@ describe(p: Problem) -> string
         Problem.BlockBitmapCrc(g) -> s"group $g's block bitmap fails its checksum"
         Problem.InodeBitmapCrc(g) -> s"group $g's inode bitmap fails its checksum"
         Problem.Totals -> "the superblock's free totals disagree with the descriptors"
+        Problem.DirBlock(i, b, _) -> s"directory $i's block $b breaks a rule of its own"
+        Problem.DirName(i, b) -> s"directory $i's block $b holds a name no directory may"
+        Problem.DirTarget(i, t) -> s"directory $i names inode $t, which is not an allocated ordinary inode"
+        Problem.DirType(i, t) -> s"directory $i's name for inode $t has the wrong file type"
+        Problem.DirDuplicate(i) -> s"directory $i holds a name twice"
+        Problem.DirRange(i, b) -> s"directory $i's leaf $b holds a name outside its range"
+        Problem.DirMark(i, b) -> s"directory $i's leaf $b is marked a continuation the leaf before it does not begin"
+        Problem.DirReach(i, b) -> s"directory $i's block $b is reached twice, or not at all"
+        Problem.DirShape(i) -> s"directory $i's blocks, size or flags do not agree"
 
 // Check the filesystem on `dev`.
 check[D: BlockDevice](dev: *D) -> Report
@@ -145,7 +176,7 @@ check[D: BlockDevice](dev: *D) -> Report
         rep.add(Problem.NeedsRecovery)
         audit_log(dev, sb, st, rep)
         return rep
-    var c = Checker(m, 0, 0, buf(), buf(), buf(), buf(), buf())
+    var c = Checker(m, 0, 0, buf(), buf(), buf(), buf(), buf(), buf(), buf())
     for _ in 0..<usize(sb.blocks)
         c.owner.push(0)
     for _ in 0..<m.geo.group_count
@@ -153,7 +184,9 @@ check[D: BlockDevice](dev: *D) -> Report
     for _ in 0..<(usize(sb.inode_count) + 1)
         c.allocated.push(false)
         c.flagged.push(false)
+        c.types.push(0)
     var failed = pass1(dev, &c, rep).is_err()
+    if !failed then failed = pass2(dev, &c, rep).is_err()
     if !failed then failed = pass5(dev, &c, rep).is_err()
     if failed then rep.add(Problem.Super(OpenError.Device(DeviceError.Io)))
     rep.inodes = c.inodes
@@ -162,7 +195,7 @@ check[D: BlockDevice](dev: *D) -> Report
 // What pass 1 leaves for pass 5: the filesystem, which inode claims each block (0 for none) and each
 // group's directories; the blocks the inode being walked has claimed so far and its extents, and the
 // inodes checked; and, by inode number, which are allocated and which carry `ORPHAN`.
-private struct Checker
+private[kfs] struct Checker
     m: Mounted
     count: u64
     inodes: u64
@@ -171,6 +204,28 @@ private struct Checker
     extents: Buf[ExtentLeaf]
     allocated: Buf[bool]
     flagged: Buf[bool]
+    // For pass 2: each sound inode's `DT_*` type by number (0 for none), and each directory pass 1
+    // found sound.
+    types: Buf[u8]
+    seen: Buf[DirSeen]
+
+// A directory for pass 2: its inode's fields and its extents.
+private[kfs] struct DirSeen
+    ino: u64
+    generation: u32
+    flags: u32
+    size: u64
+    extents: Buf[ExtentLeaf]
+
+// The `DT_*` value of an inode of type `t`.
+private dt_of(t: u16) -> u8
+    if t == S_IFREG then return DT_REG
+    if t == S_IFDIR then return DT_DIR
+    if t == S_IFLNK then return DT_LNK
+    if t == S_IFCHR then return DT_CHR
+    if t == S_IFBLK then return DT_BLK
+    if t == S_IFIFO then return DT_FIFO
+    DT_SOCK
 
 // -- Pass 0: the log ----------------------------------------------------------------------------------
 
@@ -238,6 +293,7 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
             c.allocated[usize(ino)] = true
             if ino == 1 || (ino >= 3 && ino < FIRST_INO) then continue
             c.inodes += 1
+            val problems_before = rep.problems.len()
             if !verify_inode(seed, ino, slot)
                 rep.add(Problem.InodeChecksum(ino))
                 continue
@@ -249,6 +305,7 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
                 rep.add(Problem.InodeMode(ino))
                 continue
             if t == S_IFDIR then c.dirs[usize(grp)] = c.dirs[usize(grp)] + 1
+            c.types[usize(ino)] = dt_of(t)
             val f = node.flags
             if f & ~(INODE_INLINE | INODE_INDEXED | INODE_ORPHAN) != 0 || (f & INODE_INLINE != 0 && t != S_IFLNK) || (f & INODE_INDEXED != 0 && t != S_IFDIR)
                 rep.add(Problem.InodeFlags(ino))
@@ -274,6 +331,11 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
                         continue
                     None -> ()
                 past_end(dev, c, rep, ino, node, t == S_IFREG)?
+                // Pass 2 judges only a directory pass 1 found sound.
+                if t == S_IFDIR && rep.problems.len() == problems_before
+                    var ex: Buf[ExtentLeaf] = buf()
+                    ex.extend(c.extents.view())
+                    c.seen.push(DirSeen(ino, node.generation, f, node.size, ex))
             if node.xattr_block != 0
                 claim(c, rep, node.xattr_block, ino)
                 c.count += 1

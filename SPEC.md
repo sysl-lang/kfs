@@ -681,7 +681,10 @@ Block 0 of an indexed directory is the **root**; deeper index blocks are **inter
 | 4080 | 16 | block tail | |
 
 An **index entry** is `key: u64` at 0, `child: u32` (a logical block of this directory) at 8,
-`reserved: u32` at 12. Entries are sorted by `key`, strictly increasing as unsigned 64-bit numbers.
+`reserved: u32` at 12. Entries are sorted by `key`, strictly increasing as unsigned 64-bit numbers —
+except that a continuation key `h | 1` may repeat: a run of one hash over three or more leaves keys every
+leaf after its first `h | 1` (below), and the order rule is then "each key above the one before, or equal
+to it with bit 0 set", across the whole index in key order.
 **The root's entry 0 has key 0; an interior block's entry 0 has the same key as the entry in its
 parent that points to it**, so every leaf's key is simply its entry's key in its own parent. The
 root's `level` + 1 is the number of index levels, at most `DIR_MAX_LEVELS`.
@@ -707,7 +710,9 @@ can span a leaf split, and it is precise:
   record fits (in a free record, in slack, or by splitting slack); else into the next leaf of the
   same run (key `h | 1`) that has room; else it splits the last leaf it visited.
 - **Split** a leaf: take its live entries plus the new one, ordered by hash. Let *s* be the first entry
-  whose cumulative live bytes reach half. If entries *s* − 1 and *s* have different hashes, split
+  whose cumulative live bytes reach half — precisely, the least *s* ≥ 1 for which the entries before
+  *s* hold at least half of all the live bytes, or the last entry when no *s* does (so the lower half is
+  never empty). If entries *s* − 1 and *s* have different hashes, split
   there: the new leaf gets entries *s* … and its key is `hash_s`. Otherwise move *s* to the nearest
   index (fewest entries moved, ties toward the end) where adjacent hashes differ and both halves fit; if
   there is none (every entry has one hash), split at *s* and the new key is `hash_s | 1`. The lower
@@ -715,6 +720,17 @@ can span a leaf split, and it is precise:
 - **Split** an index block: halves by count; the new block's key in the parent is its first entry's
   key, mark and all (which its entry 0 keeps). A full root moves its entries into a new index block and becomes a single entry
   pointing to it, one level higher; past `DIR_MAX_LEVELS`, insert answers `ENOSPC`.
+
+(Stage 7.) "Both halves fit" means each holds at most the 4072 bytes of a leaf's record area. An insert
+tries the leaves it visited in key order — the probed leaf, then each next one keyed `h | 1` — and takes
+the first with room. A split counts the blocks it needs before it changes anything — the new leaf, one
+for each index block on the path that overflows, two for a full root (the new block the root moves into
+overflows at once, so it is split at once: the lower half, keeping key 0, and the upper) — then allocates
+and maps them all; `ENOSPC`, for space or for a root already at `DIR_MAX_LEVELS`, leaves the directory
+exactly as it was (blocks already mapped are given back). An index block halves with the lower half the
+larger. Insert answers `EEXIST` for `.` and `..`, which always exist; removal answers `EINVAL` for them.
+A stored name is 1 … 255 bytes without `/` or NUL: an empty one is `EINVAL`, a longer one
+`ENAMETOOLONG`.
 
 **Converting** a linear directory: when an entry will not fit in block 0, two new leaves are
 allocated, the entries (and the new one) are split between them by the rule above, block 0 is
@@ -737,6 +753,21 @@ Removing an entry may shrink the directory, in the same transaction:
 
 Holes in a directory are never visited: lookup and `readdir` follow the index, not block order.
 
+(Stage 7.) Rule 2 is tried for the leaf the entry left when it is not empty: with its right sibling
+first, else with its left sibling (the leaf's records then move into the left one, and the leaf is
+freed); "half a leaf" is 2036 live bytes, so 2032 merge and 2040 do not. In a linear directory rule 4
+frees block 0 with its last name. A directory's `size` is always its blocks' end: the end of its last
+mapped block. The blocks a removal empties are freed last, after every block that stays is written, and
+with the reserve's right (uid 0): freeing a block inside an extent splits the extent, and a removal must
+not fail for want of a node.
+
+**The mark stays honest.** A key `h | 1` says the leaf before it in key order holds a name of hash `h` —
+a split sets it only so — and a removal keeps that true: when the first leaf that can hold `h` (the probe
+for `h`) holds no name of hash `h` any more and the next leaf is keyed `h | 1`, that key becomes `h`, and so
+does every entry above it of which it is the first. (The run may also have stopped continuing into the
+marked leaf while the leaf before still holds `h`; that mark is harmless — lookup scans one leaf more — and
+stays.)
+
 ### readdir positions
 
 `getdents64` reports, and `lseek` accepts, a **position** per entry: `.` is at 1, `..` at 2, and an
@@ -750,6 +781,13 @@ for a whole scan is returned **exactly once**; one added or removed during it ma
 names with one hash share a position, so **one `getdents64` call never ends between them**; if their
 whole run does not fit the caller's buffer the call answers `EINVAL` (with a keyed 64-bit hash, a run
 longer than one is a chance of 2⁻⁶³ per pair).
+
+(Stage 7.) A call answers whole runs while they fit its buffer, each record Linux's `linux_dirent64` (19
+bytes, the name and its NUL, rounded up to 8); the first run that does not fit ends the call, whose next
+position is that run's — so a call resumed there answers the run whole — and `EINVAL` only when it is the
+call's first. `.` and `..` are runs of their own; `..`'s `d_off` is the first name's position, or the end
+in an empty directory. Every name of a run but the last has the run's own position as its `d_off`. A
+position past the end answers nothing.
 
 **Pedagogical notes.** Linear search is fine for a few dozen names and hopeless for a million; the
 hash index turns lookup into one block per level. Hashing makes a directory order-free, which is why
@@ -1647,6 +1685,13 @@ names unique in the directory. Indexed directories: block 0 is a root; `level`s 
 sorted, the root's entry 0's key 0 and every interior block's entry 0's key its parent entry's; every leaf's hashes lie in its range by the rule of section 10 (the
 continuation mark set exactly where a run is split); every leaf and index block reachable exactly once;
 no block of the directory unreachable. Linear directories: one leaf, block 0. Empty: no blocks.
+(Stage 7: "the continuation mark set exactly where a run is split" is checked as section 10 keeps it —
+every leaf's hashes inside `[key & ~1, next & ~1]`, closed above only when the next key is marked, which
+makes a mark necessary wherever a run is split; and a marked key `h | 1` only after a leaf holding a name
+of hash `h`. Also: a free record (`ino` 0) only first; no empty leaf; no root above level 0 with one
+entry; no unwritten extent; `size` the blocks' end; an empty directory without `INDEXED`. A leaf that
+fails its own checks is reported and the walk goes on with the next; an index block that fails ends the
+directory's walk. Names are hashed with the superblock's seed, so the checker's hash is the writer's.)
 
 **Pass 3 — connectivity.** Every directory is reached from the root by exactly one name; its `parent`
 names the directory that holds that name; the root's `parent` is itself; no cycles. With `-y`: a
@@ -1932,6 +1977,11 @@ directory accepts entries again; thousands of alternating inserts and removals a
 `readdir` while inserting and removing returns every untouched name exactly once; a collision run that
 does not fit the buffer answers `EINVAL`; leaf and index blocks with a bad checksum, wrong magic, or
 another directory's owner are refused.
+(Stage 7: the hook takes up to four forced raw values and gives a name the one its last byte picks,
+modulo how many there are — one value makes every name collide, two alternate. A test's index blocks may
+have a smaller `max` (`Fs.index_max`, at least 2), so three levels come within a few hundred names. The
+directory operations here are the directory's half of the namespace operations: add a name, remove a
+name, look one up, list — stage 8 builds create, link, unlink and rename on them.)
 
 ### Stage 8 — Namespace operations
 

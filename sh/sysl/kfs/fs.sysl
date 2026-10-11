@@ -58,6 +58,8 @@ enum Corruption
     // The orphan list (section 16) reaches `ino`, which is out of range, free, without `ORPHAN`, or
     // already on the list (a cycle).
     OrphanList(ino: u64)
+    // Directory `ino`'s block at logical `block` breaks a rule of section 10.
+    Directory(ino: u64, block: u64, fault: DirFault)
 
 // What is wrong with an extent-tree node (section 9).
 enum NodeFault
@@ -99,6 +101,14 @@ enum FsError
     Invalid
     // EROFS: the filesystem was mounted read-only, or its journal has aborted.
     ReadOnly
+    // EEXIST: the name is already in the directory (`.` and `..` always are).
+    Exists
+    // ENOENT: the name is not in the directory.
+    NotFound
+    // ENAMETOOLONG: a name past NAME_MAX bytes.
+    NameTooLong
+    // ENOTDIR: a directory operation on an inode that is not a directory.
+    NotDirectory
 
 impl From[DeviceError] for FsError
     from(e: DeviceError) -> FsError = FsError.Device(e)
@@ -174,6 +184,9 @@ struct Fs[D: BlockDevice, P: Platform]
     // The `max` new extent-tree node blocks are written with: the capacity, or less on a test's RAM disk
     // (section 9, "`max` may be smaller than the capacity").
     node_max: u16
+    // The `max` new directory index blocks are written with: DIR_INDEX_SLOTS, or less on a test's RAM disk
+    // (section 10, "`max` ... tests may use less").
+    index_max: u16
 
     // -- Buffers -------------------------------------------------------------------------------------
 
@@ -502,7 +515,7 @@ mount[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D, P], FsError
         groups.push(GroupState(buf(), 0, false, false))
     var p = plat
     if !read_only then m.sb = set_state_directly(dev, 0, STATE_CLEAN, Some(p.now().sec))?
-    var fs = Fs(dev, p, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, new_journal(st, read_only, m.sb.max_transaction), buf(), 0, u16(EXTENT_NODE_SLOTS))
+    var fs = Fs(dev, p, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, new_journal(st, read_only, m.sb.max_transaction), buf(), 0, u16(EXTENT_NODE_SLOTS), u16(DIR_INDEX_SLOTS))
     // Then the orphan list (section 16), in ordinary transactions. A list that breaks its rules aborts
     // the journal: the filesystem is mounted read-only, and fsck repairs it.
     if !read_only

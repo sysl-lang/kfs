@@ -16,18 +16,24 @@ hash_of_raw(raw: u64) -> u64
     if even > HASH_MAX then return HASH_MAX
     even
 
-// The test hook: while set, `dir_hash` ignores the name and the key and treats `forced_raw` as the raw
-// SipHash value, which is how a test reaches the clamp's edges and makes two different names collide.
-// Tests set it and clear it again; nothing else does.
-private var forced: bool = false
-private var forced_raw: u64 = 0
+// The test hook: while set, `dir_hash` ignores the key and treats one of up to four forced values as
+// the raw SipHash value — the one its name's last byte picks, modulo how many there are — which is how
+// a test reaches the clamp's edges and makes different names collide, all on one hash or on several
+// alternating. Tests set it and clear it again; nothing else does.
+private var forced: usize = 0
+private var forced_raw: [4]u64 = [0, 0, 0, 0]
 
 force_raw_hash(raw: u64)
-    forced_raw = raw
-    forced = true
+    forced_raw[0] = raw
+    forced = 1
+
+force_raw_hashes(values: []const u64)
+    for i in 0..<values.len
+        forced_raw[i] = values[i]
+    forced = values.len
 
 clear_raw_hash()
-    forced = false
+    forced = 0
 
 // The 16-byte seed's two key words.
 seed_k0(seed: []const u8) -> u64 = le64(seed, 0)
@@ -35,7 +41,9 @@ seed_k1(seed: []const u8) -> u64 = le64(seed, 8)
 
 // `hash(name)` under the filesystem's `hash_seed`.
 dir_hash(seed: []const u8, name: []const u8) -> u64
-    if forced then return hash_of_raw(forced_raw)
+    if forced > 0
+        val pick = if name.len == 0 then 0 else usize(name[name.len - 1]) % forced
+        return hash_of_raw(forced_raw[pick])
     hash_of_raw(siphash13(seed_k0(seed), seed_k1(seed), name))
 
 // A little-endian integer at `at` in `bytes`.
