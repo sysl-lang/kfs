@@ -1,0 +1,173 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The crash-injection device of kfs/SPEC.md section 27: any `BlockDevice` wrapped so that the power
+// fails at a chosen write, in one of the three ways section 2's device model allows.
+//
+// - **Drop after N**: writes 1 ... N persist; the power fails at write N + 1, which is lost with every
+//   write after it.
+// - **Tear the Nth**: write N persists only the sectors in a mask (bit k is sector k), the rest keep
+//   their old bytes; the power fails there.
+// - **Reorder at N**: write N is issued, then the power fails, and of the writes since the last flush —
+//   N among them — a seeded subset is lost. A block written twice since the flush ends as its last
+//   surviving write, or as it was at the flush if none survived.
+//
+// Counting starts at `arm`, so a test can mount and prepare without spending crash points. Once the
+// power has failed every read, write and flush answers `Io`, so the code above stops where a real
+// machine would; `disarm` turns the power back on with the device as the crash left it.
+//
+// **Rewinding.** From `mark` on, the device keeps the first-touched bytes of every block written
+// through it (crash or not), and `rewind` puts them back: the every-write loop runs the same operation
+// from the same image once per crash point without copying the image.
+
+enum CrashMode
+    Off
+    DropAfter(n: u64)
+    Tear(n: u64, sectors: u8)
+    Reorder(n: u64, seed: u64)
+
+struct CrashDevice[D: BlockDevice]
+    inner: *D
+    // The plan `arm` puts into effect, and whether it is in effect.
+    plan: CrashMode
+    armed: bool
+    crashed: bool
+    // Writes counted since `arm`.
+    counted: u64
+    // Writes the crash lost (for a reorder: those of the subset; for a tear: 1).
+    lost: u64
+    private undo_blocks: Buf[u64]
+    private undo_data: Buf[u8]
+    // Every write since the last flush, in order, and each touched block's bytes as of that flush.
+    private since_blocks: Buf[u64]
+    private since_data: Buf[u8]
+    private flushed_blocks: Buf[u64]
+    private flushed_data: Buf[u8]
+
+    // Start keeping what `rewind` needs, forgetting anything kept before.
+    mark(*self)
+        self.undo_blocks.clear()
+        self.undo_data.clear()
+
+    // Put back every block written since `mark`, and turn the power on with no plan.
+    rewind(*self) -> Result[unit, DeviceError]
+        for i in 0..<self.undo_blocks.len()
+            self.inner.write(self.undo_blocks[i], self.undo_data.view()[i * BLOCK_SIZE..<(i + 1) * BLOCK_SIZE])?
+        self.mark()
+        self.disarm()
+        self.plan = CrashMode.Off
+        Ok(())
+
+    // Put the plan into effect: count writes from here.
+    arm(*self)
+        self.armed = true
+        self.crashed = false
+        self.counted = 0
+        self.lost = 0
+        self.forget_since_flush()
+
+    // Power back on: no plan in effect, the device as the crash left it.
+    disarm(*self)
+        self.armed = false
+        self.crashed = false
+        self.forget_since_flush()
+
+    private forget_since_flush(*self)
+        self.since_blocks.clear()
+        self.since_data.clear()
+        self.flushed_blocks.clear()
+        self.flushed_data.clear()
+
+    // Write through, keeping what rewinding and reordering need.
+    private put(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+        if !touched(self.undo_blocks, b) || !touched(self.flushed_blocks, b)
+            var old = block_buf()
+            self.inner.read(b, old.view())?
+            if !touched(self.undo_blocks, b)
+                self.undo_blocks.push(b)
+                self.undo_data.extend(old.view())
+            if !touched(self.flushed_blocks, b)
+                self.flushed_blocks.push(b)
+                self.flushed_data.extend(old.view())
+        self.since_blocks.push(b)
+        self.since_data.extend(data)
+        self.inner.write(b, data)
+
+    // The power fails after a reorder: every block touched since the flush goes back to its bytes at
+    // the flush, then the writes that survive are applied again in order.
+    private reorder_loss(*self, seed: u64) -> Result[unit, DeviceError]
+        var x = seed * 0x9E37_79B9_7F4A_7C15 + 0x2545_F491_4F6C_DD1D
+        var keep: Buf[bool] = buf()
+        for _ in 0..<self.since_blocks.len()
+            x = x * 6364136223846793005 + 1442695040888963407
+            val survives = (x >> 63) == 1
+            keep.push(survives)
+            if !survives then self.lost += 1
+        for i in 0..<self.flushed_blocks.len()
+            self.inner.write(self.flushed_blocks[i], self.flushed_data.view()[i * BLOCK_SIZE..<(i + 1) * BLOCK_SIZE])?
+        for i in 0..<self.since_blocks.len()
+            if keep[i]
+                self.inner.write(self.since_blocks[i], self.since_data.view()[i * BLOCK_SIZE..<(i + 1) * BLOCK_SIZE])?
+        Ok(())
+
+    private fail(*self) -> Result[unit, DeviceError]
+        self.crashed = true
+        Err(DeviceError.Io)
+
+private touched(xs: Buf[u64], b: u64) -> bool
+    for x in xs.view()
+        if x == b then return true
+    false
+
+crash_device[D: BlockDevice](inner: *D) -> CrashDevice[D]
+    CrashDevice(inner, CrashMode.Off, false, false, 0, 0, buf(), buf(), buf(), buf(), buf(), buf())
+
+impl[D: BlockDevice] BlockDevice for CrashDevice[D]
+    blocks(self) -> u64 = self.inner.blocks()
+
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
+        if self.crashed then return Err(DeviceError.Io)
+        self.inner.read(b, out)
+
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+        if self.crashed then return Err(DeviceError.Io)
+        if data.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        if !self.armed then return self.put(b, data)
+        self.counted += 1
+        val n = self.counted
+        self.plan match
+            CrashMode.Off -> self.put(b, data)
+            CrashMode.DropAfter(last) ->
+                if n > last
+                    self.lost += 1
+                    return self.fail()
+                self.put(b, data)
+            CrashMode.Tear(at, sectors) ->
+                if n < at then return self.put(b, data)
+                if n > at then return self.fail()
+                var torn = block_buf()
+                self.inner.read(b, torn.view())?
+                for k in 0..<SECTORS_PER_BLOCK
+                    if (sectors >> u8(k)) & 1 == 1
+                        for i in k * SECTOR_SIZE..<(k + 1) * SECTOR_SIZE
+                            torn[i] = data[i]
+                self.put(b, torn.view())?
+                self.lost = 1
+                self.fail()
+            CrashMode.Reorder(at, seed) ->
+                if n < at then return self.put(b, data)
+                if n > at then return self.fail()
+                self.put(b, data)?
+                self.reorder_loss(seed)?
+                self.fail()
+
+    flush(*self) -> Result[unit, DeviceError]
+        if self.crashed then return Err(DeviceError.Io)
+        self.since_blocks.clear()
+        self.since_data.clear()
+        self.flushed_blocks.clear()
+        self.flushed_data.clear()
+        self.inner.flush()
+
+    override has_flush(self) -> bool = self.inner.has_flush()

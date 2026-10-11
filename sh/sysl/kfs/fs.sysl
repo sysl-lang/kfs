@@ -316,10 +316,11 @@ struct Fs[D: BlockDevice, P: Platform]
     // it; a host test playing that thread calls it between its simulated operations.
     journal_step(*self) -> Result[bool, FsError] = committer_step(self)
 
-    // The committer's timer: commit the running transaction when it has been open `COMMIT_INTERVAL`.
+    // The committer's timer: commit the running transaction when it has been open `COMMIT_INTERVAL`
+    // (and do whatever else the committer can).
     tick(*self) -> Result[unit, FsError]
-        val _ = committer_step(self)?
-        Ok(())
+        loop
+            if !committer_step(self)? then return Ok(())
 
     // The commit callback: transaction `seq` is durable, so the blocks it freed (and any older
     // transaction's) become allocatable and count in the total again.

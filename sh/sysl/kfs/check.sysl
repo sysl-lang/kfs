@@ -1,0 +1,360 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The checker: `fsck.kfs`'s read-only half (kfs/SPEC.md sections 23 and 27), over a block device and
+// nothing else — it shares no state with a mounted `Fs`, only the format's codecs, so it can disagree
+// with the code that wrote the image. It reports every problem it finds in one run and writes nothing.
+//
+// The passes so far, each with the checks for what exists at this stage (later stages add theirs):
+//
+// - **Pass 0** — the superblock and every descriptor (`open`: checksums, magic, version, geometry,
+//   locations), unknown features, `ERROR`, the journal superblock and its `error`. A log that is not
+//   empty needs recovery, which is the repairing half's: it is reported, the log is audited (every
+//   block the scan takes for a header begins with the journal magic, every copy in the scanned region
+//   does not — escaping — and agrees with its tag), and the passes over the home blocks are skipped,
+//   since those are not yet what the log says they are.
+// - **Pass 1** — every inode whose bitmap bit is set, but 1 and 3-10: its checksum, a valid type and
+//   permission bits, flags valid for the type, `parent` only for directories, devices, FIFOs and
+//   sockets without size or blocks, an inline symlink's size; its extent tree under every rule of
+//   section 9 (the same rules stage 4's test oracle checks); every block it claims, a block claimed
+//   twice being a problem; and `blocks` against what it claims. A free inode's slot with a mode is a
+//   warning.
+// - **Pass 5** — each group's block bitmap against what it must be (metadata, the journal, the bits
+//   past the group's end, and the claimed blocks, nothing else), the inode bitmap against the slots in
+//   use, the descriptor's free counts, `directories` and both bitmap checksums, and the superblock's
+//   totals when `CLEAN` says they are exact.
+//
+// Not yet checked, because nothing writes them yet: a written extent past `ceil(size / 4096)` and the
+// zeroed tail (stage 6), directories (stage 7), the orphan list (stage 6), xattr blocks (stage 8).
+
+enum Problem
+    // Pass 0.
+    Super(why: OpenError)
+    Features
+    ErrorState
+    Journal(why: OpenError)
+    JournalError(errno: u32)
+    NeedsRecovery
+    // A log position where the scan and the journal magic disagree, or a copy that fails its tag.
+    LogAudit(pos: u32)
+    // Pass 1.
+    InodeChecksum(ino: u64)
+    InodeMode(ino: u64)
+    InodeFlags(ino: u64)
+    InodeParent(ino: u64)
+    InodeSize(ino: u64)
+    Extent(ino: u64, block: u64, fault: NodeFault)
+    DoubleClaim(block: u64, ino: u64)
+    BlockCount(ino: u64, recorded: u64, counted: u64)
+    // A warning: a free inode's slot holds a mode.
+    FreeInodeInUse(ino: u64)
+    // Pass 5.
+    BlockBit(block: u64, should_be_set: bool)
+    InodeBit(ino: u64, should_be_set: bool)
+    FreeBlocks(group: u32)
+    FreeInodes(group: u32)
+    Directories(group: u32)
+    BlockBitmapCrc(group: u32)
+    InodeBitmapCrc(group: u32)
+    Totals
+
+struct Report
+    problems: Buf[Problem]
+    warnings: Buf[Problem]
+    // Every block an inode claims (extent-tree nodes, data, the xattr block), in the order found.
+    claimed: Buf[u64]
+    // How many inodes pass 1 checked.
+    inodes: u64
+
+    clean(self) -> bool = self.problems.len() == 0
+
+    private add(self, p: Problem)
+        self.problems.push(p)
+
+// A problem in words, for a report.
+describe(p: Problem) -> string
+    p match
+        Problem.Super(_) -> "the superblock or a descriptor fails its check"
+        Problem.Features -> "unknown features"
+        Problem.ErrorState -> "the superblock has ERROR set"
+        Problem.Journal(_) -> "the journal superblock fails its check"
+        Problem.JournalError(e) -> s"the journal recorded error $e"
+        Problem.NeedsRecovery -> "the log is not empty: recovery has not run"
+        Problem.LogAudit(pos) -> s"log block $pos disagrees with the scan"
+        Problem.InodeChecksum(i) -> s"inode $i fails its checksum"
+        Problem.InodeMode(i) -> s"inode $i has an invalid mode"
+        Problem.InodeFlags(i) -> s"inode $i has flags invalid for its type"
+        Problem.InodeParent(i) -> s"inode $i has a parent and is not a directory, or is a directory without one"
+        Problem.InodeSize(i) -> s"inode $i has a size or blocks its type does not allow"
+        Problem.Extent(i, b, _) -> s"inode $i's extent tree breaks a rule at block $b"
+        Problem.DoubleClaim(b, i) -> s"block $b is claimed twice, the second time by inode $i"
+        Problem.BlockCount(i, r, c) -> s"inode $i records $r blocks and claims $c"
+        Problem.FreeInodeInUse(i) -> s"free inode $i has a mode"
+        Problem.BlockBit(b, want) -> s"block $b's bitmap bit should be $want"
+        Problem.InodeBit(i, want) -> s"inode $i's bitmap bit should be $want"
+        Problem.FreeBlocks(g) -> s"group $g's free block count disagrees with its bitmap"
+        Problem.FreeInodes(g) -> s"group $g's free inode count disagrees with its bitmap"
+        Problem.Directories(g) -> s"group $g's directory count is wrong"
+        Problem.BlockBitmapCrc(g) -> s"group $g's block bitmap fails its checksum"
+        Problem.InodeBitmapCrc(g) -> s"group $g's inode bitmap fails its checksum"
+        Problem.Totals -> "the superblock's free totals disagree with the descriptors"
+
+// Check the filesystem on `dev`.
+check[D: BlockDevice](dev: *D) -> Report
+    var rep = Report(buf(), buf(), buf(), 0)
+    val m = open(dev) match
+        Ok(m) -> m
+        Err(e) ->
+            rep.add(Problem.Super(e))
+            return rep
+    val sb = m.sb
+    if sb.feature_incompat != 0 || sb.feature_ro_compat != 0 then rep.add(Problem.Features)
+    if sb.state & STATE_ERROR != 0 then rep.add(Problem.ErrorState)
+    val st = read_journal_super(dev, sb) match
+        Ok(s) -> s
+        Err(e) ->
+            rep.add(Problem.Journal(e))
+            return rep
+    if st.error != 0 then rep.add(Problem.JournalError(st.error))
+    if st.start != 0
+        rep.add(Problem.NeedsRecovery)
+        audit_log(dev, sb, st, rep)
+        return rep
+    var c = Checker(m, 0, buf(), buf(), buf())
+    for _ in 0..<usize(sb.blocks)
+        c.owner.push(0)
+    for _ in 0..<usize(sb.inode_count)
+        c.used.push(false)
+    for _ in 0..<m.geo.group_count
+        c.dirs.push(0)
+    var failed = pass1(dev, &c, rep).is_err()
+    if !failed then failed = pass5(dev, &c, rep).is_err()
+    if failed then rep.add(Problem.Super(OpenError.Device(DeviceError.Io)))
+    rep
+
+// What pass 1 leaves for pass 5: the filesystem, which inode claims each block (0 for none), which
+// inode slots hold a mode, and each group's directories; and the blocks the inode being walked has
+// claimed so far.
+private struct Checker
+    m: Mounted
+    count: u64
+    owner: Buf[u64]
+    used: Buf[bool]
+    dirs: Buf[u32]
+
+// -- Pass 0: the log ----------------------------------------------------------------------------------
+
+private begins_with_magic(b: []u8) -> bool = le32(b, 0) == JOURNAL_MAGIC
+
+private audit_log[D: BlockDevice](dev: *D, sb: Superblock, st: JournalState, rep: Report)
+    val sc = scan_log(dev, sb, st) match
+        Ok(s) -> s
+        Err(_) ->
+            rep.add(Problem.LogAudit(st.start))
+            return
+    val jb = sb.journal_blocks
+    var blk = block_buf()
+    var copy = block_buf()
+    for t in sc.txns.view()
+        var pos = t.first
+        while pos != t.commit
+            if dev.read(sb.journal_start + u64(pos), blk.view()).is_err()
+                rep.add(Problem.LogAudit(pos))
+                return
+            val h: *JournalHeader = at(blk.view(), 0)
+            if h.kind == JOURNAL_DESCRIPTOR
+                val d: *DescriptorHeader = at(blk.view(), 0)
+                for i in 0..<usize(d.count)
+                    val cp = log_advance(jb, pos, u32(i) + 1)
+                    if dev.read(sb.journal_start + u64(cp), copy.view()).is_err() || begins_with_magic(copy.view()) || !verify_tag(sb.csum_seed, t.seq, tag_at(blk.view(), i), copy.view())
+                        rep.add(Problem.LogAudit(cp))
+                pos = log_advance(jb, pos, 1 + d.count)
+            else
+                pos = log_advance(jb, pos, 1)
+
+// -- Pass 1 -------------------------------------------------------------------------------------------
+
+private valid_type(t: u16) -> bool
+    t == S_IFREG || t == S_IFDIR || t == S_IFLNK || t == S_IFCHR || t == S_IFBLK || t == S_IFIFO || t == S_IFSOCK
+
+// Whether `first`, `len` blocks are data blocks of one group, clear of the journal.
+private data_run(m: Mounted, first: u64, len: u64) -> bool
+    val g = m.geo
+    if first == 0 || len == 0 || first + len > g.blocks then return false
+    val grp = u32((first - 1) / u64(g.blocks_per_group))
+    if first < g.data_start(grp) || first + len > g.group_end(grp) then return false
+    !(first < g.journal_start + u64(g.journal_blocks) && g.journal_start < first + len)
+
+private claim(c: *Checker, rep: Report, b: u64, ino: u64)
+    rep.claimed.push(b)
+    if c.owner[usize(b)] != 0 then rep.add(Problem.DoubleClaim(b, ino)) else c.owner[usize(b)] = ino
+
+private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit, DeviceError]
+    val g = c.m.geo
+    val seed = c.m.seed
+    var ibm = block_buf()
+    var table = block_buf()
+    for grp in 0..<g.group_count
+        dev.read(g.inode_bitmap(grp), ibm.view())?
+        for i in 0..<g.inodes_per_group
+            if i % 16 == 0 then dev.read(g.inode_table(grp) + u64(i / 16), table.view())?
+            val ino = u64(grp) * u64(g.inodes_per_group) + u64(i) + 1
+            val off = usize(i % 16) * INODE_SIZE
+            val slot = table.view()[off..<off + INODE_SIZE]
+            val node: *Inode = at(table.view(), off)
+            if node.mode != 0 then c.used[usize(ino - 1)] = true
+            if !bit_test(ibm.view(), usize(i))
+                if node.mode != 0 then rep.warnings.push(Problem.FreeInodeInUse(ino))
+                continue
+            if ino == 1 || (ino >= 3 && ino < FIRST_INO) then continue
+            rep.inodes += 1
+            if !verify_inode(seed, ino, slot)
+                rep.add(Problem.InodeChecksum(ino))
+                continue
+            val t = node.mode & S_IFMT
+            if !valid_type(t) || node.mode & ~(S_IFMT | 0o7777) != 0
+                rep.add(Problem.InodeMode(ino))
+                continue
+            if t == S_IFDIR then c.dirs[usize(grp)] = c.dirs[usize(grp)] + 1
+            val f = node.flags
+            if f & ~(INODE_INLINE | INODE_INDEXED | INODE_ORPHAN) != 0 || (f & INODE_INLINE != 0 && t != S_IFLNK) || (f & INODE_INDEXED != 0 && t != S_IFDIR)
+                rep.add(Problem.InodeFlags(ino))
+                continue
+            if (t == S_IFDIR) != (node.parent != 0) then rep.add(Problem.InodeParent(ino))
+            val special = t == S_IFCHR || t == S_IFBLK || t == S_IFIFO || t == S_IFSOCK
+            if special && (node.size != 0 || node.blocks != 0) then rep.add(Problem.InodeSize(ino))
+            if t == S_IFLNK && f & INODE_INLINE != 0 && (node.size == 0 || node.size > u64(SYMLINK_INLINE_MAX)) then rep.add(Problem.InodeSize(ino))
+            c.count = 0
+            if t == S_IFREG || t == S_IFDIR || (t == S_IFLNK && f & INODE_INLINE == 0)
+                val head: *NodeHeader = at(table.view(), off + 112)
+                var fault: Option[Problem] = None
+                if head.magic != EXTENT_MAGIC || head.max == 0 || usize(head.max) > EXTENT_ROOT_SLOTS || head.count > head.max || !reserved_zero(head)
+                    fault = Some(Problem.Extent(ino, 0, if head.magic != EXTENT_MAGIC then NodeFault.Magic else NodeFault.Header))
+                else if usize(head.depth) > EXTENT_MAX_DEPTH || (head.depth > 0 && head.count == 0)
+                    fault = Some(Problem.Extent(ino, 0, if head.depth > 0 && head.count == 0 then NodeFault.Header else NodeFault.Depth))
+                else
+                    fault = walk_node(dev, c, rep, ino, node.generation, table.view(), off + 112, 0, LOGICAL_BLOCKS)?
+                fault match
+                    Some(p) ->
+                        rep.add(p)
+                        continue
+                    None -> ()
+            if node.xattr_block != 0
+                claim(c, rep, node.xattr_block, ino)
+                c.count += 1
+            if node.blocks != c.count then rep.add(Problem.BlockCount(ino, node.blocks, c.count))
+    Ok(())
+
+private reserved_zero(head: *NodeHeader) -> bool
+    for k in 0..<6
+        if head.reserved[k] != 0 then return false
+    true
+
+private entry_at(bytes: []u8, base: usize, i: usize) -> ExtentLeaf
+    val p: *ExtentLeaf = at(bytes, base + sizeof(NodeHeader) + i * sizeof(ExtentLeaf))
+    *p
+
+// The entries of the node at `base` in `bytes` (its header already checked), which its parent allows
+// [lo, hi): section 9's rules for each entry, then each child read and checked in turn. Claims every
+// block, counting them in `counted`; answers the first fault.
+//
+// A fault in a node's own entries is answered naming block 0; its parent renames it to the node's block
+// (`named`), so the root's faults name 0 and every other node's its own block.
+private walk_node[D: BlockDevice](dev: *D, c: *Checker, rep: Report, ino: u64, generation: u32, bytes: []u8, base: usize, lo: u64, hi: u64) -> Result[Option[Problem], DeviceError]
+    val head: *NodeHeader = at(bytes, base)
+    val depth = head.depth
+    val count = usize(head.count)
+    val leaf = depth == 0
+    var entries: Buf[ExtentLeaf] = buf()
+    for i in 0..<count
+        entries.push(entry_at(bytes, base, i))
+    for i in 0..<count
+        val e = entries[i]
+        var bad: Option[NodeFault] = None
+        if leaf
+            if e.len == 0 || u32(e.len) > EXTENT_MAX_LEN || e.flags & ~EXTENT_UNWRITTEN != 0 || !data_run(c.m, e.physical, u64(e.len))
+                bad = Some(NodeFault.Entry)
+        else
+            if e.len != 0 || e.flags != 0 || !data_run(c.m, e.physical, 1) then bad = Some(NodeFault.Entry)
+        if bad.is_none() && i > 0
+            val prev = entries[i - 1]
+            if e.logical <= prev.logical || (leaf && u64(prev.logical) + u64(prev.len) > u64(e.logical)) then bad = Some(NodeFault.Order)
+        if bad.is_none()
+            if u64(e.logical) < lo || (leaf && u64(e.logical) + u64(e.len) > hi) || (!leaf && u64(e.logical) >= hi) then bad = Some(NodeFault.Range)
+        bad match
+            Some(f) -> return Ok(Some(Problem.Extent(ino, 0, f)))
+            None -> ()
+    for i in 0..<count
+        val e = entries[i]
+        if leaf
+            for k in 0..<u64(e.len)
+                claim(c, rep, e.physical + k, ino)
+            c.count += u64(e.len)
+        else
+            claim(c, rep, e.physical, ino)
+            c.count += 1
+            val child_hi = if i + 1 < count then u64(entries[i + 1].logical) else hi
+            var cb = block_buf()
+            dev.read(e.physical, cb.view())?
+            val cv = cb.view()
+            var f: Option[NodeFault] = None
+            val ch: *NodeHeader = at(cv, 0)
+            if !verify_block(c.m.seed, cv) then f = Some(NodeFault.Checksum)
+            else if le64(cv, TAIL_OFFSET) != ino then f = Some(NodeFault.Owner)
+            else if le32(cv, TAIL_OFFSET + 8) != generation then f = Some(NodeFault.Generation)
+            else if ch.magic != EXTENT_MAGIC then f = Some(NodeFault.Magic)
+            else if ch.max == 0 || usize(ch.max) > EXTENT_NODE_SLOTS || ch.count > ch.max || !reserved_zero(ch) || ch.count == 0 then f = Some(NodeFault.Header)
+            else if ch.depth != depth - 1 then f = Some(NodeFault.Depth)
+            else if u64(entry_at(cv, 0, 0).logical) != u64(e.logical) then f = Some(NodeFault.Key)
+            f match
+                Some(x) -> return Ok(Some(Problem.Extent(ino, e.physical, x)))
+                None -> ()
+            val r = walk_node(dev, c, rep, ino, generation, cv, 0, u64(e.logical), child_hi)?
+            r match
+                Some(p) -> return Ok(Some(named(p, e.physical)))
+                None -> ()
+    Ok(None)
+
+// A problem a child found in its own entries (naming block 0) names the child.
+private named(p: Problem, block: u64) -> Problem
+    p match
+        Problem.Extent(ino, b, f) -> if b == 0 then Problem.Extent(ino, block, f) else p
+        _ -> p
+
+// -- Pass 5 -------------------------------------------------------------------------------------------
+
+private pass5[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit, DeviceError]
+    val g = c.m.geo
+    val seed = c.m.seed
+    var bb = block_buf()
+    var ib = block_buf()
+    var free_blocks: u64 = 0
+    var free_inodes: u64 = 0
+    for grp in 0..<g.group_count
+        val d = c.m.desc(grp)
+        dev.read(g.block_bitmap(grp), bb.view())?
+        dev.read(g.inode_bitmap(grp), ib.view())?
+        val first = g.group_first(grp)
+        val len = usize(g.group_len(grp))
+        val meta = usize(g.meta_blocks(grp))
+        for i in 0..<(BLOCK_SIZE * 8)
+            val b = first + u64(i)
+            val journal = b >= g.journal_start && b < g.journal_start + u64(g.journal_blocks)
+            val want = i < meta || i >= len || journal || c.owner[usize(b)] != 0
+            if bit_test(bb.view(), i) != want then rep.add(Problem.BlockBit(b, want))
+        val ipg = usize(g.inodes_per_group)
+        for i in 0..<(BLOCK_SIZE * 8)
+            val ino = u64(grp) * u64(g.inodes_per_group) + u64(i) + 1
+            val want = i >= ipg || ino < FIRST_INO || c.used[usize(ino - 1)]
+            if bit_test(ib.view(), i) != want then rep.add(Problem.InodeBit(ino, want))
+        if count_clear(bb.view(), len) != d.free_blocks then rep.add(Problem.FreeBlocks(grp))
+        if count_clear(ib.view(), ipg) != d.free_inodes then rep.add(Problem.FreeInodes(grp))
+        if c.dirs[usize(grp)] != d.directories then rep.add(Problem.Directories(grp))
+        if bitmap_crc(seed, grp, bb.view()) != d.block_bitmap_crc then rep.add(Problem.BlockBitmapCrc(grp))
+        if bitmap_crc(seed, grp, ib.view()) != d.inode_bitmap_crc then rep.add(Problem.InodeBitmapCrc(grp))
+        free_blocks += u64(d.free_blocks)
+        free_inodes += u64(d.free_inodes)
+    if c.m.sb.state & STATE_CLEAN != 0 && (c.m.sb.free_blocks != free_blocks || c.m.sb.free_inodes != free_inodes)
+        rep.add(Problem.Totals)
+    Ok(())

@@ -538,6 +538,7 @@ checkpoint_oldest[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[Cp, FsEr
 
 // Commit everything and checkpoint everything: the log is empty and `start` is 0 on the disk.
 checkpoint_everything[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
+    commit_running(fs)?
     loop
         checkpoint_oldest(fs)? match
             Cp.Done -> ()
@@ -587,12 +588,16 @@ open_handle[D: BlockDevice, P: Platform](fs: *Fs[D, P], op: string, credits: u32
             Ok(Some(h)) -> return h
             Ok(None) -> ()
         if fs.plat.wake_committer()
-            committer_step(fs) match
-                Err(e) -> return Handle(op, credits, 0, buf(), 0, Some(e))
-                Ok(true) -> ()
-                Ok(false) ->
-                    fs.plat.fatal(Fatal.Deadlock(op))
-                    return Handle(op, credits, 0, buf(), 0, Some(FsError.Bug))
+            // No commit thread: do all the committer can now, so no commit is left half done.
+            var moved = false
+            loop
+                committer_step(fs) match
+                    Err(e) -> return Handle(op, credits, 0, buf(), 0, Some(e))
+                    Ok(true) -> moved = true
+                    Ok(false) -> break
+            if !moved
+                fs.plat.fatal(Fatal.Deadlock(op))
+                return Handle(op, credits, 0, buf(), 0, Some(FsError.Bug))
         else
             fs.plat.wait_for_commit()
 

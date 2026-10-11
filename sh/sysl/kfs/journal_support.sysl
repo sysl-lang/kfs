@@ -1,0 +1,248 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// Helpers the journal, recovery, checker and crash tests share.
+
+type RamFs = Fs[RamDevice, HostPlatform]
+type CrashFs = Fs[CrashDevice[RamDevice], HostPlatform]
+
+private journal_entropy() -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i) * 7 + 3)
+    e
+
+formatted(blocks: u64, o: Options) -> RamDevice
+    var dev = ram_device(blocks)
+    val e = journal_entropy()
+    format(&dev, o, e.view(), 1_700_000_000) match
+        Ok(_) -> dev
+        Err(_) -> panic("the format was refused")
+
+// 16 MiB: two groups of 2048 blocks, 128 inodes each, the smallest journal (1024 blocks: a log of 1023,
+// `max_transaction` 256) at the start of group 1's data area.
+small_device() -> RamDevice = formatted(4097, Options(65536, RESERVED_DEFAULT, 0, 0))
+
+// 32 MiB: two groups of 4096 blocks and a journal of 2560 blocks (`max_transaction` 640), for a
+// transaction of 600 copies.
+wide_device() -> RamDevice = formatted(8193, Options(65536, RESERVED_DEFAULT, 4096, 2560))
+
+mounted[D: BlockDevice](dev: *D) -> Fs[D, HostPlatform]
+    mount(dev, host_platform()) match
+        Ok(fs) -> fs
+        Err(_) -> panic("the filesystem did not mount")
+
+must(r: Result[unit, FsError])
+    r match
+        Ok(_) -> ()
+        Err(_) -> panic(s"an operation failed: ${fails(r)}")
+
+must_id(r: Result[usize, FsError]) -> usize
+    r match
+        Ok(i) -> i
+        Err(_) -> panic("a buffer could not be read")
+
+must_bool(r: Result[bool, FsError]) -> bool
+    r match
+        Ok(v) -> v
+        Err(_) -> panic("a journal step failed")
+
+must_handle(r: Result[Option[Handle], FsError]) -> Handle
+    r match
+        Ok(Some(h)) -> h
+        Ok(None) -> panic("the handle had to wait")
+        Err(_) -> panic("the handle was refused")
+
+// Whether `try_start` answered "wait".
+waits(r: Result[Option[Handle], FsError]) -> bool
+    r match
+        Ok(None) -> true
+        _ -> false
+
+// How a call failed, as a number: 0 for success.
+fails[T](r: Result[T, FsError]) -> i64
+    r match
+        Ok(_) -> 0
+        Err(FsError.NoSpace) -> 1
+        Err(FsError.Bug) -> 2
+        Err(FsError.Invalid) -> 3
+        Err(FsError.ReadOnly) -> 4
+        Err(FsError.Device(_)) -> 5
+        Err(FsError.Corrupt(_)) -> 6
+        Err(_) -> 9
+
+// The `k`th scratch block: a data block of group 0 no test allocates, used as a metadata block by the
+// tests of the journal alone (they never allocate, so nothing else claims it).
+scratch[D: BlockDevice](fs: *Fs[D, HostPlatform], k: u64) -> u64 = fs.geo.data_start(0) + 32 + k
+
+// Declare block `b` in `h` and fill it with `filled_block(salt)`. Answers the buffer.
+stamp[D: BlockDevice](fs: *Fs[D, HostPlatform], h: *Handle, b: u64, salt: u32) -> usize
+    val id = must_id(fs.buffer(b))
+    fs.plat.lock(LockId.Buffer(b))
+    must(fs.write_access(h, id))
+    val src = filled_block(salt)
+    val dst = fs.bytes(id)
+    for i in 0..<BLOCK_SIZE
+        dst[i] = src[i]
+    fs.plat.unlock(LockId.Buffer(b))
+    id
+
+// Fill block `b` (declared in `h`) with `bytes`.
+put_bytes[D: BlockDevice](fs: *Fs[D, HostPlatform], h: *Handle, b: u64, bytes: []const u8)
+    val id = must_id(fs.buffer(b))
+    fs.plat.lock(LockId.Buffer(b))
+    must(fs.write_access(h, id))
+    val dst = fs.bytes(id)
+    for i in 0..<BLOCK_SIZE
+        dst[i] = bytes[i]
+    fs.plat.unlock(LockId.Buffer(b))
+
+// One handle that stamps each block of `blocks` with `salt + its index`, then a commit.
+stamp_all[D: BlockDevice](fs: *Fs[D, HostPlatform], blocks: Buf[u64], salt: u32)
+    var h = fs.start("stamp", u32(blocks.len()))
+    for i in 0..<blocks.len()
+        stamp(fs, &h, blocks[i], salt + u32(i))
+    fs.stop(&h)
+    must(fs.commit())
+
+raw[D: BlockDevice](dev: *D, b: u64) -> Buf[u8]
+    var out = new_block()
+    assert(dev.read(b, out.view()).is_ok())
+    out
+
+raw_put[D: BlockDevice](dev: *D, b: u64, bytes: []const u8)
+    assert(dev.write(b, bytes).is_ok())
+
+same(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// Whether block `b` on the device holds `filled_block(salt)`.
+holds[D: BlockDevice](dev: *D, b: u64, salt: u32) -> bool = same(raw(dev, b).view(), filled_block(salt).view())
+
+// The superblock as it is on the device.
+super_of[D: BlockDevice](dev: *D) -> Superblock
+    val b = raw(dev, 1)
+    val sb: *Superblock = at(b.view(), 0)
+    *sb
+
+// The journal superblock as it is on the device.
+journal_of[D: BlockDevice](dev: *D) -> JournalState
+    read_journal_super(dev, super_of(dev)) match
+        Ok(st) -> st
+        Err(_) -> panic("the journal superblock does not verify")
+
+// The device block of log position `p`.
+log_pos(sb: Superblock, p: u32) -> u64 = sb.journal_start + u64(p)
+
+// One copy found in the log: its transaction, home block, tag flags, position, and the bytes as logged.
+struct LogCopy
+    seq: u64
+    block: u64
+    flags: u32
+    pos: u32
+    data: Buf[u8]
+
+// What the log holds from the journal superblock's `start`: every complete transaction's copies, and
+// the number of descriptor and revoke blocks seen and every revoked block.
+struct LogContents
+    copies: Buf[LogCopy]
+    descriptors: u32
+    revoke_blocks: u32
+    revoked: Buf[u64]
+    txns: Buf[Found]
+
+log_contents[D: BlockDevice](dev: *D) -> LogContents
+    val sb = super_of(dev)
+    val st = journal_of(dev)
+    var out = LogContents(buf(), 0, 0, buf(), buf())
+    val sc = scan_log(dev, sb, st) match
+        Ok(s) -> s
+        Err(_) -> panic("the log could not be scanned")
+    out.txns = sc.txns
+    for t in sc.txns.view()
+        var pos = t.first
+        while pos != t.commit
+            val blk = raw(dev, log_pos(sb, pos))
+            val h: *JournalHeader = at(blk.view(), 0)
+            if h.kind == JOURNAL_DESCRIPTOR
+                out.descriptors += 1
+                val d: *DescriptorHeader = at(blk.view(), 0)
+                for i in 0..<usize(d.count)
+                    val tag = tag_at(blk.view(), i)
+                    val cp = log_advance(sb.journal_blocks, pos, u32(i) + 1)
+                    out.copies.push(LogCopy(t.seq, tag.block, tag.flags, cp, raw(dev, log_pos(sb, cp))))
+                pos = log_advance(sb.journal_blocks, pos, 1 + d.count)
+            else
+                out.revoke_blocks += 1
+                val r: *RevokeHeader = at(blk.view(), 0)
+                for i in 0..<usize(r.count)
+                    out.revoked.push(le64(blk.view(), sizeof(RevokeHeader) + 8 * i))
+                pos = log_advance(sb.journal_blocks, pos, 1)
+    out
+
+// The copies of block `b` in the log.
+copies_of(c: LogContents, b: u64) -> Buf[LogCopy]
+    var out: Buf[LogCopy] = buf()
+    for x in c.copies.view()
+        if x.block == b then out.push(x)
+    out
+
+// Indexes in the RamDevice write log of the writes to block `b`.
+writes_to(dev: *RamDevice, b: u64) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for i in 0..<dev.log_len()
+        if dev.log_block(i) == b then out.push(i)
+    out
+
+// Push the log's head to position `target` (which must lie ahead of it in this lap) with transactions
+// of scratch blocks 1000 ... that are committed and checkpointed at once, leaving the log empty.
+advance_head_to[D: BlockDevice](fs: *Fs[D, HostPlatform], target: u32)
+    must(fs.checkpoint_all())
+    loop
+        val head = fs.log_head()
+        if head == target then return
+        assert(head < target)
+        val room = target - head
+        assert(room >= 3)
+        // A transaction of n copies takes n + 2 blocks: one descriptor, the copies, the commit.
+        val n = if room - 2 > 200 then 200 else room - 2
+        var blocks: Buf[u64] = buf()
+        for k in 0..<u64(n)
+            blocks.push(scratch(fs, 1000 + k))
+        stamp_all(fs, blocks, 900)
+        must(fs.checkpoint_all())
+
+// The checker's report on `dev`, which must be clean; every problem is printed first if it is not.
+checked_clean[D: BlockDevice](dev: *D) -> Report
+    val rep = check(dev)
+    for p in rep.problems.view()
+        print("checker: " + describe(p))
+    assert(rep.clean())
+    rep
+
+// A device whose `flush` does not order anything (virtio-blk without the flush feature).
+struct NoFlushDevice
+    inner: *RamDevice
+
+impl BlockDevice for NoFlushDevice
+    blocks(self) -> u64 = self.inner.blocks()
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError] = self.inner.read(b, out)
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError] = self.inner.write(b, data)
+    flush(*self) -> Result[unit, DeviceError] = self.inner.flush()
+    override has_flush(self) -> bool = false
+
+// Rewrite the superblock on the device with `set_state` bits added and the two feature words, resealed.
+edit_super(dev: *RamDevice, set_state: u16, ro_compat: u32, incompat: u32)
+    var b = raw(dev, 1)
+    val sb: *Superblock = at(b.view(), 0)
+    sb.state = sb.state | set_state
+    sb.feature_ro_compat = ro_compat
+    sb.feature_incompat = incompat
+    seal_superblock(b.view())
+    raw_put(dev, 1, b.view())
