@@ -63,7 +63,7 @@ private bitmap_buffer[D: BlockDevice, P: Platform](fs: *Fs[D, P], g: u32, d: *Gr
     if !checked
         val want = if inodes then d.inode_bitmap_crc else d.block_bitmap_crc
         if bitmap_crc(fs.seed, g, fs.bytes(id)) != want
-            return Err(FsError.Corrupt(if inodes then Corruption.InodeBitmap(g) else Corruption.BlockBitmap(g)))
+            return Err(fs.corrupt(if inodes then Corruption.InodeBitmap(g) else Corruption.BlockBitmap(g)))
         if inodes
             fs.groups.view()[usize(g)].inode_bitmap_checked = true
         else
@@ -175,12 +175,12 @@ private inode_in_group_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Ha
     var i: usize = 0
     while i < ipg && bit_test(fs.bytes(ib), i)
         i += 1
-    if i == ipg then return Err(FsError.Corrupt(Corruption.GroupCounts(g)))
+    if i == ipg then return Err(fs.corrupt(Corruption.GroupCounts(g)))
     val ino = u64(g) * u64(ipg) + u64(i) + 1
     val loc = fs.inode_location(ino)
     val tb = fs.buffer(loc.block)?
     val slot = fs.bytes(tb)[loc.offset..<loc.offset + INODE_SIZE]
-    if !all_zero(slot) && !verify_inode(fs.seed, ino, slot) then return Err(FsError.Corrupt(Corruption.Inode(ino)))
+    if !all_zero(slot) && !verify_inode(fs.seed, ino, slot) then return Err(fs.corrupt(Corruption.Inode(ino)))
 
     declare(fs, h, ib)?
     declare(fs, h, did)?
@@ -241,7 +241,7 @@ private init_inode(block: []u8, offset: usize, seed: u32, ino: u64, n: NewInode,
 // free (and one directory fewer for a directory). A free of an inode that is not allocated is
 // corruption, and changes nothing.
 free_inode[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> Result[unit, FsError]
-    if ino < FIRST_INO || ino > fs.sb.inode_count then return Err(FsError.Corrupt(Corruption.BadInodeNumber(ino)))
+    if ino < FIRST_INO || ino > fs.sb.inode_count then return Err(fs.corrupt(Corruption.BadInodeNumber(ino)))
     val g = fs.inode_group(ino)
     fs.plat.lock(LockId.Group(g))
     val r = free_inode_locked(fs, h, g, ino)
@@ -255,11 +255,11 @@ private free_inode_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle
     val d = desc_in(fs, did, g)
     val ib = bitmap_buffer(fs, g, d, true)?
     val i = usize((ino - 1) % u64(fs.geo.inodes_per_group))
-    if !bit_test(fs.bytes(ib), i) then return Err(FsError.Corrupt(Corruption.FreeingFreeInode(ino)))
+    if !bit_test(fs.bytes(ib), i) then return Err(fs.corrupt(Corruption.FreeingFreeInode(ino)))
     val loc = fs.inode_location(ino)
     val tb = fs.buffer(loc.block)?
     val slot = fs.bytes(tb)[loc.offset..<loc.offset + INODE_SIZE]
-    if !verify_inode(fs.seed, ino, slot) then return Err(FsError.Corrupt(Corruption.Inode(ino)))
+    if !verify_inode(fs.seed, ino, slot) then return Err(fs.corrupt(Corruption.Inode(ino)))
 
     declare(fs, h, ib)?
     declare(fs, h, did)?
@@ -354,7 +354,7 @@ private blocks_in_group_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *H
 
     val found = find_run(usable.view(), lo, hi, start, usize(n)) match
         Some(s) -> s
-        None -> return Err(FsError.Corrupt(Corruption.GroupCounts(g)))
+        None -> return Err(fs.corrupt(Corruption.GroupCounts(g)))
 
     declare(fs, h, bb)?
     declare(fs, h, did)?
@@ -413,18 +413,19 @@ find_run(bits: []const u8, lo: usize, hi: usize, from: usize, want: usize) -> Op
 // corruption and changes nothing.
 free_blocks[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, first: u64, len: u32) -> Result[unit, FsError]
     if len == 0 then return Err(FsError.Invalid)
-    if first < 1 || first >= fs.geo.blocks then return not_data(first)
+    if first < 1 || first >= fs.geo.blocks then return not_data(fs, first)
     val g = fs.block_group(first)
     val end = first + u64(len)
-    if first < fs.geo.data_start(g) || end > fs.geo.group_end(g) then return not_data(first)
+    if first < fs.geo.data_start(g) || end > fs.geo.group_end(g) then return not_data(fs, first)
     if g == fs.geo.journal_group() && first < fs.geo.journal_start + u64(fs.geo.journal_blocks) && end > fs.geo.journal_start
-        return not_data(first)
+        return not_data(fs, first)
     fs.plat.lock(LockId.Group(g))
     val r = free_blocks_locked(fs, h, g, first, len)
     fs.plat.unlock(LockId.Group(g))
     r
 
-private not_data(first: u64) -> Result[unit, FsError] = Err(FsError.Corrupt(Corruption.NotDataBlocks(first)))
+private not_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], first: u64) -> Result[unit, FsError]
+    Err(fs.corrupt(Corruption.NotDataBlocks(first)))
 
 private free_blocks_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, g: u32, first: u64, len: u32) -> Result[unit, FsError]
     val did = descriptor(fs, g)?
@@ -433,7 +434,7 @@ private free_blocks_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handl
     val at_bit = usize(first - fs.geo.group_first(g))
     for k in 0..<usize(len)
         if !bit_test(fs.bytes(bb), at_bit + k)
-            return Err(FsError.Corrupt(Corruption.FreeingFreeBlock(first + u64(k))))
+            return Err(fs.corrupt(Corruption.FreeingFreeBlock(first + u64(k))))
 
     declare(fs, h, bb)?
     declare(fs, h, did)?

@@ -19,6 +19,10 @@ enum OpenError
     BadDescriptor(group: u32)
     // The group's descriptor says its bitmaps or inode table are not where the layout puts them.
     MisplacedGroup(group: u32)
+    // The journal superblock fails its check (section 15, step 1): magic, type, checksum, uuid or sizes.
+    BadJournal
+    // `feature_incompat` names a feature this code does not know (section 21): refused.
+    UnknownFeatures
 
 impl From[DeviceError] for OpenError
     from(e: DeviceError) -> OpenError = OpenError.Device(e)

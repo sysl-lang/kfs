@@ -58,6 +58,8 @@ open_message(e: OpenError) -> string
         BadGeometry -> "the superblock's numbers are inconsistent or do not fit the device"
         BadDescriptor(g) -> s"group ${g}'s descriptor fails its checksum"
         MisplacedGroup(g) -> s"group ${g}'s descriptor puts its metadata somewhere else than the layout does"
+        BadJournal -> "the journal superblock fails its check"
+        UnknownFeatures -> "the filesystem uses an incompatible feature this tool does not know"
 
 // `mkfs.kfs <image> <blocks> [options]`: make a zeroed image file of that many blocks and format it.
 run_mkfs(args: []string, entropy: []const u8, now: i64) -> Result[string, string]

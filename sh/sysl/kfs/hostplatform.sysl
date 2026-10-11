@@ -3,18 +3,24 @@ module keel.kfs
 import sysl.buf.{Buf, buf}
 
 // The platform on the host, where one thread runs everything: the locks are bookkeeping rather than
-// exclusion, the clock is a counter a test sets, and there is no commit thread, so a request to commit
-// is answered "commit it yourself".
+// exclusion, the clocks are counters a test sets, and by default there is no commit thread, so a request
+// to commit is answered "commit it yourself".
 //
 // The bookkeeping is what makes it more than a stub. Every acquisition is checked against section 19's
 // order (`rank`): taking a lock while holding one of the same or a higher rank panics, which is how a
 // host test catches the two-group-locks mistake or a buffer lock taken outside its group lock. Every
 // release must be of a lock that is held. `fatal` panics unless a test asked to record it.
+//
+// **A simulated commit thread.** With `committer_thread` set, `wake_committer` answers that a thread
+// was woken, as the kernel's does; nothing runs it, so the test plays that thread itself by calling
+// `Fs.journal_step` between the steps of its simulated operations. A handle that must wait is then the
+// test's to retry (`Fs.try_start`), never a blocking `start`: `wait_for_commit` panics, because on one
+// thread there is nobody to wake it.
 
 struct HostPlatform
     private held_rank: Buf[u32]
     private held_key: Buf[u64]
-    // The clock: seconds, advanced by one at every reading so two inodes made in a row differ.
+    // The wall clock: seconds, advanced by one at every reading so two inodes made in a row differ.
     clock: i64
     // A `fatal` is counted and returned from instead of panicking.
     record_fatal: bool
@@ -24,11 +30,18 @@ struct HostPlatform
     // Acquisitions of a group lock, and the most group locks ever held at once.
     group_locks: u64
     most_groups_held: u32
+    // The monotonic clock in milliseconds; it moves only when a test moves it.
+    ms: u64
+    // Whether a (simulated) commit thread exists; see above.
+    committer_thread: bool
+    // The last fatal reported, as a number: 1 credit overrun, 2 revoke overrun, 3 deadlock, 4 log
+    // overrun.
+    last_fatal: u32
 
     // How many locks are held now.
     held(self) -> usize = self.held_rank.len()
 
-host_platform() -> HostPlatform = HostPlatform(buf(), buf(), 1_700_000_000, false, 0, 0, 0, 0)
+host_platform() -> HostPlatform = HostPlatform(buf(), buf(), 1_700_000_000, false, 0, 0, 0, 0, 0, false, 0)
 
 private key_of(l: LockId) -> u64
     l match
@@ -67,12 +80,25 @@ impl Platform for HostPlatform
         self.clock += 1
         Time(self.clock, 500)
 
+    monotonic_ms(*self) -> u64 = self.ms
+
     wake_committer(*self) -> bool
         self.commit_requests += 1
-        true
+        !self.committer_thread
+
+    wait_for_commit(*self)
+        panic("keel.kfs: a blocking start with a simulated commit thread; use try_start")
 
     fatal(*self, f: Fatal)
         self.fatals += 1
+        self.last_fatal = f match
+            Fatal.CreditOverrun(_, _) -> 1
+            Fatal.RevokeOverrun(_, _) -> 2
+            Fatal.Deadlock(_) -> 3
+            Fatal.LogOverrun(_) -> 4
         if !self.record_fatal
             f match
                 Fatal.CreditOverrun(_, _) -> panic("keel.kfs: a handle went past its credits")
+                Fatal.RevokeOverrun(_, _) -> panic("keel.kfs: a handle revoked past its credits")
+                Fatal.Deadlock(_) -> panic("keel.kfs: a handle waits for log room nothing can make")
+                Fatal.LogOverrun(_) -> panic("keel.kfs: a transaction overran the log")

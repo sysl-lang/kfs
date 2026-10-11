@@ -93,7 +93,9 @@ private flags_of(unwritten: bool) -> u16 = if unwritten then EXTENT_UNWRITTEN el
 private extent_entry(logical: u64, len: u64, physical: u64, flags: u16) -> ExtentLeaf
     ExtentLeaf(u32(logical), u16(len), flags, physical)
 
-private fault(o: Owner, block: u64, f: NodeFault) -> FsError = FsError.Corrupt(Corruption.Extent(o.ino, block, f))
+// A broken rule of section 9: corruption, which aborts the journal (section 22).
+private fault[D: BlockDevice, P: Platform](fs: *Fs[D, P], o: Owner, block: u64, f: NodeFault) -> FsError
+    fs.corrupt(Corruption.Extent(o.ino, block, f))
 
 // The last entry whose key is at most `l` (a binary search: the entries are sorted).
 private last_at_most(entries: Buf[ExtentLeaf], l: u64) -> Option[usize]
@@ -116,7 +118,7 @@ private data_run[D: BlockDevice, P: Platform](fs: *Fs[D, P], first: u64, len: u6
 // -- Reading and verifying ----------------------------------------------------------------------------
 
 private load_owner[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Owner, FsError]
-    if ino == 0 || ino > fs.sb.inode_count then return Err(FsError.Corrupt(Corruption.BadInodeNumber(ino)))
+    if ino == 0 || ino > fs.sb.inode_count then return Err(fs.corrupt(Corruption.BadInodeNumber(ino)))
     val loc = fs.inode_location(ino)
     val id = fs.buffer(loc.block)?
     fs.plat.lock(LockId.Buffer(loc.block))
@@ -126,7 +128,7 @@ private load_owner[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Resu
     val flags = node.flags
     val o = Owner(ino, node.generation, loc, id, node.blocks)
     fs.plat.unlock(LockId.Buffer(loc.block))
-    if !good then return Err(FsError.Corrupt(Corruption.Inode(ino)))
+    if !good then return Err(fs.corrupt(Corruption.Inode(ino)))
     val t = mode & S_IFMT
     if !(t == S_IFREG || t == S_IFDIR || t == S_IFLNK) || flags & INODE_INLINE != 0 then return Err(FsError.Invalid)
     Ok(o)
@@ -170,11 +172,11 @@ private read_root[D: BlockDevice, P: Platform](fs: *Fs[D, P], o: Owner) -> Resul
     fs.plat.unlock(LockId.Buffer(o.loc.block))
     val root = parsed match
         Ok(n) -> n
-        Err(f) -> return Err(fault(o, 0, f))
-    if usize(root.depth) > EXTENT_MAX_DEPTH then return Err(fault(o, 0, NodeFault.Depth))
-    if root.depth > 0 && root.entries.len() == 0 then return Err(fault(o, 0, NodeFault.Header))
+        Err(f) -> return Err(fault(fs, o,0, f))
+    if usize(root.depth) > EXTENT_MAX_DEPTH then return Err(fault(fs, o,0, NodeFault.Depth))
+    if root.depth > 0 && root.entries.len() == 0 then return Err(fault(fs, o,0, NodeFault.Header))
     check_entries(fs, root, 0, LOGICAL_BLOCKS) match
-        Some(f) -> Err(fault(o, 0, f))
+        Some(f) -> Err(fault(fs, o,0, f))
         None -> Ok(root)
 
 // The child at `block`, which its parent's entry gives key `key`, depth `depth` and range [key, hi):
@@ -194,13 +196,13 @@ private read_node[D: BlockDevice, P: Platform](fs: *Fs[D, P], o: Owner, block: u
     fs.plat.unlock(LockId.Buffer(block))
     var n = parsed match
         Ok(n) -> n
-        Err(f) -> return Err(fault(o, block, f))
+        Err(f) -> return Err(fault(fs, o,block, f))
     n.hi = hi
-    if n.depth != depth then return Err(fault(o, block, NodeFault.Depth))
-    if n.entries.len() == 0 then return Err(fault(o, block, NodeFault.Header))
-    if u64(n.entries[0].logical) != key then return Err(fault(o, block, NodeFault.Key))
+    if n.depth != depth then return Err(fault(fs, o,block, NodeFault.Depth))
+    if n.entries.len() == 0 then return Err(fault(fs, o,block, NodeFault.Header))
+    if u64(n.entries[0].logical) != key then return Err(fault(fs, o,block, NodeFault.Key))
     check_entries(fs, n, key, hi) match
-        Some(f) -> Err(fault(o, block, f))
+        Some(f) -> Err(fault(fs, o,block, f))
         None -> Ok(n)
 
 // The path from the root to the leaf that holds (or would hold) logical block `l`: at every index node

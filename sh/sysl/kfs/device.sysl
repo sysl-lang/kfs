@@ -25,3 +25,8 @@ trait BlockDevice
 
     // Everything written before this is durable once it returns.
     flush(*self) -> Result[unit, DeviceError]
+
+    // Whether `flush` really orders writes. A device without one (virtio-blk without
+    // `VIRTIO_BLK_F_FLUSH`) is mounted read-only (section 2): the commit block could reach the disk
+    // before the blocks it commits.
+    has_flush(self) -> bool = true

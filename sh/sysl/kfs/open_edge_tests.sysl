@@ -16,6 +16,8 @@ private failure(r: Result[Mounted, OpenError]) -> i64
         Err(OpenError.BadGeometry) -> 4
         Err(OpenError.BadDescriptor(g)) -> 100 + i64(g)
         Err(OpenError.MisplacedGroup(g)) -> 200 + i64(g)
+        Err(OpenError.BadJournal) -> 5
+        Err(OpenError.UnknownFeatures) -> 6
 
 // The 32 MiB worked example: four groups of 2048, 1024 inodes each.
 private example() -> Sparse = sparse_formatted(8192, default_options())

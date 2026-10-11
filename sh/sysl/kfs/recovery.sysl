@@ -1,0 +1,253 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The journal on the disk, read without a mounted filesystem: the journal superblock, the scan of the
+// log, and recovery (kfs/SPEC.md sections 14 and 15). Mount runs `recover`; the checker runs `scan_log`
+// to audit a log it may not change.
+//
+// **Positions.** The log is journal blocks 1 ... `journal_blocks - 1`; a position is a journal block
+// number in that range, and the block after the last is block 1. Device block = `journal_start +
+// position`.
+
+// The errno `error` records for a checksum failure or an impossible structure (section 5).
+const ERROR_EIO: u32 = 5
+
+// The fields of the journal superblock that change while the filesystem lives.
+struct JournalState
+    start: u32
+    start_seq: u64
+    error: u32
+
+// The position `n` blocks after `p` in a log of `journal_blocks` blocks.
+log_advance(journal_blocks: u32, p: u32, n: u32) -> u32
+    val len = u64(journal_blocks - 1)
+    u32(1 + (u64(p) - 1 + u64(n)) % len)
+
+// Read and check the journal superblock against the filesystem's superblock (section 15, step 1).
+read_journal_super[D: BlockDevice](dev: *D, sb: Superblock) -> Result[JournalState, OpenError]
+    var blk = block_buf()
+    dev.read(sb.journal_start, blk.view())?
+    val js: *JournalSuper = at(blk.view(), 0)
+    if js.header.magic != JOURNAL_MAGIC || js.header.kind != JOURNAL_SUPER || js.header.sequence != 0
+        return Err(OpenError.BadJournal)
+    if !verify_sector(sb.csum_seed, blk.view()) then return Err(OpenError.BadJournal)
+    if js.journal_blocks != sb.journal_blocks || js.max_transaction != sb.max_transaction || js.first != 1
+        return Err(OpenError.BadJournal)
+    if js.start >= js.journal_blocks || js.features != 0 then return Err(OpenError.BadJournal)
+    for k in 0..<16
+        if js.uuid[k] != sb.uuid[k] then return Err(OpenError.BadJournal)
+    Ok(JournalState(js.start, js.start_seq, js.error))
+
+// Write the journal superblock: a direct write of one sector that no transaction ever logs.
+write_journal_super[D: BlockDevice](dev: *D, sb: Superblock, st: JournalState) -> Result[unit, DeviceError]
+    var blk = block_buf()
+    val js: *JournalSuper = at(blk.view(), 0)
+    js.header.magic = JOURNAL_MAGIC
+    js.header.kind = JOURNAL_SUPER
+    js.journal_blocks = sb.journal_blocks
+    js.first = 1
+    js.start = st.start
+    js.error = st.error
+    js.start_seq = st.start_seq
+    for k in 0..<16
+        js.uuid[k] = sb.uuid[k]
+    js.max_transaction = sb.max_transaction
+    seal_sector(sb.csum_seed, blk.view())
+    dev.write(sb.journal_start, blk.view())
+
+// A complete transaction found by the scan: its sequence, the position of its first block, how many
+// blocks precede its commit block, and the commit block's position.
+struct Found
+    seq: u64
+    first: u32
+    blocks: u32
+    commit: u32
+
+// The scan's answer: the complete transactions in order, and `end_seq`, one past the last of them.
+struct Scan
+    txns: Buf[Found]
+    end_seq: u64
+
+// What kind of journal block `blk` is, for sequence `seq`: its type if it is a header of that sequence
+// whose checksum agrees and whose count is in range, else 0.
+private header_kind(blk: []u8, seed: u32, seq: u64, seen: u32) -> u32
+    val h: *JournalHeader = at(blk, 0)
+    if h.magic != JOURNAL_MAGIC || h.sequence != seq then return 0
+    if h.kind == JOURNAL_DESCRIPTOR
+        val d: *DescriptorHeader = at(blk, 0)
+        if d.count == 0 || usize(d.count) > DESCRIPTOR_TAGS || !verify_journal_block(seed, blk) then return 0
+        return JOURNAL_DESCRIPTOR
+    if h.kind == JOURNAL_REVOKE
+        val r: *RevokeHeader = at(blk, 0)
+        if r.count == 0 || usize(r.count) > REVOKE_ENTRIES || !verify_journal_block(seed, blk) then return 0
+        return JOURNAL_REVOKE
+    if h.kind == JOURNAL_COMMIT
+        val c: *Commit = at(blk, 0)
+        if !verify_sector(seed, blk) || c.blocks != seen then return 0
+        return JOURNAL_COMMIT
+    0
+
+// Section 15, step 2: from `start` with `start_seq`, follow descriptors (skipping their copies), revoke
+// blocks and commit blocks of the expected sequence; anything else ends the scan. It reads at most one
+// lap of the log, so a log of nothing but valid blocks cannot keep it going.
+scan_log[D: BlockDevice](dev: *D, sb: Superblock, st: JournalState) -> Result[Scan, DeviceError]
+    var txns: Buf[Found] = buf()
+    if st.start == 0 then return Ok(Scan(txns, st.start_seq))
+    val jb = sb.journal_blocks
+    val lap = jb - 1
+    var blk = block_buf()
+    var pos = st.start
+    var seq = st.start_seq
+    var read: u32 = 0
+    loop
+        val first = pos
+        var seen: u32 = 0
+        var complete = false
+        loop
+            if read >= lap then break
+            dev.read(sb.journal_start + u64(pos), blk.view())?
+            read += 1
+            val kind = header_kind(blk.view(), sb.csum_seed, seq, seen)
+            if kind == JOURNAL_DESCRIPTOR
+                val d: *DescriptorHeader = at(blk.view(), 0)
+                seen += 1 + d.count
+                read += d.count
+                pos = log_advance(jb, pos, 1 + d.count)
+            else if kind == JOURNAL_REVOKE
+                seen += 1
+                pos = log_advance(jb, pos, 1)
+            else if kind == JOURNAL_COMMIT
+                txns.push(Found(seq, first, seen, pos))
+                pos = log_advance(jb, pos, 1)
+                complete = true
+                break
+            else
+                break
+        if !complete then break
+        seq += 1
+    Ok(Scan(txns, seq))
+
+// The tags of the descriptor in `blk`.
+tag_at(blk: []u8, i: usize) -> *Tag = at(blk, sizeof(DescriptorHeader) + i * sizeof(Tag))
+
+// Whether `b` is a block a journal copy may be written to: inside the filesystem, not block 0, and not
+// the journal itself.
+private replayable(sb: Superblock, b: u64) -> bool
+    b != 0 && b < sb.blocks && !(b >= sb.journal_start && b < sb.journal_start + u64(sb.journal_blocks))
+
+// Whether every copy of `t` agrees with its tag and names a block replay may write.
+private copies_good[D: BlockDevice](dev: *D, sb: Superblock, t: Found) -> Result[bool, DeviceError]
+    val jb = sb.journal_blocks
+    var blk = block_buf()
+    var copy = block_buf()
+    var pos = t.first
+    while pos != t.commit
+        dev.read(sb.journal_start + u64(pos), blk.view())?
+        val h: *JournalHeader = at(blk.view(), 0)
+        if h.kind == JOURNAL_DESCRIPTOR
+            val d: *DescriptorHeader = at(blk.view(), 0)
+            for i in 0..<usize(d.count)
+                val tag = tag_at(blk.view(), i)
+                if !replayable(sb, tag.block) || tag.flags & ~TAG_ESCAPED != 0 then return Ok(false)
+                dev.read(sb.journal_start + u64(log_advance(jb, pos, u32(i) + 1)), copy.view())?
+                if !verify_tag(sb.csum_seed, t.seq, tag, copy.view()) then return Ok(false)
+            pos = log_advance(jb, pos, 1 + d.count)
+        else
+            pos = log_advance(jb, pos, 1)
+    Ok(true)
+
+// The revoke table of step 3: for each revoked block, the newest transaction revoking it.
+private struct Revoked
+    blocks: Buf[u64]
+    seqs: Buf[u64]
+
+    record(self, b: u64, seq: u64)
+        for i in 0..<self.blocks.len()
+            if self.blocks[i] == b
+                if self.seqs[i] < seq then self.seqs[i] = seq
+                return
+        self.blocks.push(b)
+        self.seqs.push(seq)
+
+    // Whether a copy of `b` in transaction `seq` is cancelled: revoked by `seq` or a newer one.
+    cancels(self, b: u64, seq: u64) -> bool
+        for i in 0..<self.blocks.len()
+            if self.blocks[i] == b then return self.seqs[i] >= seq
+        false
+
+// What recovery did: the journal superblock as it left it, how many transactions it replayed, and
+// whether it stopped at a copy that fails its tag (media corruption, section 15 step 4).
+struct Recovered
+    st: JournalState
+    replayed: u32
+    corrupt: bool
+
+// Section 15, steps 1-5 (step 6, reloading the superblock and copying `error`, is mount's). Idempotent:
+// until the journal superblock is rewritten at the end, a crash leaves everything to do again, and
+// writing a copy twice writes the same bytes twice.
+//
+// A transaction is replayed only if every copy in it agrees with its tag (and names a block replay may
+// write); the first that does not is media corruption. Recovery then replays only the transactions
+// before it, takes revokes only from those, leaves `start` as it was (the log stays for `fsck.kfs`), and
+// records `EIO` in `error`: the mount is read-only.
+recover[D: BlockDevice](dev: *D, sb: Superblock) -> Result[Recovered, OpenError]
+    var st = read_journal_super(dev, sb)?
+    if st.start == 0 then return Ok(Recovered(st, 0, false))
+    val sc = scan_log(dev, sb, st)?
+    val jb = sb.journal_blocks
+
+    // Which transactions to replay: those before the first with a bad copy.
+    var good: usize = 0
+    var corrupt = false
+    while good < sc.txns.len() && !corrupt
+        if copies_good(dev, sb, sc.txns[good])? then good += 1 else corrupt = true
+
+    // Step 3: the revoke pass.
+    var revoked = Revoked(buf(), buf())
+    var blk = block_buf()
+    for k in 0..<good
+        val t = sc.txns[k]
+        var pos = t.first
+        while pos != t.commit
+            dev.read(sb.journal_start + u64(pos), blk.view())?
+            val h: *JournalHeader = at(blk.view(), 0)
+            if h.kind == JOURNAL_DESCRIPTOR
+                val d: *DescriptorHeader = at(blk.view(), 0)
+                pos = log_advance(jb, pos, 1 + d.count)
+            else
+                val r: *RevokeHeader = at(blk.view(), 0)
+                for i in 0..<usize(r.count)
+                    revoked.record(le64(blk.view(), sizeof(RevokeHeader) + 8 * i), t.seq)
+                pos = log_advance(jb, pos, 1)
+
+    // Step 4: the replay pass.
+    var copy = block_buf()
+    for k in 0..<good
+        val t = sc.txns[k]
+        var pos = t.first
+        while pos != t.commit
+            dev.read(sb.journal_start + u64(pos), blk.view())?
+            val h: *JournalHeader = at(blk.view(), 0)
+            if h.kind == JOURNAL_DESCRIPTOR
+                val d: *DescriptorHeader = at(blk.view(), 0)
+                for i in 0..<usize(d.count)
+                    val tag = tag_at(blk.view(), i)
+                    if !revoked.cancels(tag.block, t.seq)
+                        dev.read(sb.journal_start + u64(log_advance(jb, pos, u32(i) + 1)), copy.view())?
+                        unescape_copy(copy.view(), tag.flags)
+                        dev.write(tag.block, copy.view())?
+                pos = log_advance(jb, pos, 1 + d.count)
+            else
+                pos = log_advance(jb, pos, 1)
+
+    // Step 5.
+    dev.flush()?
+    if corrupt
+        if st.error == 0 then st.error = ERROR_EIO
+    else
+        st.start = 0
+        st.start_seq = sc.end_seq
+    write_journal_super(dev, sb, st)?
+    dev.flush()?
+    Ok(Recovered(st, u32(good), corrupt))

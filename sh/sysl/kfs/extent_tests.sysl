@@ -53,6 +53,12 @@ private ok_run(r: Result[Run, FsError]) -> Run
         Ok(run) -> run
         Err(_) -> panic("a block allocation failed")
 
+// Commit and checkpoint: the home blocks hold everything, so the device can be read and damaged
+// directly and a fresh mount sees it as written.
+private settle(fs: *HostFs)
+    ok(fs.commit())
+    ok(fs.checkpoint_all())
+
 private ok_u64(r: Result[u64, FsError]) -> u64
     r match
         Ok(v) -> v
@@ -383,7 +389,7 @@ root_push_down()
         assert(!is_hole(ok_map(lookup(&fs, ino, 2 * u64(i)))))
         assert(is_hole(ok_map(lookup(&fs, ino, 2 * u64(i) + 1))))
     // And on the disk, read back by a fresh mount.
-    ok(fs.commit())
+    settle(&fs)
     var again = mounted_fs(&dev)
     assert_eq(walk(&again, ino).extents.len(), 8)
     assert(!is_hole(ok_map(lookup(&again, ino, 14))))
@@ -682,7 +688,7 @@ remove_whole_file()
     assert_eq(inode_of(&fs, ino).blocks, 0)
     assert_eq(used_blocks(&fs), baseline)
     assert_eq(totals_agree(&fs), "")
-    ok(fs.commit())
+    settle(&fs)
     assert_eq(totals_agree(&fs), "")
 
 @test("a truncation step stops after its limit and answers where it stopped, never splitting")
@@ -949,7 +955,7 @@ private build(dev: *RamDevice) -> Built
     val s = walk(&fs, ino)
     assert_eq(s.depth, 2)
     assert_eq(s.nodes.len(), 4)
-    ok(fs.commit())
+    settle(&fs)
     Built(ino, s.nodes[0], s.nodes[1], s.nodes[2])
 
 // One way to break a node of the built tree, each breaking exactly one rule of section 9.
@@ -1016,31 +1022,46 @@ private apply(d: Damage, b: Buf[u8])
 // Break the built tree with `d` on the device, re-sealed (but for FlipByte) so that only the rule
 // under test fails; then mount afresh and answer how a lookup refuses. An insert and a removal reaching
 // the same node must refuse the same way, and the refusal must name the damaged block.
+//
+// Corruption aborts the journal (section 22), after which nothing more starts, so each of the three
+// operations runs on its own freshly damaged device.
 private corrupt(d: Damage) -> i64
-    var dev = standard_device()
-    val built = build(&dev)
     val on_index = d == Damage.IndexDepth || d == Damage.KeyNotFirst
-    val b = if on_index then built.index else built.leaf
     val probe: u64 = if d == Damage.KeyNotFirst then 3 else 2
-    // A key is checked against the child it leads to, so that child is the block named.
-    val named = if d == Damage.KeyNotFirst then built.next_leaf else b
-    val bytes = read_dev(&dev, b)
-    apply(d, bytes)
-    var fs = mounted_fs(&dev)
-    if d != Damage.FlipByte then seal_block(fs.seed, bytes.view())
-    write_dev(&dev, b, bytes.view())
-    var again = mounted_fs(&dev)
-    val r = lookup(&again, built.ino, probe)
-    assert(failure(r) >= 100)
-    assert_eq(faulty_block(r), named)
-    val t = extent_tree(built.ino, 0)
-    assert_eq(failure(put(&again, t, 3, Run(again.geo.data_start(3), 1), false)), failure(r))
-    var h = again.start("punch", 86)
-    assert_eq(failure(remove(&again, &h, t, 0, probe + 1, 16)), failure(r))
-    assert_eq(h.spent(), 0)
-    again.stop(&h)
-    assert_eq(again.plat.held(), 0)
-    failure(r)
+    var answers: Buf[i64] = buf()
+    for which in 0..<3
+        var dev = standard_device()
+        val built = build(&dev)
+        val b = if on_index then built.index else built.leaf
+        // A key is checked against the child it leads to, so that child is the block named.
+        val named = if d == Damage.KeyNotFirst then built.next_leaf else b
+        val bytes = read_dev(&dev, b)
+        apply(d, bytes)
+        var fs = mounted_fs(&dev)
+        if d != Damage.FlipByte then seal_block(fs.seed, bytes.view())
+        write_dev(&dev, b, bytes.view())
+        var again = mounted_fs(&dev)
+        val t = extent_tree(built.ino, 0)
+        if which == 0
+            val r = lookup(&again, built.ino, probe)
+            assert(failure(r) >= 100)
+            assert_eq(faulty_block(r), named)
+            answers.push(failure(r))
+        else if which == 1
+            answers.push(failure(put(&again, t, 3, Run(again.geo.data_start(3), 1), false)))
+        else
+            var h = again.start("punch", 86)
+            answers.push(failure(remove(&again, &h, t, 0, probe + 1, 16)))
+            assert_eq(h.spent(), 0)
+            again.stop(&h)
+        // The journal aborted, recorded EIO, and the filesystem is read-only.
+        assert(again.aborted())
+        assert(again.read_only())
+        assert_eq(again.journal_error(), 5)
+        assert_eq(again.plat.held(), 0)
+    assert_eq(answers[1], answers[0])
+    assert_eq(answers[2], answers[0])
+    answers[0]
 
 @test("the tree as built is sound and maps what was put in it")
 built_tree_sound()
@@ -1139,7 +1160,7 @@ refused_foreign_node()
     val b = file_inode(&fs)
     fill(&fs, extent_tree(b, 0), 0, 8)
     assert_eq(walk(&fs, b).depth, 1)
-    ok(fs.commit())
+    settle(&fs)
     // b's root entry now names a's index node, which is a valid node of a's.
     rewrite_inode(&dev, b, 112 + 16 + 8, le_bytes(a.index, 8).view())
     var again = mounted_fs(&dev)
@@ -1159,7 +1180,7 @@ refused_previous_life()
     fs.stop(&h)
     val ino = file_inode(&fs)
     assert_eq(ino, old.ino)
-    ok(fs.commit())
+    settle(&fs)
     // The new life's inode, with the old life's root copied into its data.
     rewrite_inode(&dev, ino, 112, root_copy.view()[loc.offset + 112..<loc.offset + 240])
     var again = mounted_fs(&dev)
@@ -1388,7 +1409,7 @@ private run_model(seed: u64, root_max: u16, node_max: u16, low: u64, high: u64, 
                 if f != 3 then why = s"an overlapping insert of $n blocks answered $f"
                 from = k
                 to = k
-        if step % 16 == 15 then ok(fs.commit())
+        if step % 16 == 15 then settle(&fs)
         if why.len == 0 then why = check(&fs, ino, m, baseline, &rng, step % 64 == 63, from, to)
         if why.len > 0
             print(s"extent model: seed $seed, root max $root_max, node max $node_max, step $step: $why")
@@ -1396,7 +1417,7 @@ private run_model(seed: u64, root_max: u16, node_max: u16, low: u64, high: u64, 
         val d = ok_depth(depth_of(&fs, ino))
         if d > out.deepest then out.deepest = d
     // At the end, everything committed and read back by a fresh mount agrees too.
-    ok(fs.commit())
+    settle(&fs)
     var again = mounted_fs(&dev)
     val final = check(&again, ino, m, baseline, &rng, true, 0, 0)
     if final.len > 0

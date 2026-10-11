@@ -1,0 +1,616 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The journal of kfs/SPEC.md section 14, as it runs while the filesystem is mounted: transactions and
+// handles, log-space reservation, the commit in its exact order, frozen copies, revocation, checkpoint,
+// and the abort. Recovery, which runs before any of this exists, is recovery.sysl's.
+//
+// **The life of a transaction.** Handles join the *running* transaction (`try_start`), declare every
+// buffer before changing it (`write_access`), and leave (`stop`). The running transaction closes to new
+// handles when it would outgrow `max_transaction`, when it has been open `COMMIT_INTERVAL`, or when a
+// commit or a checkpoint needs it to; once its last handle has left, `begin` makes it the *committing*
+// transaction and opens the next one (step 1), and `finish` writes it (steps 2-7). While it commits,
+// handles of the next transaction run beside it; one that changes a buffer the committing transaction
+// still has to log takes a frozen copy first (step 3). A committed transaction's buffers form its
+// *checkpoint list*; `checkpoint` writes the oldest list home and moves the log's `start` past it.
+//
+// **Buffer states.** A buffer belongs to at most one transaction of each kind:
+//
+//     txn         the running transaction changed it (or freed it): pinned
+//     committing  the committing transaction logs it (its frozen copy, if the running one changed it since)
+//     cp          the committed transaction whose checkpoint list holds it
+//
+// A pinned buffer — `txn` or `committing` set — is never written home and never evicted (section 14,
+// "The buffer-cache rule"). A buffer joins the checkpoint list of the newest transaction that logged it,
+// leaving any older one's; checkpointing a list holding a pinned buffer must first commit the
+// transaction that pins it.
+//
+// **Space.** Every log block a transaction can come to is reserved when its handles join: `reserved` of
+// the running transaction counts the buffers it holds plus every credit its open handles have not yet
+// spent, and their overhead (descriptors, revoke blocks, commit). A handle joins only if the log's used
+// blocks, the committing transaction's and the running one's reservation with it all fit. Otherwise
+// it waits — on the host, `start` runs `journal_step` until it fits — and the committer checkpoints,
+// committing the running transaction first when a buffer it must write home is pinned by it. A commit
+// never waits for space: its blocks were reserved.
+//
+// **Sequences.** A transaction that logs nothing (no buffers, no revokes) does not take a sequence: the
+// next running transaction keeps it, so the sequences in the log never have a gap (recovery's scan
+// ends at one).
+
+// One transaction, running or committing.
+struct Txn
+    seq: u64
+    // The buffers it logs, in the order they joined.
+    ids: Buf[usize]
+    // The buffers it freed: pinned until it commits, then dropped from the cache unwritten.
+    freed: Buf[usize]
+    // The blocks it revokes.
+    revokes: Buf[u64]
+    // Its ordered data: blocks written home before it is logged (step 2), with their bytes.
+    data_blocks: Buf[u64]
+    data: Buf[u8]
+    handles: u32
+    // Credits its open handles may still spend on new buffers, and on revokes.
+    outstanding: u32
+    outstanding_revokes: u32
+    // Closed to new handles.
+    closed: bool
+    // When its first handle joined, on the monotonic clock.
+    opened_ms: u64
+    // Whether this slot holds a transaction (the committing slot is often empty).
+    live: bool
+
+    // Nothing has joined it and nothing is in it.
+    empty(self) -> bool
+        self.handles == 0 && self.ids.len() == 0 && self.freed.len() == 0 && self.revokes.len() == 0 && self.data_blocks.len() == 0
+
+    // Whether committing it writes anything to the log.
+    logs(self) -> bool = self.ids.len() > 0 || self.revokes.len() > 0
+
+    // The most log blocks it can come to.
+    reserved(self) -> u32
+        txn_blocks(u32(self.ids.len()) + self.outstanding, u32(self.revokes.len()) + self.outstanding_revokes)
+
+fresh_txn(seq: u64) -> Txn = Txn(seq, buf(), buf(), buf(), buf(), buf(), 0, 0, 0, false, 0, true)
+
+no_txn() -> Txn = Txn(0, buf(), buf(), buf(), buf(), buf(), 0, 0, 0, false, 0, false)
+
+private ceil_by(a: u32, b: u32) -> u32 = (a + b - 1) / b
+
+// The log blocks of a transaction of `buffers` copies and `revokes` revoke records: the copies, a
+// descriptor per 254, a revoke block per 508, and the commit block. Nothing at all for an empty one.
+txn_blocks(buffers: u32, revokes: u32) -> u32
+    if buffers == 0 && revokes == 0 then return 0
+    buffers + ceil_by(buffers, u32(DESCRIPTOR_TAGS)) + ceil_by(revokes, u32(REVOKE_ENTRIES)) + 1
+
+// The most credits one handle may open with: its transaction, alone, may then still declare that many
+// buffers and revoke that many blocks within `max_transaction`. 253 for the smallest journal.
+handle_limit(max_transaction: u32) -> u32
+    var c = max_transaction
+    while c > 0 && txn_blocks(c, c) > max_transaction
+        c -= 1
+    c
+
+// A committed transaction still in the log.
+struct Logged
+    seq: u64
+    // Its first log position and how many log blocks it takes, commit included.
+    first: u32
+    blocks: u32
+    // Its checkpoint list.
+    ids: Buf[usize]
+
+// The journal's whole state.
+struct Journal
+    running: Txn
+    committing: Txn
+    // Committed transactions in the log, oldest first, and the log blocks they hold.
+    logged: Buf[Logged]
+    used: u32
+    // The position the next log block is written at.
+    head: u32
+    // The journal superblock's changing fields as they are on the disk.
+    disk: JournalState
+    // Aborted: nothing more commits (section 5). Read-only: nothing more starts.
+    aborted: bool
+    read_only: bool
+    // The credits of a handle waiting for log room, 0 when none waits.
+    wanted: u32
+    // `handle_limit(max_transaction)`.
+    max_credits: u32
+
+new_journal(st: JournalState, read_only: bool, max_transaction: u32) -> Journal
+    Journal(fresh_txn(st.start_seq), no_txn(), buf(), 0, 1, st, false, read_only, 0, handle_limit(max_transaction))
+
+// What `begin` did.
+enum Begin
+    // The running transaction is now the committing one.
+    Started
+    // It has open handles (now closed to new ones), or a commit is already in progress.
+    Busy
+    // There was nothing to commit.
+    Nothing
+
+// What a checkpoint of the oldest committed transaction did.
+enum Cp
+    Done
+    // The log holds no committed transaction.
+    Empty
+    // A buffer on its list is pinned by the running or the committing transaction.
+    Held
+
+private index_of_u64(xs: Buf[u64], x: u64) -> Option[usize]
+    for i in 0..<xs.len()
+        if xs[i] == x then return Some(i)
+    None
+
+private drop_id(xs: Buf[usize], x: usize)
+    for i in 0..<xs.len()
+        if xs[i] == x
+            xs.remove(i)
+            return
+
+// A device result, aborting the journal on a failure: a write or flush the journal depends on that
+// does not happen leaves nothing it can promise (section 22).
+private io[D: BlockDevice, P: Platform](fs: *Fs[D, P], r: Result[unit, DeviceError]) -> Result[unit, FsError]
+    r match
+        Ok(_) -> Ok(())
+        Err(e) ->
+            abort_journal(fs, ERROR_EIO)
+            Err(FsError.Device(e))
+
+// The device block of log position `p`.
+private log_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], p: u32) -> u64 = fs.sb.journal_start + u64(p)
+
+private advance[D: BlockDevice, P: Platform](fs: *Fs[D, P], p: u32, n: u32) -> u32 = log_advance(fs.sb.journal_blocks, p, n)
+
+// The log's blocks.
+private log_len[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> u32 = fs.sb.journal_blocks - 1
+
+// The sequence the next logged transaction will have.
+private next_seq[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> u64
+    if fs.j.committing.live then fs.j.committing.seq else fs.j.running.seq
+
+// -- Handles --------------------------------------------------------------------------------------------
+
+// Join the running transaction with `credits`, or answer None when the opener has to wait: the running
+// transaction is closed, or it would outgrow `max_transaction` with this handle (it is closed now), or
+// it has been open `COMMIT_INTERVAL` (closed now), or the log has no room for it (the committer is told
+// how much is wanted). `Invalid` for credits no transaction could hold; `ReadOnly` once aborted.
+join_running[D: BlockDevice, P: Platform](fs: *Fs[D, P], op: string, credits: u32) -> Result[Option[Handle], FsError]
+    if fs.j.aborted || fs.j.read_only then return Err(FsError.ReadOnly)
+    if credits == 0 || credits > fs.j.max_credits then return Err(FsError.Invalid)
+    val now = fs.plat.monotonic_ms()
+    fs.plat.lock(LockId.Journal)
+    val r = fs.j.running
+    if r.closed
+        fs.plat.unlock(LockId.Journal)
+        return Ok(None)
+    if !r.empty() && now >= r.opened_ms + u64(COMMIT_INTERVAL_SECONDS) * 1000
+        fs.j.running.closed = true
+        fs.plat.unlock(LockId.Journal)
+        return Ok(None)
+    val after = txn_blocks(u32(r.ids.len()) + r.outstanding + credits, u32(r.revokes.len()) + r.outstanding_revokes + credits)
+    if after > fs.sb.max_transaction
+        fs.j.running.closed = true
+        fs.plat.unlock(LockId.Journal)
+        return Ok(None)
+    val committing = if fs.j.committing.live then fs.j.committing.reserved() else 0
+    if fs.j.used + committing + after > log_len(fs)
+        fs.j.wanted = credits
+        fs.plat.unlock(LockId.Journal)
+        return Ok(None)
+    if r.empty() then fs.j.running.opened_ms = now
+    fs.j.running.handles += 1
+    fs.j.running.outstanding += credits
+    fs.j.running.outstanding_revokes += credits
+    fs.j.wanted = 0
+    fs.plat.unlock(LockId.Journal)
+    Ok(Some(Handle(op, credits, r.seq, buf(), 0, None)))
+
+// Declare that `h` is about to change buffer `id` (under the buffer's lock, before the change).
+declare_access[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, id: usize) -> Result[unit, FsError]
+    h.refused match
+        Some(e) -> return Err(e)
+        None -> ()
+    if fs.j.aborted then return Err(FsError.ReadOnly)
+    val b = fs.buffers[id].block
+    var known = false
+    for x in h.used.view()
+        if x == b then known = true
+    if !known
+        if h.used.len() >= usize(h.credits)
+            fs.plat.fatal(Fatal.CreditOverrun(h.op, h.credits))
+            return Err(FsError.Bug)
+        h.used.push(b)
+    fs.plat.lock(LockId.Journal)
+    if !known then fs.j.running.outstanding -= 1
+    val bf = fs.buffers[id]
+    val seq = fs.j.running.seq
+    val mine = bf.txn == seq
+    // Journaling a block cancels its revoke in the same transaction (section 14, "Revocation").
+    index_of_u64(fs.j.running.revokes, b) match
+        Some(k) -> fs.j.running.revokes.remove(k)
+        None -> ()
+    if mine && bf.freed
+        drop_id(fs.j.running.freed, id)
+        fs.buffers.view()[id].freed = false
+    if !mine || bf.freed
+        // Step 3: the committing transaction keeps its own bytes of a buffer the next one changes.
+        if bf.committing != 0 && bf.frozen.len() == 0 then fs.buffers.view()[id].frozen = bf.data.copy()
+        fs.buffers.view()[id].txn = seq
+        fs.j.running.ids.push(id)
+    fs.plat.unlock(LockId.Journal)
+    Ok(())
+
+// Record that `h` freed metadata block `b`: a revoke record in the running transaction, and the buffer,
+// if cached, pinned until the transaction commits and then dropped unwritten. A copy of `b` the same
+// transaction had logged is dropped too: the revoke would cancel it anyway.
+revoke_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64)
+    h.refused match
+        Some(_) -> return
+        None -> ()
+    if fs.j.aborted then return
+    h.revoked += 1
+    if h.revoked > h.credits
+        fs.plat.fatal(Fatal.RevokeOverrun(h.op, h.credits))
+        return
+    val cached = fs.cached_id(b)
+    fs.plat.lock(LockId.Journal)
+    fs.j.running.outstanding_revokes -= 1
+    if index_of_u64(fs.j.running.revokes, b).is_none() then fs.j.running.revokes.push(b)
+    cached match
+        Some(id) ->
+            val bf = fs.buffers[id]
+            val seq = fs.j.running.seq
+            if !(bf.txn == seq && bf.freed)
+                if bf.txn == seq then drop_id(fs.j.running.ids, id)
+                fs.buffers.view()[id].freed = true
+                fs.buffers.view()[id].txn = seq
+                fs.j.running.freed.push(id)
+        None -> ()
+    fs.plat.unlock(LockId.Journal)
+
+// Put data block `b`'s new bytes on the running transaction's ordered list: written home before the
+// transaction is logged (step 2). A second write of the same block in the transaction replaces the first.
+add_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64, bytes: []const u8) -> Result[unit, FsError]
+    h.refused match
+        Some(e) -> return Err(e)
+        None -> ()
+    if fs.j.aborted then return Err(FsError.ReadOnly)
+    if bytes.len != BLOCK_SIZE then return Err(FsError.Invalid)
+    fs.plat.lock(LockId.Journal)
+    val t = fs.j.running
+    index_of_u64(t.data_blocks, b) match
+        Some(k) ->
+            for i in 0..<BLOCK_SIZE
+                t.data[k * BLOCK_SIZE + i] = bytes[i]
+        None ->
+            t.data_blocks.push(b)
+            t.data.extend(bytes)
+    fs.plat.unlock(LockId.Journal)
+    Ok(())
+
+// Close a handle. Its unspent credits leave the transaction's reservation. When it was the last handle of
+// a closed transaction, the commit is asked for (and run here when there is no commit thread).
+leave[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle)
+    h.refused match
+        Some(_) -> return
+        None -> ()
+    fs.plat.lock(LockId.Journal)
+    fs.j.running.handles -= 1
+    fs.j.running.outstanding -= h.credits - u32(h.used.len())
+    fs.j.running.outstanding_revokes -= h.credits - h.revoked
+    val due = fs.j.running.closed && fs.j.running.handles == 0
+    fs.plat.unlock(LockId.Journal)
+    if due && !fs.j.aborted && fs.plat.wake_committer()
+        val _ = commit_running(fs)
+
+// -- The commit -----------------------------------------------------------------------------------------
+
+// Step 1: make the running transaction the committing one, once it has no open handle, and open the
+// next. A running transaction with open handles is closed to new ones and left (`Busy`).
+begin[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[Begin, FsError]
+    if fs.j.aborted then return Err(FsError.ReadOnly)
+    fs.plat.lock(LockId.Journal)
+    if fs.j.committing.live
+        fs.plat.unlock(LockId.Journal)
+        return Ok(Begin.Busy)
+    val r = fs.j.running
+    if r.handles > 0
+        fs.j.running.closed = true
+        fs.plat.unlock(LockId.Journal)
+        return Ok(Begin.Busy)
+    if r.empty()
+        fs.j.running.closed = false
+        fs.plat.unlock(LockId.Journal)
+        return Ok(Begin.Nothing)
+    fs.j.committing = r
+    fs.j.committing.closed = true
+    for id in r.ids.view()
+        fs.buffers.view()[id].committing = r.seq
+        fs.buffers.view()[id].txn = 0
+    for id in r.freed.view()
+        fs.buffers.view()[id].committing = r.seq
+        fs.buffers.view()[id].txn = 0
+    fs.j.running = fresh_txn(if r.logs() then r.seq + 1 else r.seq)
+    fs.plat.unlock(LockId.Journal)
+    Ok(Begin.Started)
+
+// The bytes the committing transaction `seq` logs for buffer `id`: its frozen copy when the running
+// transaction has changed the buffer since, else the buffer itself. Under the buffer's lock.
+private copy_for_log[D: BlockDevice, P: Platform](fs: *Fs[D, P], id: usize, out: []u8)
+    val b = fs.buffers[id].block
+    fs.plat.lock(LockId.Buffer(b))
+    val bf = fs.buffers[id]
+    val src = if bf.frozen.len() > 0 then bf.frozen.view() else bf.data.view()
+    for i in 0..<BLOCK_SIZE
+        out[i] = src[i]
+    fs.plat.unlock(LockId.Buffer(b))
+
+private zero(b: []u8)
+    for i in 0..<b.len
+        b[i] = 0
+
+// Steps 2-7 for the committing transaction, in section 14's order: ordered data; descriptors, escaped
+// copies and revoke blocks; flush; the commit block; flush; then the buffers join its checkpoint list,
+// the blocks it freed are dropped, and `committed` releases its pending frees.
+finish[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
+    if !fs.j.committing.live then return Ok(())
+    if fs.j.aborted then return Err(FsError.ReadOnly)
+    val t = fs.j.committing
+    val seed = fs.seed
+
+    // Step 2: ordered data.
+    for i in 0..<t.data_blocks.len()
+        io(fs, fs.dev.write(t.data_blocks[i], t.data.view()[i * BLOCK_SIZE..<(i + 1) * BLOCK_SIZE]))?
+    if !t.logs()
+        io(fs, fs.dev.flush())?
+        fs.plat.lock(LockId.Journal)
+        fs.j.committing = no_txn()
+        fs.plat.unlock(LockId.Journal)
+        return Ok(())
+
+    val nbuf = u32(t.ids.len())
+    val nrev = u32(t.revokes.len())
+    val size = txn_blocks(nbuf, nrev)
+    if fs.j.used + size > log_len(fs)
+        fs.plat.fatal(Fatal.LogOverrun(t.seq))
+        abort_journal(fs, ERROR_EIO)
+        return Err(FsError.Bug)
+    val first = fs.j.head
+    // An empty log on the disk says so in its superblock: point it at this transaction before the
+    // flush that makes the transaction durable, or recovery would never look.
+    if fs.j.disk.start == 0
+        val st = JournalState(first, t.seq, fs.j.disk.error)
+        io(fs, write_journal_super(fs.dev, fs.sb, st))?
+        fs.j.disk = st
+
+    // Step 4: descriptors with their copies, then revoke blocks.
+    var desc = block_buf()
+    var copy = block_buf()
+    var pos = first
+    var i: u32 = 0
+    while i < nbuf
+        val n = if nbuf - i < u32(DESCRIPTOR_TAGS) then nbuf - i else u32(DESCRIPTOR_TAGS)
+        zero(desc.view())
+        val d: *DescriptorHeader = at(desc.view(), 0)
+        d.header.magic = JOURNAL_MAGIC
+        d.header.kind = JOURNAL_DESCRIPTOR
+        d.header.sequence = t.seq
+        d.count = n
+        for k in 0..<n
+            val id = t.ids[usize(i + k)]
+            copy_for_log(fs, id, copy.view())
+            val tag = tag_at(desc.view(), usize(k))
+            tag.block = fs.buffers[id].block
+            tag.flags = escape_copy(copy.view())
+            seal_tag(seed, t.seq, tag, copy.view())
+            io(fs, fs.dev.write(log_block(fs, advance(fs, pos, k + 1)), copy.view()))?
+        seal_journal_block(seed, desc.view())
+        io(fs, fs.dev.write(log_block(fs, pos), desc.view()))?
+        pos = advance(fs, pos, 1 + n)
+        i += n
+    var j: u32 = 0
+    while j < nrev
+        val n = if nrev - j < u32(REVOKE_ENTRIES) then nrev - j else u32(REVOKE_ENTRIES)
+        zero(desc.view())
+        val r: *RevokeHeader = at(desc.view(), 0)
+        r.header.magic = JOURNAL_MAGIC
+        r.header.kind = JOURNAL_REVOKE
+        r.header.sequence = t.seq
+        r.count = n
+        for k in 0..<n
+            put_le64(desc.view(), sizeof(RevokeHeader) + 8 * usize(k), t.revokes[usize(j + k)])
+        seal_journal_block(seed, desc.view())
+        io(fs, fs.dev.write(log_block(fs, pos), desc.view()))?
+        pos = advance(fs, pos, 1)
+        j += n
+
+    // Step 5: everything the commit block vouches for is durable before it is written.
+    io(fs, fs.dev.flush())?
+
+    // Step 6: the commit block, and the flush that makes it durable.
+    zero(desc.view())
+    val c: *Commit = at(desc.view(), 0)
+    c.header.magic = JOURNAL_MAGIC
+    c.header.kind = JOURNAL_COMMIT
+    c.header.sequence = t.seq
+    val when = fs.plat.now()
+    c.commit_sec = when.sec
+    c.commit_nsec = when.nsec
+    c.blocks = size - 1
+    seal_sector(seed, desc.view())
+    io(fs, fs.dev.write(log_block(fs, pos), desc.view()))?
+    io(fs, fs.dev.flush())?
+    pos = advance(fs, pos, 1)
+
+    // Step 7: committed.
+    fs.plat.lock(LockId.Journal)
+    fs.j.head = pos
+    fs.j.used += size
+    var list: Buf[usize] = buf()
+    for id in t.ids.view()
+        val old = fs.buffers[id].cp
+        if old != 0 then off_list(fs, old, id)
+        fs.buffers.view()[id].committing = 0
+        fs.buffers.view()[id].frozen = buf()
+        fs.buffers.view()[id].cp = t.seq
+        list.push(id)
+    fs.j.logged.push(Logged(t.seq, first, size, list))
+    var gone: Buf[usize] = buf()
+    for id in t.freed.view()
+        val old = fs.buffers[id].cp
+        if old != 0 then off_list(fs, old, id)
+        fs.buffers.view()[id].committing = 0
+        fs.buffers.view()[id].frozen = buf()
+        fs.buffers.view()[id].cp = 0
+        if fs.buffers[id].txn == 0 then gone.push(id) else fs.buffers.view()[id].freed = false
+    fs.j.committing = no_txn()
+    fs.plat.unlock(LockId.Journal)
+    for id in gone.view()
+        fs.forget(id)
+    fs.committed(t.seq)
+    Ok(())
+
+// Take buffer `id` off committed transaction `seq`'s checkpoint list. Under the journal lock.
+private off_list[D: BlockDevice, P: Platform](fs: *Fs[D, P], seq: u64, id: usize)
+    for l in fs.j.logged.view()
+        if l.seq == seq then drop_id(l.ids, id)
+
+// Commit the running transaction now, with any commit already in progress finished first. `Invalid`
+// while a handle is open in it: on one thread nothing could close that handle.
+commit_running[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
+    if fs.j.aborted then return Err(FsError.ReadOnly)
+    finish(fs)?
+    begin(fs)? match
+        Begin.Started -> finish(fs)
+        Begin.Busy -> Err(FsError.Invalid)
+        Begin.Nothing -> Ok(())
+
+// -- Checkpoint -----------------------------------------------------------------------------------------
+
+// Checkpoint the oldest committed transaction (section 14, "Checkpoint"): write its list home, flush,
+// move the journal superblock's `start` and `start_seq` to the oldest transaction left (or `start = 0`),
+// flush, and only then give its log blocks back.
+checkpoint_oldest[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[Cp, FsError]
+    if fs.j.aborted then return Err(FsError.ReadOnly)
+    fs.plat.lock(LockId.Journal)
+    if fs.j.logged.len() == 0
+        fs.plat.unlock(LockId.Journal)
+        return Ok(Cp.Empty)
+    val o = fs.j.logged[0]
+    var held = false
+    for id in o.ids.view()
+        if fs.buffers[id].pinned() then held = true
+    val list = o.ids.copy()
+    fs.plat.unlock(LockId.Journal)
+    if held then return Ok(Cp.Held)
+
+    for id in list.view()
+        val b = fs.buffers[id].block
+        fs.plat.lock(LockId.Buffer(b))
+        fs.plat.lock(LockId.Journal)
+        val pinned = fs.buffers[id].pinned()
+        fs.plat.unlock(LockId.Journal)
+        if pinned
+            fs.plat.unlock(LockId.Buffer(b))
+            return Ok(Cp.Held)
+        val w = fs.dev.write(b, fs.buffers[id].data.view())
+        fs.plat.unlock(LockId.Buffer(b))
+        io(fs, w)?
+    io(fs, fs.dev.flush())?
+
+    fs.plat.lock(LockId.Journal)
+    fs.j.logged.remove(0)
+    for id in list.view()
+        if fs.buffers[id].cp == o.seq then fs.buffers.view()[id].cp = 0
+    val st = if fs.j.logged.len() == 0 then JournalState(0, next_seq(fs), fs.j.disk.error) else JournalState(fs.j.logged[0].first, fs.j.logged[0].seq, fs.j.disk.error)
+    fs.plat.unlock(LockId.Journal)
+    io(fs, write_journal_super(fs.dev, fs.sb, st))?
+    io(fs, fs.dev.flush())?
+    fs.plat.lock(LockId.Journal)
+    fs.j.disk = st
+    fs.j.used -= o.blocks
+    fs.plat.unlock(LockId.Journal)
+    Ok(Cp.Done)
+
+// Commit everything and checkpoint everything: the log is empty and `start` is 0 on the disk.
+checkpoint_everything[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
+    loop
+        checkpoint_oldest(fs)? match
+            Cp.Done -> ()
+            Cp.Empty -> return Ok(())
+            Cp.Held -> commit_running(fs)?
+
+// -- The committer --------------------------------------------------------------------------------------
+
+// One unit of the committer's work, answering whether it got anywhere: finish a commit in progress;
+// else begin the running transaction if it is closed or older than `COMMIT_INTERVAL` and has no handle
+// open; else, when a handle waits for log room, checkpoint the oldest transaction, closing and committing
+// the running transaction first if the checkpoint needs it. False means only an open handle's `stop`
+// can let the journal move.
+committer_step[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[bool, FsError]
+    if fs.j.aborted then return Err(FsError.ReadOnly)
+    if fs.j.committing.live
+        finish(fs)?
+        return Ok(true)
+    val now = fs.plat.monotonic_ms()
+    fs.plat.lock(LockId.Journal)
+    val r = fs.j.running
+    val due = r.closed || (!r.empty() && now >= r.opened_ms + u64(COMMIT_INTERVAL_SECONDS) * 1000)
+    val wanted = fs.j.wanted
+    val short = wanted > 0 && fs.j.used + txn_blocks(u32(r.ids.len()) + r.outstanding + wanted, u32(r.revokes.len()) + r.outstanding_revokes + wanted) > log_len(fs)
+    fs.plat.unlock(LockId.Journal)
+    if due
+        begin(fs)? match
+            Begin.Started -> return Ok(true)
+            _ -> ()
+    if short
+        checkpoint_oldest(fs)? match
+            Cp.Done -> return Ok(true)
+            Cp.Empty -> return Ok(false)
+            Cp.Held ->
+                begin(fs)? match
+                    Begin.Started -> return Ok(true)
+                    _ -> return Ok(false)
+    Ok(false)
+
+// Open a handle, waiting as long as it takes: with no commit thread the waiting is the committer's work
+// done here. A handle that cannot be opened (aborted, read-only, too many credits, or no way forward)
+// comes back refused, and its first `write_access` answers why.
+open_handle[D: BlockDevice, P: Platform](fs: *Fs[D, P], op: string, credits: u32) -> Handle
+    loop
+        join_running(fs, op, credits) match
+            Err(e) -> return Handle(op, credits, 0, buf(), 0, Some(e))
+            Ok(Some(h)) -> return h
+            Ok(None) -> ()
+        if fs.plat.wake_committer()
+            committer_step(fs) match
+                Err(e) -> return Handle(op, credits, 0, buf(), 0, Some(e))
+                Ok(true) -> ()
+                Ok(false) ->
+                    fs.plat.fatal(Fatal.Deadlock(op))
+                    return Handle(op, credits, 0, buf(), 0, Some(FsError.Bug))
+        else
+            fs.plat.wait_for_commit()
+
+// -- Abort ----------------------------------------------------------------------------------------------
+
+// Abort the journal (section 5): the running transaction is discarded (its buffers stay pinned, so its
+// changes never reach home), nothing more commits, the filesystem is read-only, and `errno` is recorded
+// in the journal superblock's `error` — a direct write of one sector no transaction logs, so no replay
+// can clear it. The first error is the one kept.
+abort_journal[D: BlockDevice, P: Platform](fs: *Fs[D, P], errno: u32)
+    fs.plat.lock(LockId.Journal)
+    if fs.j.aborted
+        fs.plat.unlock(LockId.Journal)
+        return
+    fs.j.aborted = true
+    fs.j.read_only = true
+    if fs.j.disk.error == 0 then fs.j.disk.error = errno
+    val st = fs.j.disk
+    fs.plat.unlock(LockId.Journal)
+    if write_journal_super(fs.dev, fs.sb, st).is_ok()
+        val _ = fs.dev.flush()

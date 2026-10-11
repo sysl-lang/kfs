@@ -13,23 +13,27 @@ import sysl.sync.{Atomic, Ordering}
 //     lock(Buffer(b)); write_access(h, id)?; unlock(Buffer(b))     -- declare it, before any byte moves
 //     lock(Buffer(b)); <change the bytes>; unlock(Buffer(b))       -- then change it
 //
-// `write_access` is the seam the journal plugs into. It charges the buffer to the handle (a credit
-// overrun is a bug, section 14) and makes it part of the running transaction; in stage 5 it is also
-// where a buffer the committing transaction still owns is frozen before the change (section 14, step
-// 3), which is why it must come before the change and not after.
+// `write_access` is the seam the journal plugs into (journal.sysl). It charges the buffer to the handle
+// (a credit overrun is a bug, section 14), makes it part of the running transaction — which pins it:
+// it is never written home or evicted until that transaction commits — and, when the committing
+// transaction still has to log the buffer, takes the frozen copy it will log (section 14, step 3).
+// That is why it must come before the change and not after.
 //
-// **Handles and the transaction.** `start` opens a handle with a credit count and joins the running
-// transaction; `stop` closes it. `commit` commits the running transaction when no handle is open. In
-// this stage that is a write-through: every buffer of the transaction is written in place and the
-// device flushed. Stage 5 replaces the body of `commit` with the journal's commit (log, flush, commit
-// block, flush, checkpoint later); everything above it calls the same five things. Either way a
-// commit ends with `committed(seq)`, the commit callback, which is what returns the transaction's
-// freed blocks to the allocatable pool (section 17).
+// **Handles and transactions.** `start` opens a handle with a credit count on the running
+// transaction, waiting for room in the log or for a commit if it must; `stop` closes it. A transaction
+// commits once it is closed and its last handle has left: by `commit`/`sync`, by `stop` when it was
+// closed, or by the committer (`journal_step`). Its commit is section 14's: ordered data, the log,
+// flush, the commit block, flush — and then `committed(seq)`, which returns its freed blocks to the
+// allocatable pool (section 17). `checkpoint` writes committed buffers home and frees log space.
 //
 // **The totals** of section 19 are two atomics, moved by the same deltas as the descriptors under the
 // same group lock. A block freed by a transaction that has not committed is in its descriptor's
 // `free_blocks` (the bitmap bit is clear) but not yet in `free_blocks_total` (section 20), so the
 // total is always the sum of the descriptors less the blocks pending free.
+//
+// **Errors.** Corruption found anywhere (`corrupt`) and a failed device write or flush the journal
+// needed abort the journal (section 22): the filesystem turns read-only and the error is recorded in
+// the journal superblock, where the next mount finds it.
 
 enum Corruption
     // A bitmap block disagrees with the checksum its group's descriptor holds for it.
@@ -88,8 +92,10 @@ enum FsError
     // A bug in KFS; the platform's `fatal` was told first.
     Bug
     // An argument no caller should pass: a zero-length request, a mode with no file type, a commit
-    // while a handle is open.
+    // while a handle is open, a handle asking for more credits than a transaction can hold.
     Invalid
+    // EROFS: the filesystem was mounted read-only, or its journal has aborted.
+    ReadOnly
 
 impl From[DeviceError] for FsError
     from(e: DeviceError) -> FsError = FsError.Device(e)
@@ -97,20 +103,39 @@ impl From[DeviceError] for FsError
 impl From[OpenError] for FsError
     from(e: OpenError) -> FsError = FsError.Open(e)
 
-// One cached metadata block.
+// One cached metadata block, with its journal state (journal.sysl, "Buffer states").
 struct Buffer
     block: u64
     data: Buf[u8]
-    // The sequence of the transaction the buffer belongs to, 0 when it belongs to none.
+    // The sequence of the running transaction that changed or freed it; 0 when none.
     txn: u64
+    // The sequence of the committing transaction that logs it; 0 when none.
+    committing: u64
+    // The committing transaction's bytes, taken when the running one first changed it; empty otherwise.
+    frozen: Buf[u8]
+    // The sequence of the committed transaction whose checkpoint list holds it; 0 when none.
+    cp: u64
+    // Freed (revoked) by the transaction in `txn` or `committing`: never written home again.
+    freed: bool
+    // Whether the slot holds a buffer at all.
+    valid: bool
+
+    // Pinned: an uncommitted transaction holds it, so it may not be written home or evicted.
+    pinned(self) -> bool = self.txn != 0 || self.committing != 0
+
+private empty_slot() -> Buffer = Buffer(0, buf(), 0, 0, buf(), 0, false, false)
 
 // An operation's handle on the running transaction (section 14). `op` names the operation in a credit
-// failure; `used` is the blocks of the distinct buffers it has declared.
+// failure; `used` is the blocks of the distinct buffers it has declared and `revoked` how many blocks it
+// has revoked. A handle that could not be opened is `refused`, with the reason its first
+// `write_access` answers.
 struct Handle
     op: string
     credits: u32
     seq: u64
     private[kfs] used: Buf[u64]
+    private[kfs] revoked: u32
+    refused: Option[FsError]
 
     // How many credits it has used.
     spent(self) -> u32 = u32(self.used.len())
@@ -139,10 +164,7 @@ struct Fs[D: BlockDevice, P: Platform]
     free_inodes_total: Atomic[u64]
     private[kfs] buffers: Buf[Buffer]
     private[kfs] groups: Buf[GroupState]
-    // The running transaction: its sequence, its buffers and how many handles are open in it.
-    private[kfs] seq: u64
-    private[kfs] txn_buffers: Buf[usize]
-    private[kfs] handles: u32
+    private[kfs] j: Journal
 
     // -- Buffers -------------------------------------------------------------------------------------
 
@@ -160,74 +182,143 @@ struct Fs[D: BlockDevice, P: Platform]
         val raced = self.cached(b)
         val id = raced match
             Some(other) -> other
-            None ->
-                self.buffers.push(Buffer(b, data, 0))
-                self.buffers.len() - 1
+            None -> self.place(Buffer(b, data, 0, 0, buf(), 0, false, true))
         self.plat.unlock(LockId.Cache)
         Ok(id)
 
+    // A free slot for `bf`, or a new one. Under the cache lock.
+    private place(*self, bf: Buffer) -> usize
+        for i in 0..<self.buffers.len()
+            if !self.buffers[i].valid
+                self.buffers[i] = bf
+                return i
+        self.buffers.push(bf)
+        self.buffers.len() - 1
+
     private cached(self, b: u64) -> Option[usize]
         for i in 0..<self.buffers.len()
-            if self.buffers[i].block == b then return Some(i)
+            if self.buffers[i].valid && self.buffers[i].block == b then return Some(i)
         None
+
+    // The buffer holding block `b` if one is cached.
+    cached_id(*self, b: u64) -> Option[usize]
+        self.plat.lock(LockId.Cache)
+        val r = self.cached(b)
+        self.plat.unlock(LockId.Cache)
+        r
+
+    // Drop buffer `id` from the cache. Its id may then name another block.
+    private[kfs] forget(*self, id: usize)
+        self.plat.lock(LockId.Cache)
+        self.buffers[id] = empty_slot()
+        self.plat.unlock(LockId.Cache)
 
     // A buffer's block number and bytes.
     block_of(self, id: usize) -> u64 = self.buffers[id].block
     bytes(self, id: usize) -> []u8 = self.buffers[id].data.view()
 
-    // -- Handles and the transaction -----------------------------------------------------------------
+    // Whether buffer `id` is pinned by an uncommitted transaction.
+    pinned(self, id: usize) -> bool = self.buffers[id].pinned()
+
+    // How many buffers are cached.
+    cached_count(self) -> usize
+        var n: usize = 0
+        for bf in self.buffers.view()
+            if bf.valid then n += 1
+        n
+
+    // Evict buffer `id`: refused (false) while it is pinned; a committed buffer not yet checkpointed is
+    // written home first (a checkpoint write, section 14). Call it only where no id is held across the
+    // call, since the slot is reused.
+    evict(*self, id: usize) -> Result[bool, FsError]
+        val b = self.buffers[id].block
+        self.plat.lock(LockId.Buffer(b))
+        self.plat.lock(LockId.Journal)
+        val bf = self.buffers[id]
+        self.plat.unlock(LockId.Journal)
+        if !bf.valid || bf.pinned()
+            self.plat.unlock(LockId.Buffer(b))
+            return Ok(false)
+        if bf.cp != 0
+            val w = self.dev.write(b, bf.data.view())
+            if w.is_err()
+                self.plat.unlock(LockId.Buffer(b))
+                abort_journal(self, ERROR_EIO)
+                return Err(FsError.Device(DeviceError.Io))
+            self.plat.lock(LockId.Journal)
+            for l in self.j.logged.view()
+                if l.seq == bf.cp
+                    for i in 0..<l.ids.len()
+                        if l.ids[i] == id
+                            l.ids.remove(i)
+                            break
+            self.plat.unlock(LockId.Journal)
+        self.plat.unlock(LockId.Buffer(b))
+        self.forget(id)
+        Ok(true)
+
+    // -- Handles and transactions ----------------------------------------------------------------------
 
     // Open a handle for operation `op` with `credits` buffers to spend, joining the running
-    // transaction. (Stage 5: may wait for room in the log or for a commit.)
-    start(*self, op: string, credits: u32) -> Handle
-        self.plat.lock(LockId.Journal)
-        self.handles += 1
-        val seq = self.seq
-        self.plat.unlock(LockId.Journal)
-        Handle(op, credits, seq, buf())
+    // transaction; it waits for room in the log or for a commit when it must (journal.sysl). A handle
+    // that cannot be opened comes back refused: `write_access` answers why.
+    start(*self, op: string, credits: u32) -> Handle = open_handle(self, op, credits)
+
+    // Join the running transaction now, or answer None when the opener would have to wait (a commit
+    // thread, or a test playing one, then runs `journal_step`). `Invalid` for more credits than a
+    // transaction can hold; `ReadOnly` on a read-only or aborted filesystem.
+    try_start(*self, op: string, credits: u32) -> Result[Option[Handle], FsError] = join_running(self, op, credits)
 
     // Declare that `h` is about to change buffer `id`. Call it under the buffer's lock, before the
     // change. A buffer the handle has not declared before costs one credit; past the last credit the
     // platform is told of the bug and the call answers `Bug`.
-    write_access(*self, h: *Handle, id: usize) -> Result[unit, FsError]
-        val b = self.buffers[id].block
-        var known = false
-        for x in h.used.view()
-            if x == b then known = true
-        if !known
-            if h.used.len() >= usize(h.credits)
-                self.plat.fatal(Fatal.CreditOverrun(h.op, h.credits))
-                return Err(FsError.Bug)
-            h.used.push(b)
-        self.plat.lock(LockId.Journal)
-        if self.buffers[id].txn != h.seq
-            self.buffers.view()[id].txn = h.seq
-            self.txn_buffers.push(id)
-        self.plat.unlock(LockId.Journal)
-        Ok(())
+    write_access(*self, h: *Handle, id: usize) -> Result[unit, FsError] = declare_access(self, h, id)
+
+    // Data block `b`'s new bytes, written home before `h`'s transaction is logged (data=ordered).
+    write_data(*self, h: *Handle, b: u64, bytes: []const u8) -> Result[unit, FsError] = add_data(self, h, b, bytes)
+
+    // A metadata block (an extent-tree node, a directory block, an xattr block) was freed in `h`: a
+    // revoke record in its transaction (section 14, "Revocation"), so replay of an older copy cannot
+    // overwrite whatever the block holds next. Journaling the block again in the same transaction
+    // cancels it.
+    revoke(*self, h: *Handle, b: u64) = revoke_block(self, h, b)
 
     // Close a handle. Its changes stay in the running transaction until it commits.
-    stop(*self, h: *Handle)
-        self.plat.lock(LockId.Journal)
-        self.handles -= 1
-        self.plat.unlock(LockId.Journal)
+    stop(*self, h: *Handle) = leave(self, h)
 
-    // Commit the running transaction. Stage 3 writes every buffer it holds in place and flushes; stage
-    // 5 replaces this with the journal's commit. Every handle must be closed.
+    // Commit the running transaction now (finishing any commit in progress first). Every handle must
+    // be closed: `Invalid` otherwise.
     commit(*self) -> Result[unit, FsError]
-        if self.handles != 0 then return Err(FsError.Invalid)
-        for id in self.txn_buffers.view()
-            val b = self.buffers[id].block
-            self.plat.lock(LockId.Buffer(b))
-            val wrote = self.dev.write(b, self.buffers[id].data.view())
-            self.buffers.view()[id].txn = 0
-            self.plat.unlock(LockId.Buffer(b))
-            wrote?
-        self.dev.flush()?
-        val done = self.seq
-        self.seq += 1
-        self.txn_buffers.clear()
-        self.committed(done)
+        if self.j.running.handles != 0 then return Err(FsError.Invalid)
+        commit_running(self)
+
+    // The two halves of a commit, for a committer that lets handles run in between: `commit_begin` is
+    // step 1 (false while handles are open or another commit is in progress, or when there is nothing
+    // to commit); `commit_finish` is steps 2-7.
+    commit_begin(*self) -> Result[bool, FsError]
+        begin(self)? match
+            Begin.Started -> Ok(true)
+            _ -> Ok(false)
+
+    commit_finish(*self) -> Result[unit, FsError] = finish(self)
+
+    // Checkpoint the oldest committed transaction; false when it could not (the log is empty, or a
+    // buffer it must write home is pinned).
+    checkpoint(*self) -> Result[bool, FsError]
+        checkpoint_oldest(self)? match
+            Cp.Done -> Ok(true)
+            _ -> Ok(false)
+
+    // Commit and checkpoint everything: the log is empty and `start` is 0 on the disk.
+    checkpoint_all(*self) -> Result[unit, FsError] = checkpoint_everything(self)
+
+    // One step of the committer's work; false when nothing could move. A kernel commit thread loops on
+    // it; a host test playing that thread calls it between its simulated operations.
+    journal_step(*self) -> Result[bool, FsError] = committer_step(self)
+
+    // The committer's timer: commit the running transaction when it has been open `COMMIT_INTERVAL`.
+    tick(*self) -> Result[unit, FsError]
+        val _ = committer_step(self)?
         Ok(())
 
     // The commit callback: transaction `seq` is durable, so the blocks it freed (and any older
@@ -253,15 +344,66 @@ struct Fs[D: BlockDevice, P: Platform]
         if self.plat.wake_committer() then return self.commit()
         Ok(())
 
-    // The running transaction's sequence.
-    running(self) -> u64 = self.seq
+    // Corruption found while mounted: the journal aborts (section 22) and the error to answer.
+    corrupt(*self, c: Corruption) -> FsError
+        abort_journal(self, ERROR_EIO)
+        FsError.Corrupt(c)
 
-    // A metadata block (an extent-tree node, a directory block, an xattr block) was freed in `h`. The
-    // journal must revoke it in `h`'s transaction (section 14, "Revocation"), or replay of an older copy
-    // could overwrite whatever the block holds next. Stage 3's write-through commit keeps no log, so
-    // there is nothing to revoke yet; stage 5 records the revoke here, and every caller already calls
-    // it.
-    revoke(*self, h: *Handle, b: u64) = ()
+    // Abort the journal with `errno` (section 5).
+    abort(*self, errno: u32) = abort_journal(self, errno)
+
+    // The running transaction's sequence.
+    running(self) -> u64 = self.j.running.seq
+
+    // The journal's state, for the tests and the tools: read-only, aborted, the error recorded, the log
+    // blocks held by committed transactions, the next log position, how many committed transactions
+    // are in the log, and the journal superblock's `start` and `start_seq` as on the disk.
+    read_only(self) -> bool = self.j.read_only
+    aborted(self) -> bool = self.j.aborted
+    journal_error(self) -> u32 = self.j.disk.error
+    log_used(self) -> u32 = self.j.used
+    log_head(self) -> u32 = self.j.head
+    logged_count(self) -> usize = self.j.logged.len()
+    log_start(self) -> u32 = self.j.disk.start
+    log_start_seq(self) -> u64 = self.j.disk.start_seq
+    // The most credits one handle may ask for.
+    max_credits(self) -> u32 = self.j.max_credits
+    // Whether a transaction is committing, and the running transaction's open handles.
+    committing(self) -> bool = self.j.committing.live
+    open_handles(self) -> u32 = self.j.running.handles
+
+    // Unmount (section 18): commit, checkpoint everything, and write the superblock directly with exact
+    // totals and `CLEAN`. An aborted filesystem writes `ERROR` directly instead; a read-only one writes
+    // nothing.
+    unmount(*self) -> Result[unit, FsError]
+        if self.j.aborted
+            var blk = block_buf()
+            self.dev.read(1, blk.view())?
+            val sb: *Superblock = at(blk.view(), 0)
+            sb.state = sb.state | STATE_ERROR
+            seal_superblock(blk.view())
+            self.dev.write(1, blk.view())?
+            self.dev.flush()?
+            self.sb.state = self.sb.state | STATE_ERROR
+            return Ok(())
+        if self.j.read_only then return Ok(())
+        if self.j.running.handles != 0 then return Err(FsError.Invalid)
+        self.checkpoint_all()?
+        val id = self.buffer(1)?
+        self.plat.lock(LockId.Buffer(1))
+        val bytes = self.bytes(id)
+        val sb: *Superblock = at(bytes, 0)
+        sb.state = sb.state | STATE_CLEAN
+        sb.free_blocks = self.free_blocks_total.load()
+        sb.free_inodes = self.free_inodes_total.load()
+        sb.write_time = self.plat.now().sec
+        seal_superblock(bytes)
+        val w = self.dev.write(1, bytes)
+        self.sb = *sb
+        self.plat.unlock(LockId.Buffer(1))
+        w?
+        self.dev.flush()?
+        Ok(())
 
     // -- Where things are ----------------------------------------------------------------------------
 
@@ -281,10 +423,45 @@ struct Fs[D: BlockDevice, P: Platform]
     // Blocks pending free in group `g`.
     pending_in(self, g: u32) -> u32 = self.groups[usize(g)].pending_blocks
 
-// Mount `dev`: verify the superblock and descriptors (`open`), and take the totals from the
-// descriptors.
+// Set bits `set` and clear bits `clear` of the superblock's `state` on the disk, directly, and flush;
+// everything else in block 1 stays as it is there. Only while the log is empty (section 5).
+private set_state_directly[D: BlockDevice](dev: *D, set: u16, clear: u16, mounting: Option[i64]) -> Result[Superblock, DeviceError]
+    var blk = block_buf()
+    dev.read(1, blk.view())?
+    val sb: *Superblock = at(blk.view(), 0)
+    sb.state = (sb.state | set) & ~clear
+    mounting match
+        Some(now) ->
+            sb.mount_count += 1
+            sb.mount_time = now
+            sb.write_time = now
+        None -> ()
+    seal_superblock(blk.view())
+    dev.write(1, blk.view())?
+    dev.flush()?
+    Ok(*sb)
+
+// Mount `dev` (section 18, "Mount and unmount"), in this order: read and verify the superblock and
+// descriptors; refuse unknown incompat features; recover (section 15: replay, then a recorded `error`
+// becomes `ERROR`); read-only for unknown ro_compat features, `ERROR`, a device without flush, or a
+// log recovery could not replay; the totals from the descriptors; then, read-write only, clear `CLEAN`,
+// count the mount and stamp its time — the last direct write before transactions start.
 mount[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D, P], FsError]
-    val m = open(dev)?
+    var m = open(dev)?
+    if m.sb.feature_incompat != 0 then return Err(FsError.Open(OpenError.UnknownFeatures))
+    val rec = recover(dev, m.sb)?
+    var st = rec.st
+    if rec.replayed > 0 then m = open(dev)?
+    if !rec.corrupt && st.error != 0
+        // Section 15, step 6: the log is empty now, so the direct write is safe; `error` is cleared
+        // only once `ERROR` is durable.
+        set_state_directly(dev, STATE_ERROR, 0, None)?
+        st.error = 0
+        write_journal_super(dev, m.sb, st)?
+        dev.flush()?
+        m = open(dev)?
+    val read_only = rec.corrupt || m.sb.state & STATE_ERROR != 0 || m.sb.feature_ro_compat != 0 || !dev.has_flush()
+
     var blocks: u64 = 0
     var inodes: u64 = 0
     var groups: Buf[GroupState] = buf()
@@ -292,4 +469,8 @@ mount[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D, P], FsError
         blocks += u64(d.free_blocks)
         inodes += u64(d.free_inodes)
         groups.push(GroupState(buf(), 0, false, false))
-    Ok(Fs(dev, plat, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, 1, buf(), 0))
+    var p = plat
+    if !read_only
+        m.sb = set_state_directly(dev, 0, STATE_CLEAN, Some(p.now().sec))?
+        // The orphan list (section 16) is processed here, in ordinary transactions (stage 6).
+    Ok(Fs(dev, p, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, new_journal(st, read_only, m.sb.max_transaction)))

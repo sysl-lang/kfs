@@ -7,10 +7,11 @@ module keel.kfs
 //   the same code runs over the kernel's sleeping `Mutex`es and spinning `IrqLock`s and over the host's
 //   no-ops. Which kind each one is, and the order they are taken in, is section 19's table; `rank`
 //   below is that order, and the host implementation checks it on every acquisition.
-// - **A clock**, for the times an allocation stamps on a new inode.
+// - **Clocks**: the wall time an allocation stamps on a new inode, and a monotonic one the commit
+//   interval is measured on.
 // - **The committer hook**: asked to commit the running transaction, the platform either wakes its
 //   commit thread (the kernel's `kfs-commit`) or answers that there is none, and the caller commits
-//   inline (the host).
+//   inline (the host). With a thread, a handle that must wait sleeps in `wait_for_commit`.
 //
 // Plus one exit for a bug in KFS itself (`fatal`): the kernel stops, a host test fails.
 
@@ -51,6 +52,16 @@ enum Fatal
     // Operation `op` added more buffers to its handle than the `credits` it opened with (section 14,
     // "Credits are checked, not trusted").
     CreditOverrun(op: string, credits: u32)
+    // Operation `op` revoked more blocks than its `credits`: every revoked block is one the operation
+    // freed after declaring it, so a handle never revokes more blocks than it may declare.
+    RevokeOverrun(op: string, credits: u32)
+    // Operation `op` waits for room in the log, and the journal can make none: every way forward needs
+    // a handle that this same thread holds open. On the host, where the committer runs inline, that is
+    // a test opening a second handle while holding the first.
+    Deadlock(op: string)
+    // A transaction about to be logged does not fit in the log's free space. The reservation of
+    // section 14 makes this impossible; it is checked before a log block is written.
+    LogOverrun(seq: u64)
 
 trait Platform
     // Take and release a lock. Taking may sleep for a sleeping lock and spins for a leaf.
@@ -60,9 +71,18 @@ trait Platform
     // The time now.
     now(*self) -> Time
 
+    // A monotonic clock in milliseconds, which only moves forward: the age of the running transaction
+    // against `COMMIT_INTERVAL` is measured on it.
+    monotonic_ms(*self) -> u64
+
     // Ask for the running transaction to be committed. True when there is no commit thread and the
     // caller must commit it itself, now; false when a commit thread was woken and will do it.
     wake_committer(*self) -> bool
+
+    // Sleep until the commit thread has moved the journal on: a commit or a checkpoint finished. Called
+    // only after `wake_committer` answered false, by a handle waiting to open (section 14, "Log space is
+    // reserved when a handle joins").
+    wait_for_commit(*self)
 
     // A bug in KFS. The kernel stops here; a host test fails here unless it is the test of this very
     // failure, in which case the call returns and the operation answers `FsError.Bug`.
