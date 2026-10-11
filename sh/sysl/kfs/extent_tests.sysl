@@ -1,0 +1,1416 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The extent tree of section 9 on formatted RamDevices.
+//
+// Every claim is checked by an oracle that does not share the tree's code: `walk` reads the inode and
+// every node block straight from the buffers and checks section 9's rules itself — magic, header,
+// `count <= max <= capacity`, keys strictly increasing, extents not overlapping, each child's entries
+// inside the range its parent gives it and its first key equal to its parent's key, every child one
+// level below its parent (so all leaves at one depth), the tail's owner and generation, the checksum,
+// and every mapped block and node block in use in the bitmap. The model-based test then compares what
+// the walk found, and what `lookup` answers, against a plain map from logical block to (physical,
+// unwritten) after every step.
+
+private type HostFs = Fs[RamDevice, HostPlatform]
+
+private entropy() -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i) + 11)
+    e
+
+private formatted_device(blocks: u64, o: Options) -> RamDevice
+    var dev = ram_device(blocks)
+    val e = entropy()
+    format(&dev, o, e.view(), 1_700_000_000) match
+        Ok(_) -> dev
+        Err(_) -> panic("the format was refused")
+
+// 32 MiB with the defaults: four groups of 2048 blocks, the journal in group 2.
+private standard_device() -> RamDevice = formatted_device(8192, default_options())
+
+private mounted_fs(dev: *RamDevice) -> HostFs
+    mount(dev, host_platform()) match
+        Ok(fs) -> fs
+        Err(_) -> panic("the filesystem did not mount")
+
+private ok(r: Result[unit, FsError])
+    r match
+        Ok(_) -> ()
+        Err(_) -> panic("an operation failed")
+
+private ok_id(r: Result[usize, FsError]) -> usize
+    r match
+        Ok(i) -> i
+        Err(_) -> panic("a buffer could not be read")
+
+private ok_run(r: Result[Run, FsError]) -> Run
+    r match
+        Ok(run) -> run
+        Err(_) -> panic("a block allocation failed")
+
+private ok_u64(r: Result[u64, FsError]) -> u64
+    r match
+        Ok(v) -> v
+        Err(_) -> panic("an operation answering a number failed")
+
+private ok_depth(r: Result[u16, FsError]) -> u16
+    r match
+        Ok(v) -> v
+        Err(_) -> panic("the depth could not be read")
+
+private ok_map(r: Result[Mapping, FsError]) -> Mapping
+    r match
+        Ok(m) -> m
+        Err(_) -> panic("a lookup failed")
+
+private fault_number(f: NodeFault) -> i64
+    f match
+        NodeFault.Checksum -> 1
+        NodeFault.Magic -> 2
+        NodeFault.Owner -> 3
+        NodeFault.Generation -> 4
+        NodeFault.Depth -> 5
+        NodeFault.Header -> 6
+        NodeFault.Entry -> 7
+        NodeFault.Order -> 8
+        NodeFault.Range -> 9
+        NodeFault.Key -> 10
+
+// How a call failed, as a number a test can compare: 0 for success, 100 + the fault for a refused node.
+private failure[T](r: Result[T, FsError]) -> i64
+    r match
+        Ok(_) -> 0
+        Err(FsError.NoSpace) -> 1
+        Err(FsError.Bug) -> 2
+        Err(FsError.Invalid) -> 3
+        Err(FsError.TooBig) -> 4
+        Err(FsError.Corrupt(Corruption.Inode(_))) -> 5
+        Err(FsError.Corrupt(Corruption.Extent(_, _, f))) -> 100 + fault_number(f)
+        Err(_) -> 99
+
+// The block a refused node was named by, or 0.
+private faulty_block[T](r: Result[T, FsError]) -> u64
+    r match
+        Err(FsError.Corrupt(Corruption.Extent(_, b, _))) -> b
+        _ -> 0
+
+private file_inode(fs: *HostFs) -> u64
+    var h = fs.start("create", 3)
+    val r = alloc_inode(fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO))
+    fs.stop(&h)
+    ok_u64(r)
+
+// `want` blocks for data, from `goal`, as uid 0.
+private data(fs: *HostFs, goal: u64, want: u32) -> Run
+    var h = fs.start("write", C_GROUP)
+    val r = ok_run(alloc_blocks(fs, &h, goal, want, 0))
+    fs.stop(&h)
+    r
+
+private give_back(fs: *HostFs, r: Run)
+    var h = fs.start("undo", C_GROUP)
+    ok(free_blocks(fs, &h, r.first, r.len))
+    fs.stop(&h)
+
+private put(fs: *HostFs, t: ExtentTree, logical: u64, r: Run, unwritten: bool) -> Result[unit, FsError]
+    var h = fs.start("insert", C_EXT)
+    val res = insert(fs, &h, t, Extent(logical, r.len, r.first, unwritten))
+    fs.stop(&h)
+    res
+
+private written(fs: *HostFs, t: ExtentTree, l: u64, n: u32) -> Result[unit, FsError]
+    var h = fs.start("convert", C_EXT)
+    val res = convert(fs, &h, t, l, n)
+    fs.stop(&h)
+    res
+
+// Unmap [a, b) in steps of one extent, each in a handle of a punch step's unit (section 14).
+private unmap(fs: *HostFs, t: ExtentTree, a: u64, b: u64) -> Result[u64, FsError]
+    var hi = b
+    loop
+        var h = fs.start("punch", C_EXT + C_GROUP)
+        val r = remove(fs, &h, t, a, hi, 1)
+        fs.stop(&h)
+        // FINDINGS 77: the `Err` arm cannot take the `u64` from the `Ok` arm.
+        val next: u64 = r match
+            Ok(n) -> n
+            Err(e) -> return Err(e)
+        if next <= a then return Ok(a)
+        hi = next
+
+// `count` single-block extents at logical `from`, `from + 2`, ... — a gap between each, so none merge.
+private fill(fs: *HostFs, t: ExtentTree, from: u64, count: u32)
+    for i in 0..<u64(count)
+        ok(put(fs, t, from + 2 * i, data(fs, fs.geo.data_start(1), 1), false))
+
+private inode_of(fs: *HostFs, ino: u64) -> *Inode
+    val loc = fs.inode_location(ino)
+    at(fs.bytes(ok_id(fs.buffer(loc.block))), loc.offset)
+
+// Give inode `ino`'s root a smaller `max` (section 9: a test's tree may use any max from 1 up).
+private set_root_max(fs: *HostFs, ino: u64, m: u16)
+    var h = fs.start("setattr", C_INODE)
+    val loc = fs.inode_location(ino)
+    val id = ok_id(fs.buffer(loc.block))
+    fs.plat.lock(LockId.Buffer(loc.block))
+    ok(fs.write_access(&h, id))
+    val head: *NodeHeader = at(fs.bytes(id), loc.offset + 112)
+    head.max = m
+    seal_inode(fs.seed, ino, fs.bytes(id)[loc.offset..<loc.offset + INODE_SIZE])
+    fs.plat.unlock(LockId.Buffer(loc.block))
+    fs.stop(&h)
+
+// A tree with small nodes, so that a few dozen extents reach depth 4.
+private small_tree(fs: *HostFs, ino: u64, root_max: u16, node_max: u16) -> ExtentTree
+    set_root_max(fs, ino, root_max)
+    ExtentTree(ino, 0, node_max)
+
+// -- The oracle ---------------------------------------------------------------------------------------
+
+private struct Seen
+    extents: Buf[ExtentLeaf]
+    nodes: Buf[u64]
+    depth: u16
+    root_count: u16
+    why: string
+
+private in_use(fs: *HostFs, b: u64) -> bool
+    val g = fs.block_group(b)
+    val bits = fs.bytes(ok_id(fs.buffer(fs.geo.block_bitmap(g))))
+    bit_test(bits, usize(b - fs.geo.group_first(g)))
+
+private entry(bytes: []u8, base: usize, i: usize) -> ExtentLeaf
+    val p: *ExtentLeaf = at(bytes, base + 16 + 16 * i)
+    *p
+
+// One node at `base` in `bytes`, which its parent allows the range [lo, hi); "" when it keeps every rule.
+private visit(fs: *HostFs, ino: u64, generation: u32, bytes: []u8, base: usize, capacity: usize, lo: u64, hi: u64, root: bool, want_depth: u16, seen: Seen, crc: bool) -> string
+    val head: *NodeHeader = at(bytes, base)
+    if head.magic != EXTENT_MAGIC then return "a node's magic"
+    if head.max == 0 || usize(head.max) > capacity then return "a node's max outside 1 ... its capacity"
+    if head.count > head.max then return "a node's count above its max"
+    if root
+        if usize(head.depth) > EXTENT_MAX_DEPTH then return "the root deeper than EXTENT_MAX_DEPTH"
+    else
+        if head.depth != want_depth then return "a child not one level below its parent"
+        if head.count == 0 then return "an empty node block"
+    val depth = head.depth
+    val count = usize(head.count)
+    for i in 0..<count
+        val e = entry(bytes, base, i)
+        if i > 0 && e.logical <= entry(bytes, base, i - 1).logical then return "keys not strictly increasing"
+        if u64(e.logical) < lo then return "an entry below its parent's range"
+        if !root && i == 0 && u64(e.logical) != lo then return "an index key that is not its child's first key"
+        if depth == 0
+            if e.len == 0 || u32(e.len) > EXTENT_MAX_LEN || e.flags > 1 then return "a malformed extent"
+            if i > 0
+                val prev = entry(bytes, base, i - 1)
+                if u64(prev.logical) + u64(prev.len) > u64(e.logical) then return "overlapping extents"
+            if u64(e.logical) + u64(e.len) > hi then return "an extent past its parent's range"
+            for j in 0..<u64(e.len)
+                if !in_use(fs, e.physical + j) then return "a mapped block free in the bitmap"
+            seen.extents.push(e)
+        else
+            if u64(e.logical) >= hi then return "an index key past its parent's range"
+            if e.len != 0 || e.flags != 0 then return "an index entry's reserved word"
+            val child_hi = if i + 1 < count then u64(entry(bytes, base, i + 1).logical) else hi
+            if !in_use(fs, e.physical) then return "a node block free in the bitmap"
+            for n in seen.nodes.view()
+                if n == e.physical then return "a node block reached twice"
+            seen.nodes.push(e.physical)
+            val cb = fs.bytes(ok_id(fs.buffer(e.physical)))
+            if crc && !verify_block(fs.seed, cb) then return "a node block's checksum"
+            if le64(cb, TAIL_OFFSET) != ino then return "a node block's owner"
+            if le32(cb, TAIL_OFFSET + 8) != generation then return "a node block's generation"
+            val r = visit(fs, ino, generation, cb, 0, EXTENT_NODE_SLOTS, u64(e.logical), child_hi, false, depth - 1, seen, crc)
+            if r.len > 0 then return r
+    ""
+
+private walk_with(fs: *HostFs, ino: u64, crc: bool) -> Seen
+    val loc = fs.inode_location(ino)
+    val bytes = fs.bytes(ok_id(fs.buffer(loc.block)))
+    var seen = Seen(buf(), buf(), 0, 0, "")
+    if !verify_inode(fs.seed, ino, bytes[loc.offset..<loc.offset + INODE_SIZE])
+        seen.why = "the inode's checksum"
+        return seen
+    val node: *Inode = at(bytes, loc.offset)
+    val head: *NodeHeader = at(bytes, loc.offset + 112)
+    seen.depth = head.depth
+    seen.root_count = head.count
+    seen.why = visit(fs, ino, node.generation, bytes, loc.offset + 112, EXTENT_ROOT_SLOTS, 0, LOGICAL_BLOCKS, true, 0, seen, crc)
+    seen
+
+private walk(fs: *HostFs, ino: u64) -> Seen
+    val s = walk_with(fs, ino, true)
+    if s.why.len > 0
+        print("extent tree oracle: " + s.why)
+        panic("the tree breaks a rule of section 9")
+    s
+
+// Blocks marked in use across every group's bitmap.
+private used_blocks(fs: *HostFs) -> u64
+    var used: u64 = 0
+    for g in 0..<fs.geo.group_count
+        val bits = fs.bytes(ok_id(fs.buffer(fs.geo.block_bitmap(g))))
+        val n = fs.geo.group_len(g)
+        used += u64(n - count_clear(bits, usize(n)))
+    used
+
+// The totals against the descriptors, and each descriptor against its bitmap; "" when they agree.
+private totals_agree(fs: *HostFs) -> string
+    var blocks: u64 = 0
+    var pending: u64 = 0
+    for g in 0..<fs.geo.group_count
+        val d: *GroupDesc = at(fs.bytes(ok_id(fs.buffer(fs.desc_block(g)))), fs.desc_offset(g))
+        val bits = fs.bytes(ok_id(fs.buffer(fs.geo.block_bitmap(g))))
+        if count_clear(bits, usize(fs.geo.group_len(g))) != d.free_blocks then return "a descriptor's free blocks against its bitmap"
+        if bitmap_crc(fs.seed, g, bits) != d.block_bitmap_crc then return "a bitmap's checksum in its descriptor"
+        blocks += u64(d.free_blocks)
+        pending += u64(fs.pending_in(g))
+    if fs.free_blocks_total.load() != blocks - pending then return "the free-blocks total"
+    ""
+
+private extents_of(fs: *HostFs, ino: u64) -> Buf[ExtentLeaf] = walk(fs, ino).extents
+
+private is_hole(m: Mapping) -> bool
+    m match
+        Mapping.Hole -> true
+        _ -> false
+
+private physical_of(m: Mapping) -> u64
+    m match
+        Mapping.Mapped(p, _, _) -> p
+        Mapping.Hole -> 0
+
+private run_of(m: Mapping) -> u32
+    m match
+        Mapping.Mapped(_, r, _) -> r
+        Mapping.Hole -> 0
+
+private unwritten_of(m: Mapping) -> bool
+    m match
+        Mapping.Mapped(_, _, u) -> u
+        Mapping.Hole -> false
+
+private same(a: ExtentLeaf, logical: u64, len: u64, physical: u64, flags: u16) -> bool
+    u64(a.logical) == logical && u64(a.len) == len && a.physical == physical && a.flags == flags
+
+// -- Lookup, the root, and growth from the top ---------------------------------------------------------
+
+@test("an empty tree: every block is a hole, removal finds nothing and declares nothing")
+empty_tree()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    assert(is_hole(ok_map(lookup(&fs, ino, 0))))
+    assert(is_hole(ok_map(lookup(&fs, ino, 4_000_000_000))))
+    assert(is_hole(ok_map(lookup(&fs, ino, LOGICAL_BLOCKS - 1))))
+    assert_eq(ok_depth(depth_of(&fs, ino)), 0)
+    var h = fs.start("truncate", 64)
+    assert_eq(ok_u64(remove(&fs, &h, t, 0, LOGICAL_BLOCKS, 16)), 0)
+    assert_eq(h.spent(), 0)
+    fs.stop(&h)
+    assert_eq(walk(&fs, ino).extents.len(), 0)
+    assert_eq(inode_of(&fs, ino).blocks, 0)
+
+@test("one extent: its blocks map in order with the rest of the run, either side is a hole, blocks counts it")
+one_extent()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = data(&fs, fs.geo.data_start(1), 5)
+    ok(put(&fs, t, 100, r, false))
+    assert(is_hole(ok_map(lookup(&fs, ino, 99))))
+    assert(is_hole(ok_map(lookup(&fs, ino, 105))))
+    for j in 0..<5
+        val m = ok_map(lookup(&fs, ino, 100 + u64(j)))
+        assert_eq(physical_of(m), r.first + u64(j))
+        assert_eq(run_of(m), 5 - u32(j))
+        assert(!unwritten_of(m))
+    assert_eq(inode_of(&fs, ino).blocks, 5)
+    val s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 1)
+    assert(same(s.extents[0], 100, 5, r.first, 0))
+    assert_eq(fs.plat.held(), 0)
+
+@test("an unwritten extent maps its blocks and says so")
+unwritten_extent()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = data(&fs, fs.geo.data_start(1), 3)
+    ok(put(&fs, t, 7, r, true))
+    val m = ok_map(lookup(&fs, ino, 8))
+    assert_eq(physical_of(m), r.first + 1)
+    assert(unwritten_of(m))
+    assert(same(extents_of(&fs, ino)[0], 7, 3, r.first, EXTENT_UNWRITTEN))
+
+@test("seven extents fit in the inode; the eighth moves them into a node block of the inode's group")
+root_push_down()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    fill(&fs, t, 0, 7)
+    var s = walk(&fs, ino)
+    assert_eq(s.depth, 0)
+    assert_eq(s.root_count, 7)
+    assert_eq(s.nodes.len(), 0)
+    assert_eq(inode_of(&fs, ino).blocks, 7)
+    fill(&fs, t, 14, 1)
+    s = walk(&fs, ino)
+    assert_eq(s.depth, 1)
+    assert_eq(s.root_count, 1)
+    assert_eq(s.nodes.len(), 1)
+    assert_eq(s.extents.len(), 8)
+    assert_eq(inode_of(&fs, ino).blocks, 9)
+    assert_eq(fs.block_group(s.nodes[0]), fs.inode_group(ino))
+    val nb = fs.bytes(ok_id(fs.buffer(s.nodes[0])))
+    val head: *NodeHeader = at(nb, 0)
+    assert_eq(head.max, u16(EXTENT_NODE_SLOTS))
+    assert_eq(head.count, 8)
+    assert_eq(le64(nb, TAIL_OFFSET), ino)
+    assert_eq(le32(nb, TAIL_OFFSET + 8), inode_of(&fs, ino).generation)
+    for i in 0..<8
+        assert(!is_hole(ok_map(lookup(&fs, ino, 2 * u64(i)))))
+        assert(is_hole(ok_map(lookup(&fs, ino, 2 * u64(i) + 1))))
+    // And on the disk, read back by a fresh mount.
+    ok(fs.commit())
+    var again = mounted_fs(&dev)
+    assert_eq(walk(&again, ino).extents.len(), 8)
+    assert(!is_hole(ok_map(lookup(&again, ino, 14))))
+
+@test("a leaf exactly full takes one more by splitting into halves, the new leaf's first key going up")
+leaf_split()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = small_tree(&fs, ino, 2, 4)
+    fill(&fs, t, 0, 4)
+    var s = walk(&fs, ino)
+    assert_eq(s.depth, 1)
+    assert_eq(s.nodes.len(), 1)
+    val full: *NodeHeader = at(fs.bytes(ok_id(fs.buffer(s.nodes[0]))), 0)
+    assert_eq(full.count, 4)
+    fill(&fs, t, 8, 1)
+    s = walk(&fs, ino)
+    assert_eq(s.depth, 1)
+    assert_eq(s.root_count, 2)
+    assert_eq(s.nodes.len(), 2)
+    val left: *NodeHeader = at(fs.bytes(ok_id(fs.buffer(s.nodes[0]))), 0)
+    val right: *NodeHeader = at(fs.bytes(ok_id(fs.buffer(s.nodes[1]))), 0)
+    assert_eq(left.count, 3)
+    assert_eq(right.count, 2)
+    val loc = fs.inode_location(ino)
+    val rb = fs.bytes(ok_id(fs.buffer(loc.block)))
+    assert_eq(entry(rb, loc.offset + 112, 0).logical, 0)
+    assert_eq(entry(rb, loc.offset + 112, 1).logical, 6)
+    assert_eq(inode_of(&fs, ino).blocks, 5 + 2)
+
+@test("splits reach every level up to depth 4, each within C_EXT credits, and a fifth level is refused")
+splits_to_depth_four()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = small_tree(&fs, ino, 2, 2)
+    var depth: u16 = 0
+    var reached: Buf[u16] = buf()
+    var most: u32 = 0
+    var i: u64 = 0
+    loop
+        val r = data(&fs, fs.geo.data_start(1), 1)
+        val used = used_blocks(&fs)
+        val before = walk(&fs, ino)
+        var h = fs.start("insert", C_EXT)
+        val res = insert(&fs, &h, t, Extent(2 * i, 1, r.first, false))
+        if h.spent() > most then most = h.spent()
+        fs.stop(&h)
+        if failure(res) == 4
+            // Refused before anything changed: the same tree, no node allocated, no lock held.
+            val after = walk(&fs, ino)
+            assert_eq(after.extents.len(), before.extents.len())
+            assert_eq(after.nodes.len(), before.nodes.len())
+            assert_eq(after.depth, 4)
+            assert_eq(used_blocks(&fs), used)
+            assert_eq(fs.plat.held(), 0)
+            give_back(&fs, r)
+            break
+        assert_eq(failure(res), 0)
+        val d = ok_depth(depth_of(&fs, ino))
+        if d != depth
+            reached.push(d)
+            depth = d
+        i += 1
+    assert_eq(reached.len(), 4)
+    for k in 0..<reached.len()
+        assert_eq(reached[k], u16(k) + 1)
+    // Depth 3 holds at most 2 x 2^3 extents; depth 4 was needed for more, and held them all.
+    assert(i > 16)
+    assert(most <= C_EXT)
+    val s = walk(&fs, ino)
+    assert_eq(u64(s.extents.len()), i)
+    assert_eq(inode_of(&fs, ino).blocks, i + u64(s.nodes.len()))
+    for k in 0..<i
+        assert(!is_hole(ok_map(lookup(&fs, ino, 2 * k))))
+    assert(fs.plat.most_groups_held <= 1)
+
+@test("an extent at logical 0 and one at 2^32 - 1 both map; past 2^32 is EFBIG")
+logical_limits()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val a = data(&fs, fs.geo.data_start(1), 1)
+    val b = data(&fs, fs.geo.data_start(1), 2)
+    ok(put(&fs, t, 0, a, false))
+    ok(put(&fs, t, LOGICAL_BLOCKS - 1, Run(b.first, 1), false))
+    assert_eq(physical_of(ok_map(lookup(&fs, ino, 0))), a.first)
+    val top = ok_map(lookup(&fs, ino, LOGICAL_BLOCKS - 1))
+    assert_eq(physical_of(top), b.first)
+    assert_eq(run_of(top), 1)
+    assert(is_hole(ok_map(lookup(&fs, ino, LOGICAL_BLOCKS))))
+    assert(is_hole(ok_map(lookup(&fs, ino, LOGICAL_BLOCKS - 2))))
+    assert_eq(failure(put(&fs, t, LOGICAL_BLOCKS - 1, b, false)), 4)
+    assert_eq(failure(put(&fs, t, LOGICAL_BLOCKS, Run(b.first + 1, 1), false)), 4)
+    assert_eq(failure(put(&fs, t, LOGICAL_BLOCKS - 2, b, false)), 3)
+    assert_eq(walk(&fs, ino).extents.len(), 2)
+    assert_eq(ok_u64(unmap(&fs, t, LOGICAL_BLOCKS - 1, LOGICAL_BLOCKS + 5)), LOGICAL_BLOCKS - 1)
+    assert(is_hole(ok_map(lookup(&fs, ino, LOGICAL_BLOCKS - 1))))
+    assert(!in_use(&fs, b.first))
+
+@test("lengths: 1 and a whole group's data area are accepted; 0, past EXTENT_MAX_LEN, or a run leaving its data area are not")
+extent_lengths()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val one = data(&fs, fs.geo.data_start(1), 1)
+    ok(put(&fs, t, 0, one, false))
+    val start = fs.geo.data_start(3)
+    val area = fs.geo.data_blocks(3)
+    val all = data(&fs, start, area)
+    assert_eq(all.first, start)
+    assert_eq(all.len, area)
+    ok(put(&fs, t, 10, all, false))
+    assert_eq(physical_of(ok_map(lookup(&fs, ino, 10 + u64(area) - 1))), start + u64(area) - 1)
+    assert_eq(run_of(ok_map(lookup(&fs, ino, 10))), area)
+    assert_eq(inode_of(&fs, ino).blocks, 1 + u64(area))
+    // Refused, whatever the bitmap says: section 9's length and the one-data-area rule.
+    assert_eq(failure(put(&fs, t, 50_000, Run(start, 0), false)), 3)
+    assert_eq(failure(put(&fs, t, 50_000, Run(fs.geo.data_start(1), EXTENT_MAX_LEN + 1), false)), 3)
+    assert_eq(failure(put(&fs, t, 50_000, Run(fs.geo.data_start(1), EXTENT_MAX_LEN), false)), 3)
+    assert_eq(failure(put(&fs, t, 50_000, Run(fs.geo.group_end(1) - 2, 4), false)), 3)
+    assert_eq(failure(put(&fs, t, 50_000, Run(fs.geo.block_bitmap(1), 1), false)), 3)
+    assert_eq(failure(put(&fs, t, 50_000, Run(fs.geo.journal_start + 5, 1), false)), 3)
+    assert_eq(failure(put(&fs, t, 50_000, Run(1, 1), false)), 3)
+    assert_eq(walk(&fs, ino).extents.len(), 2)
+    // The whole area unmapped at once: one extent, freed.
+    assert_eq(ok_u64(unmap(&fs, t, 10, 10 + u64(area))), 10)
+    assert(!in_use(&fs, start))
+    assert(!in_use(&fs, start + u64(area) - 1))
+    assert_eq(totals_agree(&fs), "")
+
+@test("adjacent extents merge when contiguous both ways with equal flags, and not otherwise")
+merging()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = data(&fs, fs.geo.data_start(1), 12)
+    ok(put(&fs, t, 10, Run(r.first, 4), false))
+    ok(put(&fs, t, 14, Run(r.first + 4, 3), false))
+    var s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 1)
+    assert(same(s.extents[0], 10, 7, r.first, 0))
+    // Contiguous both ways but unwritten: kept apart.
+    ok(put(&fs, t, 17, Run(r.first + 7, 2), true))
+    // Logically next but not physically: kept apart.
+    ok(put(&fs, t, 19, Run(r.first + 10, 1), false))
+    s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 3)
+    assert(same(s.extents[1], 17, 2, r.first + 7, EXTENT_UNWRITTEN))
+    assert(same(s.extents[2], 19, 1, r.first + 10, 0))
+    // Physically next but logically apart: kept apart.
+    ok(put(&fs, t, 30, Run(r.first + 11, 1), false))
+    assert_eq(walk(&fs, ino).extents.len(), 4)
+    // Filling the gap between two contiguous neighbours makes one extent of three.
+    val q = data(&fs, fs.geo.data_start(1), 6)
+    ok(put(&fs, t, 100, Run(q.first, 2), false))
+    ok(put(&fs, t, 104, Run(q.first + 4, 2), false))
+    assert_eq(walk(&fs, ino).extents.len(), 6)
+    ok(put(&fs, t, 102, Run(q.first + 2, 2), false))
+    s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 5)
+    assert(same(s.extents[4], 100, 6, q.first, 0))
+    // Mapped: 7 + 2 + 1 + 1 of the first run (its block r + 9 never was) and all 6 of the second.
+    assert_eq(inode_of(&fs, ino).blocks, 11 + 6)
+
+@test("an insert overlapping a mapped block is refused and changes nothing")
+overlapping_insert()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = small_tree(&fs, ino, 2, 2)
+    fill(&fs, t, 0, 12)
+    val before = walk(&fs, ino)
+    val spare = fs.geo.data_start(3)
+    assert_eq(failure(put(&fs, t, 4, Run(spare, 1), false)), 3)
+    assert_eq(failure(put(&fs, t, 3, Run(spare, 2), false)), 3)
+    assert_eq(failure(put(&fs, t, 21, Run(spare, 3), false)), 3)
+    val after = walk(&fs, ino)
+    assert_eq(after.extents.len(), before.extents.len())
+    assert_eq(after.nodes.len(), before.nodes.len())
+    // Into a hole right up to the next extent is fine.
+    ok(put(&fs, t, 3, data(&fs, spare, 1), false))
+
+// -- Removal --------------------------------------------------------------------------------------------
+
+// Three four-block extents at 0, 10 and 20.
+private three(fs: *HostFs, t: ExtentTree) -> Run
+    val r = data(fs, fs.geo.data_start(1), 12)
+    ok(put(fs, t, 0, Run(r.first, 4), false))
+    ok(put(fs, t, 10, Run(r.first + 4, 4), false))
+    ok(put(fs, t, 20, Run(r.first + 8, 4), false))
+    r
+
+@test("removing exactly one extent frees its blocks and leaves its neighbours")
+remove_one_extent()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = three(&fs, t)
+    assert_eq(ok_u64(unmap(&fs, t, 10, 14)), 10)
+    val s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 2)
+    assert(same(s.extents[1], 20, 4, r.first + 8, 0))
+    for j in 0..<4
+        assert(!in_use(&fs, r.first + 4 + u64(j)))
+        assert(in_use(&fs, r.first + u64(j)))
+    assert_eq(inode_of(&fs, ino).blocks, 8)
+
+@test("removing a range inside one extent splits it in two and frees only the middle")
+remove_inside_one()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = three(&fs, t)
+    assert_eq(ok_u64(unmap(&fs, t, 21, 23)), 21)
+    val s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 4)
+    assert(same(s.extents[2], 20, 1, r.first + 8, 0))
+    assert(same(s.extents[3], 23, 1, r.first + 11, 0))
+    assert(in_use(&fs, r.first + 8))
+    assert(!in_use(&fs, r.first + 9))
+    assert(!in_use(&fs, r.first + 10))
+    assert(in_use(&fs, r.first + 11))
+    assert_eq(inode_of(&fs, ino).blocks, 10)
+
+@test("removing a range straddling two extents shortens both")
+remove_straddling_two()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = three(&fs, t)
+    assert_eq(ok_u64(unmap(&fs, t, 2, 12)), 2)
+    val s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 3)
+    assert(same(s.extents[0], 0, 2, r.first, 0))
+    assert(same(s.extents[1], 12, 2, r.first + 6, 0))
+    assert_eq(inode_of(&fs, ino).blocks, 8)
+
+@test("removing a range in a hole answers at once and declares no buffer")
+remove_in_hole()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    three(&fs, t)
+    var h = fs.start("punch", 86)
+    assert_eq(ok_u64(remove(&fs, &h, t, 5, 9, 16)), 5)
+    assert_eq(ok_u64(remove(&fs, &h, t, 30, 1000, 16)), 30)
+    assert_eq(ok_u64(remove(&fs, &h, t, 9, 9, 16)), 9)
+    assert_eq(h.spent(), 0)
+    fs.stop(&h)
+    assert_eq(walk(&fs, ino).extents.len(), 3)
+
+@test("removing the first and the last block of an extent shortens it at each end")
+remove_first_and_last()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = data(&fs, fs.geo.data_start(1), 8)
+    ok(put(&fs, t, 0, r, false))
+    assert_eq(ok_u64(unmap(&fs, t, 0, 1)), 0)
+    assert_eq(ok_u64(unmap(&fs, t, 7, 8)), 7)
+    val s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 1)
+    assert(same(s.extents[0], 1, 6, r.first + 1, 0))
+    assert(!in_use(&fs, r.first))
+    assert(!in_use(&fs, r.first + 7))
+    assert(is_hole(ok_map(lookup(&fs, ino, 0))))
+    assert_eq(physical_of(ok_map(lookup(&fs, ino, 1))), r.first + 1)
+
+@test("removing the whole file leaves an empty inline root, blocks 0, and every block back")
+remove_whole_file()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val baseline = used_blocks(&fs)
+    val t = small_tree(&fs, ino, 2, 2)
+    fill(&fs, t, 0, 30)
+    assert_eq(ok_depth(depth_of(&fs, ino)), 4)
+    var h = fs.start("truncate", 200)
+    var end = LOGICAL_BLOCKS
+    while end > 0
+        end = ok_u64(remove(&fs, &h, t, 0, end, 16))
+    fs.stop(&h)
+    val s = walk(&fs, ino)
+    assert_eq(s.depth, 0)
+    assert_eq(s.root_count, 0)
+    assert_eq(inode_of(&fs, ino).blocks, 0)
+    assert_eq(used_blocks(&fs), baseline)
+    assert_eq(totals_agree(&fs), "")
+    ok(fs.commit())
+    assert_eq(totals_agree(&fs), "")
+
+@test("a truncation step stops after its limit and answers where it stopped, never splitting")
+truncation_steps()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    fill(&fs, t, 0, 40)
+    var h = fs.start("truncate", 64)
+    val used = used_blocks(&fs)
+    // Down to logical 9: extents at 78, 76, ... 10 go, 9 is a hole between 8 and 10.
+    var end = ok_u64(remove(&fs, &h, t, 9, LOGICAL_BLOCKS, 16))
+    assert_eq(end, 48)
+    assert(h.spent() <= 64)
+    fs.stop(&h)
+    assert_eq(used_blocks(&fs), used - 16)
+    while end > 9
+        var step = fs.start("truncate", 64)
+        end = ok_u64(remove(&fs, &step, t, 9, end, 16))
+        assert(step.spent() <= 64)
+        fs.stop(&step)
+    val s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 5)
+    assert_eq(s.depth, 0)
+
+@test("a punch splitting an extent in a full tree fits a punch step's credits")
+punch_split_credits()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = data(&fs, fs.geo.data_start(1), 10)
+    ok(put(&fs, t, 0, r, false))
+    fill(&fs, t, 20, 6)
+    assert_eq(walk(&fs, ino).root_count, 7)
+    var h = fs.start("punch", 64 + C_EXT + C_GROUP)
+    assert_eq(ok_u64(remove(&fs, &h, t, 3, 5, 16)), 3)
+    assert(h.spent() <= 64 + C_EXT + C_GROUP)
+    fs.stop(&h)
+    val s = walk(&fs, ino)
+    assert_eq(s.depth, 1)
+    assert_eq(s.extents.len(), 8)
+    assert(same(s.extents[0], 0, 3, r.first, 0))
+    assert(same(s.extents[1], 5, 5, r.first + 5, 0))
+
+@test("removing back down from depth 4 frees every emptied node and collapses to an inline root")
+collapse_from_depth_four()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val baseline = used_blocks(&fs)
+    val t = small_tree(&fs, ino, 2, 2)
+    fill(&fs, t, 0, 30)
+    assert_eq(ok_depth(depth_of(&fs, ino)), 4)
+    var last = ok_depth(depth_of(&fs, ino))
+    var k: u64 = 29
+    while k >= 2
+        assert_eq(ok_u64(unmap(&fs, t, 2 * k, 2 * k + 1)), 2 * k)
+        val s = walk(&fs, ino)
+        assert(s.depth <= last)
+        last = s.depth
+        assert_eq(inode_of(&fs, ino).blocks, k + u64(s.nodes.len()))
+        assert_eq(used_blocks(&fs), baseline + k + u64(s.nodes.len()))
+        k -= 1
+    val s = walk(&fs, ino)
+    assert_eq(s.depth, 0)
+    assert_eq(s.root_count, 2)
+    assert_eq(s.nodes.len(), 0)
+    assert_eq(inode_of(&fs, ino).blocks, 2)
+    assert(!is_hole(ok_map(lookup(&fs, ino, 2))))
+
+@test("with real node sizes, eight extents back to seven moves them back into the inode")
+collapse_real_sizes()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    fill(&fs, t, 0, 8)
+    val node = walk(&fs, ino).nodes[0]
+    assert(in_use(&fs, node))
+    assert_eq(ok_u64(unmap(&fs, t, 6, 7)), 6)
+    val s = walk(&fs, ino)
+    assert_eq(s.depth, 0)
+    assert_eq(s.root_count, 7)
+    assert(!in_use(&fs, node))
+    assert_eq(inode_of(&fs, ino).blocks, 7)
+
+@test("removal from the front carries the new first key up every level")
+keys_carried_up()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = small_tree(&fs, ino, 2, 2)
+    fill(&fs, t, 0, 20)
+    for k in 0..<15
+        assert_eq(ok_u64(unmap(&fs, t, 0, 2 * u64(k) + 1)), 0)
+        val s = walk(&fs, ino)
+        assert_eq(u64(s.extents[0].logical), 2 * u64(k) + 2)
+    // And an insert below every key carries it down again.
+    ok(put(&fs, t, 1, data(&fs, fs.geo.data_start(1), 1), false))
+    assert_eq(walk(&fs, ino).extents[0].logical, 1)
+
+// -- Unwritten to written ---------------------------------------------------------------------------------
+
+@test("converting the first, a middle, the last and then every block of an unwritten extent")
+conversions()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = data(&fs, fs.geo.data_start(1), 10)
+    ok(put(&fs, t, 0, r, true))
+    ok(written(&fs, t, 0, 2))
+    var s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 2)
+    assert(same(s.extents[0], 0, 2, r.first, 0))
+    assert(same(s.extents[1], 2, 8, r.first + 2, EXTENT_UNWRITTEN))
+    ok(written(&fs, t, 4, 2))
+    s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 4)
+    assert(same(s.extents[1], 2, 2, r.first + 2, EXTENT_UNWRITTEN))
+    assert(same(s.extents[2], 4, 2, r.first + 4, 0))
+    assert(same(s.extents[3], 6, 4, r.first + 6, EXTENT_UNWRITTEN))
+    ok(written(&fs, t, 8, 2))
+    s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 5)
+    assert(same(s.extents[3], 6, 2, r.first + 6, EXTENT_UNWRITTEN))
+    assert(same(s.extents[4], 8, 2, r.first + 8, 0))
+    // The rest: each conversion joins its written neighbours, until one written extent is left.
+    ok(written(&fs, t, 2, 2))
+    ok(written(&fs, t, 6, 2))
+    s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 1)
+    assert(same(s.extents[0], 0, 10, r.first, 0))
+    assert_eq(inode_of(&fs, ino).blocks, 10)
+    // A whole unwritten extent in one conversion.
+    val q = data(&fs, fs.geo.data_start(1), 5)
+    ok(put(&fs, t, 20, q, true))
+    ok(written(&fs, t, 20, 5))
+    assert(same(walk(&fs, ino).extents[1], 20, 5, q.first, 0))
+    assert(!unwritten_of(ok_map(lookup(&fs, ino, 24))))
+
+@test("a conversion of written blocks, of a hole, or across an extent's end is refused and changes nothing")
+conversion_refusals()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = extent_tree(ino, 0)
+    val r = data(&fs, fs.geo.data_start(1), 8)
+    ok(put(&fs, t, 0, Run(r.first, 4), false))
+    ok(put(&fs, t, 4, Run(r.first + 4, 4), true))
+    assert_eq(failure(written(&fs, t, 0, 1)), 3)
+    assert_eq(failure(written(&fs, t, 20, 1)), 3)
+    assert_eq(failure(written(&fs, t, 6, 3)), 3)
+    assert_eq(failure(written(&fs, t, 3, 2)), 3)
+    assert_eq(failure(written(&fs, t, 4, 0)), 3)
+    val s = walk(&fs, ino)
+    assert_eq(s.extents.len(), 2)
+    assert(same(s.extents[1], 4, 4, r.first + 4, EXTENT_UNWRITTEN))
+
+@test("a conversion that splits a full leaf grows the tree like an insert")
+conversion_splits()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = small_tree(&fs, ino, 2, 2)
+    val r = data(&fs, fs.geo.data_start(1), 9)
+    ok(put(&fs, t, 0, r, true))
+    fill(&fs, t, 20, 1)
+    assert_eq(ok_depth(depth_of(&fs, ino)), 0)
+    ok(written(&fs, t, 3, 2))
+    val s = walk(&fs, ino)
+    assert_eq(s.depth, 1)
+    assert_eq(s.extents.len(), 4)
+    assert(same(s.extents[1], 3, 2, r.first + 3, 0))
+    assert_eq(inode_of(&fs, ino).blocks, 10 + u64(s.nodes.len()))
+
+// -- Running out of space -----------------------------------------------------------------------------------
+
+@test("an insert that needs a node when none can be allocated answers NoSpace and changes nothing")
+node_no_space()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = ExtentTree(ino, 1000, u16(EXTENT_NODE_SLOTS))
+    var mine: Buf[Run] = buf()
+    for i in 0..<8
+        mine.push(data(&fs, fs.geo.data_start(1), 1))
+    // Leave only the reserve: uid 1000 may not dip into it for the node.
+    loop
+        var h = fs.start("hog", C_GROUP)
+        val r = alloc_blocks(&fs, &h, fs.geo.data_start(0), 2048, 1000)
+        fs.stop(&h)
+        if failure(r) != 0 then break
+    for i in 0..<mine.len() - 1
+        ok(put(&fs, t, 2 * u64(i), mine[i], false))
+    val used = used_blocks(&fs)
+    assert_eq(failure(put(&fs, t, 14, mine[7], false)), 1)
+    val s = walk(&fs, ino)
+    assert_eq(s.depth, 0)
+    assert_eq(s.root_count, 7)
+    assert_eq(inode_of(&fs, ino).blocks, 7)
+    assert_eq(used_blocks(&fs), used)
+    assert_eq(fs.plat.held(), 0)
+    // As uid 0 the reserve is there to take.
+    ok(put(&fs, extent_tree(ino, 0), 14, mine[7], false))
+    assert_eq(walk(&fs, ino).depth, 1)
+
+// -- Verification on every read -------------------------------------------------------------------------------
+
+private read_dev(dev: *RamDevice, b: u64) -> Buf[u8]
+    var out = new_block()
+    assert(dev.read(b, out.view()).is_ok())
+    out
+
+private write_dev(dev: *RamDevice, b: u64, bytes: []const u8)
+    assert(dev.write(b, bytes).is_ok())
+
+// A file whose tree is two levels of small nodes (root max 1, nodes of 3), committed:
+//
+//     root -> index node I (keys 0, 4, 8) -> leaf L1 [0, 2], leaf L2 [4, 6], leaf L3 [8, 10, 12]
+//
+// so a lookup of block 2 reads I and then L1, and one of block 3 reads I and then L2.
+private struct Built
+    ino: u64
+    index: u64
+    leaf: u64
+    next_leaf: u64
+
+private build(dev: *RamDevice) -> Built
+    var fs = mounted_fs(dev)
+    val ino = file_inode(&fs)
+    val t = small_tree(&fs, ino, 1, 3)
+    fill(&fs, t, 0, 7)
+    val s = walk(&fs, ino)
+    assert_eq(s.depth, 2)
+    assert_eq(s.nodes.len(), 4)
+    ok(fs.commit())
+    Built(ino, s.nodes[0], s.nodes[1], s.nodes[2])
+
+// One way to break a node of the built tree, each breaking exactly one rule of section 9.
+private enum Damage
+    // A byte of L1's entries flipped, the checksum left as it was.
+    FlipByte
+    // L1's magic changed.
+    Magic
+    // L1's tail names the next inode.
+    Owner
+    // L1's tail names the inode's previous generation.
+    Generation
+    // L1 says it is at depth 1 under a depth-1 parent.
+    LeafDepth
+    // I says it is at depth 0 under the depth-2 root.
+    IndexDepth
+    // L1's count above its max of 3.
+    CountOverMax
+    // L1's max above the capacity of 254.
+    MaxOverCapacity
+    // L1 with no entries.
+    NoEntries
+    // L1's second key equal to its first.
+    Unsorted
+    // L1's last extent long enough to reach L2's first key.
+    PastNextKey
+    // I's key for L2 lowered below L2's first key.
+    KeyNotFirst
+    // L1's first extent of length 0.
+    ZeroLength
+    // L1's first extent with a flag section 9 does not define.
+    UnknownFlag
+
+private put_u16(b: Buf[u8], at: usize, v: u16)
+    b[at] = u8(v & 0xFF)
+    b[at + 1] = u8(v >> 8)
+
+private put_u32(b: Buf[u8], at: usize, v: u32)
+    for k in at..<at + 4
+        b[k] = u8((v >> u32(8 * (k - at))) & 0xFF)
+
+private put_u64(b: Buf[u8], at: usize, v: u64)
+    for k in at..<at + 8
+        b[k] = u8((v >> u64(8 * (k - at))) & 0xFF)
+
+// Apply `d` to the node's bytes `b`.
+private apply(d: Damage, b: Buf[u8])
+    d match
+        Damage.FlipByte -> put_u16(b, 40, u16(b[40] ^ 1) | (u16(b[41]) << 8))
+        Damage.Magic -> put_u32(b, 0, 0x1234_5678)
+        Damage.Owner -> put_u64(b, TAIL_OFFSET, le64(b.view(), TAIL_OFFSET) + 1)
+        Damage.Generation -> put_u32(b, TAIL_OFFSET + 8, le32(b.view(), TAIL_OFFSET + 8) - 1)
+        Damage.LeafDepth -> put_u16(b, 8, 1)
+        Damage.IndexDepth -> put_u16(b, 8, 0)
+        Damage.CountOverMax -> put_u16(b, 4, 4)
+        Damage.MaxOverCapacity -> put_u16(b, 6, 255)
+        Damage.NoEntries -> put_u16(b, 4, 0)
+        Damage.Unsorted -> put_u32(b, 16 + 16, 0)
+        Damage.PastNextKey -> put_u16(b, 16 + 16 + 4, 3)
+        Damage.KeyNotFirst -> put_u32(b, 16 + 16, 3)
+        Damage.ZeroLength -> put_u16(b, 16 + 4, 0)
+        Damage.UnknownFlag -> put_u16(b, 16 + 6, 2)
+
+// Break the built tree with `d` on the device, re-sealed (but for FlipByte) so that only the rule
+// under test fails; then mount afresh and answer how a lookup refuses. An insert and a removal reaching
+// the same node must refuse the same way, and the refusal must name the damaged block.
+private corrupt(d: Damage) -> i64
+    var dev = standard_device()
+    val built = build(&dev)
+    val on_index = d == Damage.IndexDepth || d == Damage.KeyNotFirst
+    val b = if on_index then built.index else built.leaf
+    val probe: u64 = if d == Damage.KeyNotFirst then 3 else 2
+    // A key is checked against the child it leads to, so that child is the block named.
+    val named = if d == Damage.KeyNotFirst then built.next_leaf else b
+    val bytes = read_dev(&dev, b)
+    apply(d, bytes)
+    var fs = mounted_fs(&dev)
+    if d != Damage.FlipByte then seal_block(fs.seed, bytes.view())
+    write_dev(&dev, b, bytes.view())
+    var again = mounted_fs(&dev)
+    val r = lookup(&again, built.ino, probe)
+    assert(failure(r) >= 100)
+    assert_eq(faulty_block(r), named)
+    val t = extent_tree(built.ino, 0)
+    assert_eq(failure(put(&again, t, 3, Run(again.geo.data_start(3), 1), false)), failure(r))
+    var h = again.start("punch", 86)
+    assert_eq(failure(remove(&again, &h, t, 0, probe + 1, 16)), failure(r))
+    assert_eq(h.spent(), 0)
+    again.stop(&h)
+    assert_eq(again.plat.held(), 0)
+    failure(r)
+
+@test("the tree as built is sound and maps what was put in it")
+built_tree_sound()
+    var dev = standard_device()
+    val built = build(&dev)
+    var fs = mounted_fs(&dev)
+    assert_eq(walk(&fs, built.ino).extents.len(), 7)
+    assert(!is_hole(ok_map(lookup(&fs, built.ino, 2))))
+
+@test("a node block whose checksum fails is refused")
+refused_checksum()
+    assert_eq(corrupt(Damage.FlipByte), 100 + 1)
+
+@test("a node block without the extent magic is refused")
+refused_magic()
+    assert_eq(corrupt(Damage.Magic), 100 + 2)
+
+@test("a node block belonging to another inode is refused")
+refused_owner()
+    assert_eq(corrupt(Damage.Owner), 100 + 3)
+
+@test("a node block from a previous generation of the inode is refused")
+refused_generation()
+    assert_eq(corrupt(Damage.Generation), 100 + 4)
+
+@test("a node whose depth is not one below its parent's is refused, at a leaf and at an index node")
+refused_depth()
+    assert_eq(corrupt(Damage.LeafDepth), 100 + 5)
+    assert_eq(corrupt(Damage.IndexDepth), 100 + 5)
+
+@test("a node with count above max, max above the capacity, or no entries is refused")
+refused_header()
+    assert_eq(corrupt(Damage.CountOverMax), 100 + 6)
+    assert_eq(corrupt(Damage.MaxOverCapacity), 100 + 6)
+    assert_eq(corrupt(Damage.NoEntries), 100 + 6)
+
+@test("a leaf whose keys are not strictly increasing is refused")
+refused_order()
+    assert_eq(corrupt(Damage.Unsorted), 100 + 8)
+
+@test("a child mapping past its parent's next key is refused")
+refused_range()
+    assert_eq(corrupt(Damage.PastNextKey), 100 + 9)
+
+@test("an index key that is not its child's first key is refused")
+refused_key()
+    assert_eq(corrupt(Damage.KeyNotFirst), 100 + 10)
+
+@test("an extent of length 0 or with an unknown flag is refused")
+refused_entry()
+    assert_eq(corrupt(Damage.ZeroLength), 100 + 7)
+    assert_eq(corrupt(Damage.UnknownFlag), 100 + 7)
+
+// Write `bytes` into inode `ino`'s slot on the device at `offset` within the inode, and re-seal it.
+private rewrite_inode(dev: *RamDevice, ino: u64, offset: usize, bytes: []const u8)
+    var fs = mounted_fs(dev)
+    val loc = fs.inode_location(ino)
+    val block = read_dev(dev, loc.block)
+    for k in 0..<bytes.len
+        block[loc.offset + offset + k] = bytes[k]
+    seal_inode(fs.seed, ino, block.view()[loc.offset..<loc.offset + INODE_SIZE])
+    write_dev(dev, loc.block, block.view())
+
+private le_bytes(v: u64, n: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for k in 0..<n
+        out.push(u8((v >> u64(8 * k)) & 0xFF))
+    out
+
+@test("a root without the magic, or deeper than EXTENT_MAX_DEPTH, is refused; a bad inode checksum too")
+refused_root()
+    var dev = standard_device()
+    val built = build(&dev)
+    rewrite_inode(&dev, built.ino, 112 + 8, le_bytes(5, 2).view())
+    var fs = mounted_fs(&dev)
+    val deep = lookup(&fs, built.ino, 2)
+    assert_eq(failure(deep), 100 + 5)
+    assert_eq(faulty_block(deep), 0)
+    rewrite_inode(&dev, built.ino, 112 + 8, le_bytes(2, 2).view())
+    rewrite_inode(&dev, built.ino, 112, le_bytes(0, 4).view())
+    var again = mounted_fs(&dev)
+    assert_eq(failure(lookup(&again, built.ino, 2)), 100 + 2)
+    // A byte changed without re-sealing: the inode itself is refused.
+    val loc = again.inode_location(built.ino)
+    val bytes = read_dev(&dev, loc.block)
+    bytes[loc.offset + 120] = bytes[loc.offset + 120] ^ 0x40
+    write_dev(&dev, loc.block, bytes.view())
+    var third = mounted_fs(&dev)
+    assert_eq(failure(lookup(&third, built.ino, 2)), 5)
+
+@test("one inode's tree pointing at another inode's node is refused for the owner")
+refused_foreign_node()
+    var dev = standard_device()
+    val a = build(&dev)
+    var fs = mounted_fs(&dev)
+    val b = file_inode(&fs)
+    fill(&fs, extent_tree(b, 0), 0, 8)
+    assert_eq(walk(&fs, b).depth, 1)
+    ok(fs.commit())
+    // b's root entry now names a's index node, which is a valid node of a's.
+    rewrite_inode(&dev, b, 112 + 16 + 8, le_bytes(a.index, 8).view())
+    var again = mounted_fs(&dev)
+    val r = lookup(&again, b, 0)
+    assert_eq(failure(r), 100 + 3)
+    assert_eq(faulty_block(r), a.index)
+
+@test("a node left over from the inode number's previous life is refused for its generation")
+refused_previous_life()
+    var dev = standard_device()
+    val old = build(&dev)
+    var fs = mounted_fs(&dev)
+    val loc = fs.inode_location(old.ino)
+    val root_copy = read_dev(&dev, loc.block)
+    var h = fs.start("delete", 3)
+    ok(free_inode(&fs, &h, old.ino))
+    fs.stop(&h)
+    val ino = file_inode(&fs)
+    assert_eq(ino, old.ino)
+    ok(fs.commit())
+    // The new life's inode, with the old life's root copied into its data.
+    rewrite_inode(&dev, ino, 112, root_copy.view()[loc.offset + 112..<loc.offset + 240])
+    var again = mounted_fs(&dev)
+    val r = lookup(&again, ino, 2)
+    assert_eq(failure(r), 100 + 4)
+    assert_eq(faulty_block(r), old.index)
+
+// -- The model-based property test -------------------------------------------------------------------------
+
+private struct Rng
+    state: u64
+
+    next(*self) -> u64
+        self.state += 0x9E37_79B9_7F4A_7C15
+        var z = self.state
+        z = (z ^ (z >> 30)) * 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) * 0x94D0_49BB_1331_11EB
+        z ^ (z >> 31)
+
+    below(*self, n: u64) -> u64 = self.next() % n
+
+// The reference: logical block -> (physical, unwritten), over two windows of logical blocks — the low
+// `low` blocks and the top `high` below 2^32. A slot `k` is window position: `k < low` is block `k`.
+private struct Model
+    low: u64
+    high: u64
+    phys: Buf[u64]
+    unw: Buf[bool]
+
+    size(self) -> u64 = self.low + self.high
+    logical(self, k: u64) -> u64 = if k < self.low then k else LOGICAL_BLOCKS - self.high + (k - self.low)
+    // The slot of logical block `l`, or the size when it is outside both windows.
+    slot(self, l: u64) -> u64
+        if l < self.low then return l
+        if l >= LOGICAL_BLOCKS - self.high && l < LOGICAL_BLOCKS then return self.low + (l - (LOGICAL_BLOCKS - self.high))
+        self.size()
+    // The end of slot `k`'s window.
+    window_end(self, k: u64) -> u64 = if k < self.low then self.low else self.size()
+    // Slot `k`'s physical block (0 for a hole) and unwritten flag.
+    p(self, k: u64) -> u64 = self.phys[usize(k)]
+    u(self, k: u64) -> bool = self.unw[usize(k)]
+    set(self, k: u64, physical: u64, unwritten: bool)
+        self.phys[usize(k)] = physical
+        self.unw[usize(k)] = unwritten
+    mapped(self) -> u64
+        var n: u64 = 0
+        for p in self.phys.view()
+            if p != 0 then n += 1
+        n
+
+private model(low: u64, high: u64) -> Model
+    var phys: Buf[u64] = buf()
+    var unw: Buf[bool] = buf()
+    for k in 0..<low + high
+        phys.push(0)
+        unw.push(false)
+    Model(low, high, phys, unw)
+
+// What `lookup` answers for slot `k` against the model; "" when they agree.
+private lookup_agrees(fs: *HostFs, ino: u64, m: Model, k: u64) -> string
+    val got = lookup(fs, ino, m.logical(k)) match
+        Ok(g) -> g
+        Err(_) -> return "a lookup failed"
+    if m.p(k) == 0
+        if !is_hole(got) then return s"block ${m.logical(k)} maps where the model has a hole"
+        return ""
+    if is_hole(got) then return s"block ${m.logical(k)} is a hole where the model maps it"
+    if physical_of(got) != m.p(k) then return s"block ${m.logical(k)} maps to the wrong physical block"
+    if unwritten_of(got) != m.u(k) then return s"block ${m.logical(k)} has the wrong unwritten flag"
+    val run = u64(run_of(got))
+    if run == 0 then return "a mapped run of 0"
+    val end = m.window_end(k)
+    for j in 0..<run
+        if k + j < end && m.p(k + j) != m.p(k) + j then return s"block ${m.logical(k)}'s run goes past its extent"
+    ""
+
+// Everything the test checks after a step; "" when all of it holds.
+private check(fs: *HostFs, ino: u64, m: Model, baseline: u64, rng: *Rng, full: bool, from: u64, to: u64) -> string
+    if fs.plat.held() != 0 then return "a lock is still held"
+    if fs.plat.most_groups_held > 1 then return "two group locks were held at once"
+    val s = walk_with(fs, ino, full)
+    if s.why.len > 0 then return s.why
+    // Section 9's shrink: a root left with one index entry whose child fits in it has absorbed it.
+    if s.depth > 0 && s.root_count == 1
+        val loc = fs.inode_location(ino)
+        val root: *NodeHeader = at(fs.bytes(ok_id(fs.buffer(loc.block))), loc.offset + 112)
+        val child: *NodeHeader = at(fs.bytes(ok_id(fs.buffer(s.nodes[0]))), 0)
+        if child.count <= root.max then return "a root with one child that fits in it, not collapsed"
+    var count: u64 = 0
+    for e in s.extents.view()
+        for j in 0..<u64(e.len)
+            val k = m.slot(u64(e.logical) + j)
+            if k >= m.size() then return "an extent outside the model's windows"
+            if m.p(k) != e.physical + j then return s"the tree maps block ${u64(e.logical) + j} where the model does not agree"
+            if m.u(k) != (e.flags & EXTENT_UNWRITTEN != 0) then return s"block ${u64(e.logical) + j} has the wrong flags"
+            count += 1
+    if count != m.mapped() then return s"the tree maps $count blocks and the model ${m.mapped()}"
+    val nodes = u64(s.nodes.len())
+    if inode_of(fs, ino).blocks != count + nodes then return s"blocks is ${inode_of(fs, ino).blocks}, not ${count + nodes}"
+    if used_blocks(fs) != baseline + count + nodes then return "the bitmaps' used blocks against data plus nodes"
+    val totals = totals_agree(fs)
+    if totals.len > 0 then return totals
+    if full
+        for k in 0..<m.size()
+            val why = lookup_agrees(fs, ino, m, k)
+            if why.len > 0 then return why
+    else
+        val lo = if from > 0 then from - 1 else 0
+        val hi = if to + 1 < m.size() then to + 1 else m.size() - 1
+        for k in lo..hi
+            val why = lookup_agrees(fs, ino, m, k)
+            if why.len > 0 then return why
+        for i in 0..<8
+            val why = lookup_agrees(fs, ino, m, rng.below(m.size()))
+            if why.len > 0 then return why
+    ""
+
+private struct Outcome
+    deepest: u16
+    refused: u32
+    inserts: u32
+    removes: u32
+    converts: u32
+    merges: u32
+
+// Run `steps` random operations from `seed` on a tree with the given node sizes.
+private run_model(seed: u64, root_max: u16, node_max: u16, low: u64, high: u64, steps: u32) -> Outcome
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = file_inode(&fs)
+    val t = small_tree(&fs, ino, root_max, node_max)
+    val baseline = used_blocks(&fs)
+    var m = model(low, high)
+    var rng = Rng(seed)
+    var out = Outcome(0, 0, 0, 0, 0, 0)
+    for step in 0..<steps
+        var from: u64 = 0
+        var to: u64 = 0
+        var why = ""
+        val roll = rng.below(100)
+        if roll < 45
+            // Insert into a hole, sometimes physically after its left neighbour so that it merges.
+            val k = rng.below(m.size())
+            if m.p(k) == 0
+                val want = 1 + rng.below(if rng.below(8) == 0 then 12 else 3)
+                var n: u64 = 0
+                while n < want && k + n < m.window_end(k) && m.p(k + n) == 0
+                    n += 1
+                val joins = k > 0 && k != m.low && m.p(k - 1) != 0 && rng.below(2) == 0
+                val goal = if joins then m.p(k - 1) + 1 else fs.geo.data_start(u32(rng.below(4)))
+                val r = data(&fs, goal, u32(n))
+                val unwritten = if joins then m.u(k - 1) else rng.below(3) == 0
+                val before = walk_with(&fs, ino, false).extents.len()
+                val res = put(&fs, t, m.logical(k), r, unwritten)
+                val f = failure(res)
+                if f == 0
+                    for j in 0..<u64(r.len)
+                        m.set(k + j, r.first + j, unwritten)
+                    out.inserts += 1
+                    if walk_with(&fs, ino, false).extents.len() <= before then out.merges += 1
+                else if f == 4
+                    out.refused += 1
+                    give_back(&fs, r)
+                else
+                    why = s"an insert failed with $f"
+                from = k
+                to = k + u64(r.len) - 1
+        else if roll < 72
+            // Remove a range, a few extents per step.
+            val k = rng.below(m.size())
+            val want = 1 + rng.below(if rng.below(6) == 0 then 40 else 6)
+            val end = if k + want < m.window_end(k) then k + want else m.window_end(k)
+            val a = m.logical(k)
+            var hi = m.logical(end - 1) + 1
+            loop
+                var h = fs.start("punch", C_EXT + C_GROUP)
+                val r = remove(&fs, &h, t, a, hi, u32(1 + rng.below(3)))
+                fs.stop(&h)
+                val f = failure(r)
+                if f == 4
+                    out.refused += 1
+                    break
+                if f != 0
+                    why = s"a removal failed with $f"
+                    break
+                val next = ok_u64(r)
+                val low_end = if next > a then next else a
+                for l in low_end..<hi
+                    m.set(m.slot(l), 0, false)
+                if next <= a then break
+                hi = next
+            out.removes += 1
+            from = k
+            to = end - 1
+        else if roll < 92
+            // Convert part of an unwritten extent, from a random unwritten block.
+            var k = rng.below(m.size())
+            var tries: u64 = 0
+            while tries < m.size() && !(m.p(k) != 0 && m.u(k))
+                k = (k + 1) % m.size()
+                tries += 1
+            if tries < m.size()
+                val run = u64(run_of(ok_map(lookup(&fs, ino, m.logical(k)))))
+                val n = 1 + rng.below(if run < 6 then run else 6)
+                val res = written(&fs, t, m.logical(k), u32(n))
+                val f = failure(res)
+                if f == 0
+                    for j in 0..<n
+                        m.set(k + j, m.p(k + j), false)
+                    out.converts += 1
+                else if f == 4
+                    out.refused += 1
+                else
+                    why = s"a conversion failed with $f"
+                from = k
+                to = k + n - 1
+        else if roll < 96
+            // An insert over a mapped block — starting on one, or starting in a hole and running into
+            // the next extent, which may be in the next leaf — must be refused and change nothing.
+            val k = rng.below(m.size())
+            var n: u64 = 1
+            while k + n < m.window_end(k) && m.p(k + n - 1) == 0 && n < 40
+                n += 1
+            if m.p(k + n - 1) != 0
+                val f = failure(put(&fs, t, m.logical(k), Run(fs.geo.data_start(3) + 500, u32(n)), false))
+                if f != 3 then why = s"an overlapping insert of $n blocks answered $f"
+                from = k
+                to = k
+        if step % 16 == 15 then ok(fs.commit())
+        if why.len == 0 then why = check(&fs, ino, m, baseline, &rng, step % 64 == 63, from, to)
+        if why.len > 0
+            print(s"extent model: seed $seed, root max $root_max, node max $node_max, step $step: $why")
+            panic("the extent tree disagrees with the model")
+        val d = ok_depth(depth_of(&fs, ino))
+        if d > out.deepest then out.deepest = d
+    // At the end, everything committed and read back by a fresh mount agrees too.
+    ok(fs.commit())
+    var again = mounted_fs(&dev)
+    val final = check(&again, ino, m, baseline, &rng, true, 0, 0)
+    if final.len > 0
+        print(s"extent model: seed $seed after a remount: $final")
+        panic("the extent tree disagrees with the model after a remount")
+    out
+
+@test("model: nodes of 2 under a root of 2, the fixed seed — depth 4 reached, the fifth level refused")
+model_nodes_of_two()
+    val o = run_model(0x4B46_5334, 2, 2, 72, 16, 4000)
+    stats(o)
+    assert_eq(o.deepest, 4)
+    assert(o.refused > 0)
+    assert(o.inserts > 300)
+    assert(o.removes > 300)
+    assert(o.converts > 100)
+    assert(o.merges > 0)
+
+@test("model: nodes of 3 under a root of 3, two seeds")
+model_nodes_of_three()
+    for seed in [1u64, 0xDEAD_BEEF]
+        val o = run_model(seed, 3, 3, 300, 32, 3000)
+        stats(o)
+        assert_eq(o.deepest, 4)
+        assert(o.inserts > 500)
+        assert(o.converts > 100)
+
+@test("model: nodes of 4 under a root of 2, two seeds")
+model_nodes_of_four()
+    for seed in [7u64, 0x5EED_0004]
+        val o = run_model(seed, 2, 4, 400, 32, 3000)
+        stats(o)
+        assert(o.deepest >= 3)
+        assert(o.inserts > 500)
+
+@test("model: real node sizes, a root of 7, one seed")
+model_real_sizes()
+    val o = run_model(0x7777, 7, u16(EXTENT_NODE_SLOTS), 600, 16, 2000)
+    stats(o)
+    assert_eq(o.deepest, 1)
+    assert(o.inserts > 300)
+
+// What a run did, for the log of a failing test.
+private stats(o: Outcome)
+    print(s"extent model: deepest ${o.deepest}, refused ${o.refused}, inserts ${o.inserts}, removals ${o.removes}, conversions ${o.converts}, merges ${o.merges}")

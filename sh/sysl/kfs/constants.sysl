@@ -40,6 +40,15 @@ const JOURNAL_MAX_BLOCKS: u32 = 16384
 const MAX_OP_CREDITS: u32 = 192
 const COMMIT_INTERVAL_SECONDS: u32 = 5
 
+// A file's logical blocks are 32-bit: block numbers 0 ... 2^32 - 1 (section 3, "Maximum sizes").
+const LOGICAL_BLOCKS: u64 = 0x1_0000_0000
+
+// The unit credit costs of section 14 ("Credits").
+const C_INODE: u32 = 1
+const C_GROUP: u32 = 2
+const C_EXT: u32 = 4 * (u32(EXTENT_MAX_DEPTH) + 1)
+const C_ALLOC: u32 = C_GROUP + C_EXT
+
 // Where things are inside a block. The tail is the last 16 bytes of every owned metadata block; the
 // journal's descriptor and revoke blocks keep only a 4-byte checksum there.
 const TAIL_OFFSET: usize = 4080

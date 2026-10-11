@@ -1,0 +1,570 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The extent tree of kfs/SPEC.md section 9: what maps a file's, directory's or long symlink's logical
+// blocks to physical ones.
+//
+// **Shape.** The root is the inode's 128-byte `data`: a header and up to 7 entries. Below it are node
+// blocks of up to 254 entries and a block tail naming the owner and its generation. Every leaf is at
+// the root's `depth`; a leaf entry is an extent, an index entry points to a child. An index key is
+// exactly its child's first key (section 9's clarification), so the child of entry i maps only blocks
+// in [key_i, key_i+1).
+//
+// **How a change is made.** Every operation reads the path from the root to one leaf into memory
+// (`descend`), verifying each node as it is read; edits the leaf's entries in memory; and hands the
+// path to `settle`, which restores the rules from the leaf up: a node over its `max` is split into
+// halves and the new node's first key goes into the parent; an empty node is freed and its entry
+// removed from the parent; a key that changed is carried up; a full root moves its entries into a new
+// block and becomes one index entry (the tree grows from the top, so every leaf stays at one depth);
+// a root left with one index entry whose child fits in it absorbs the child. `settle` counts the new
+// nodes it needs before it changes anything, allocates them all, and only then declares (with
+// `write_access`) and writes every buffer, so a refusal (`TooBig`, `NoSpace`) leaves the tree as it
+// was.
+//
+// The caller holds the inode's lock (section 19) and passes its handle; the credits are section 14's:
+// an insert, a conversion or one straddling removal fits `C_EXT` (one level of split per node of the
+// path, the root's growth, and the groups of the new nodes), plus `C_GROUP` for the data it maps.
+
+// An extent as the operations take one: `len` blocks from `logical` mapped to `len` blocks from
+// `physical`; unwritten blocks are allocated and read as zeros (section 8, "Invariants").
+struct Extent
+    logical: u64
+    len: u32
+    physical: u64
+    unwritten: bool
+
+// What one logical block is.
+enum Mapping
+    // No extent maps it: it reads as zeros and holds no space.
+    Hole
+    // It is block `physical`, and its extent goes on for `run` blocks from it, itself included.
+    Mapped(physical: u64, run: u32, unwritten: bool)
+
+// Whose tree an operation changes, and how new nodes are made.
+struct ExtentTree
+    ino: u64
+    // The caller's uid: a new node is allocated for it, under section 17's reserve.
+    uid: u32
+    // The `max` written into a new node block — the capacity, or less on a test's RAM disk (section 9,
+    // "`max` may be smaller than the capacity"). The root keeps the `max` its inode was given.
+    node_max: u16
+
+extent_tree(ino: u64, uid: u32) -> ExtentTree = ExtentTree(ino, uid, u16(EXTENT_NODE_SLOTS))
+
+// -- Nodes in memory ----------------------------------------------------------------------------------
+
+// One node as read. Index entries are held as `ExtentLeaf`s too: the key in `logical`, `len` and
+// `flags` 0 (they are the index entry's reserved word), and the child's block in `physical`.
+private struct Node
+    // The node's block; 0 for the root.
+    block: u64
+    depth: u16
+    max: u16
+    entries: Buf[ExtentLeaf]
+    // The end of the range the node may map: its parent's next key, or 2^32.
+    hi: u64
+    // Changed in memory, to be written.
+    dirty: bool
+
+// The inode a tree belongs to.
+private struct Owner
+    ino: u64
+    generation: u32
+    loc: InodeLoc
+    // The buffer of the inode-table block holding the inode.
+    id: usize
+    blocks: u64
+
+// The nodes from the root (`nodes[0]`) down to one leaf, and the entry followed at each index node.
+private struct Path
+    owner: Owner
+    nodes: Buf[Node]
+    slots: Buf[usize]
+
+    leaf(self) -> Node = self.nodes[self.nodes.len() - 1]
+
+private end_of(e: ExtentLeaf) -> u64 = u64(e.logical) + u64(e.len)
+
+private index_entry(key: u64, child: u64) -> ExtentLeaf = ExtentLeaf(u32(key), 0, 0, child)
+
+private flags_of(unwritten: bool) -> u16 = if unwritten then EXTENT_UNWRITTEN else 0
+
+private extent_entry(logical: u64, len: u64, physical: u64, flags: u16) -> ExtentLeaf
+    ExtentLeaf(u32(logical), u16(len), flags, physical)
+
+private fault(o: Owner, block: u64, f: NodeFault) -> FsError = FsError.Corrupt(Corruption.Extent(o.ino, block, f))
+
+// The last entry whose key is at most `l` (a binary search: the entries are sorted).
+private last_at_most(entries: Buf[ExtentLeaf], l: u64) -> Option[usize]
+    var lo: usize = 0
+    var hi = entries.len()
+    while lo < hi
+        val mid = (lo + hi) / 2
+        if u64(entries[mid].logical) <= l then lo = mid + 1 else hi = mid
+    if lo == 0 then None else Some(lo - 1)
+
+// `first`, `len` blocks: data blocks of one group, clear of the journal. Every extent and every node
+// lies in such a run (section 9, "Entries").
+private data_run[D: BlockDevice, P: Platform](fs: *Fs[D, P], first: u64, len: u64) -> bool
+    if first == 0 || len == 0 || first + len > fs.geo.blocks then return false
+    val g = fs.block_group(first)
+    if first < fs.geo.data_start(g) || first + len > fs.geo.group_end(g) then return false
+    val j = fs.geo.journal_start
+    !(first < j + u64(fs.geo.journal_blocks) && j < first + len)
+
+// -- Reading and verifying ----------------------------------------------------------------------------
+
+private load_owner[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Owner, FsError]
+    if ino == 0 || ino > fs.sb.inode_count then return Err(FsError.Corrupt(Corruption.BadInodeNumber(ino)))
+    val loc = fs.inode_location(ino)
+    val id = fs.buffer(loc.block)?
+    fs.plat.lock(LockId.Buffer(loc.block))
+    val good = verify_inode(fs.seed, ino, fs.bytes(id)[loc.offset..<loc.offset + INODE_SIZE])
+    val node: *Inode = at(fs.bytes(id), loc.offset)
+    val mode = node.mode
+    val flags = node.flags
+    val o = Owner(ino, node.generation, loc, id, node.blocks)
+    fs.plat.unlock(LockId.Buffer(loc.block))
+    if !good then return Err(FsError.Corrupt(Corruption.Inode(ino)))
+    val t = mode & S_IFMT
+    if !(t == S_IFREG || t == S_IFDIR || t == S_IFLNK) || flags & INODE_INLINE != 0 then return Err(FsError.Invalid)
+    Ok(o)
+
+// A node's header and entries at `base` in `bytes`; `capacity` is what the place can hold.
+private parse(bytes: []u8, base: usize, capacity: usize, block: u64) -> Result[Node, NodeFault]
+    val head: *NodeHeader = at(bytes, base)
+    if head.magic != EXTENT_MAGIC then return Err(NodeFault.Magic)
+    if head.max == 0 || usize(head.max) > capacity || head.count > head.max then return Err(NodeFault.Header)
+    for k in 0..<6
+        if head.reserved[k] != 0 then return Err(NodeFault.Header)
+    var entries: Buf[ExtentLeaf] = buf()
+    for i in 0..<usize(head.count)
+        val e: *ExtentLeaf = at(bytes, base + sizeof(NodeHeader) + i * sizeof(ExtentLeaf))
+        entries.push(*e)
+    Ok(Node(block, head.depth, head.max, entries, LOGICAL_BLOCKS, false))
+
+// Section 9's rules for one node's entries, given the range [lo, hi) its parent allows.
+private check_entries[D: BlockDevice, P: Platform](fs: *Fs[D, P], n: Node, lo: u64, hi: u64) -> Option[NodeFault]
+    val leaf = n.depth == 0
+    for i in 0..<n.entries.len()
+        val e = n.entries[i]
+        if leaf
+            if e.len == 0 || u32(e.len) > EXTENT_MAX_LEN || e.flags & 0xFFFE != 0 then return Some(NodeFault.Entry)
+            if !data_run(fs, e.physical, u64(e.len)) then return Some(NodeFault.Entry)
+        else
+            if e.len != 0 || e.flags != 0 || !data_run(fs, e.physical, 1) then return Some(NodeFault.Entry)
+        if i > 0
+            val prev = n.entries[i - 1]
+            if e.logical <= prev.logical then return Some(NodeFault.Order)
+            if leaf && end_of(prev) > u64(e.logical) then return Some(NodeFault.Order)
+        if u64(e.logical) < lo then return Some(NodeFault.Range)
+        if leaf && end_of(e) > hi then return Some(NodeFault.Range)
+        if !leaf && u64(e.logical) >= hi then return Some(NodeFault.Range)
+    None
+
+// The root, from the inode's `data`.
+private read_root[D: BlockDevice, P: Platform](fs: *Fs[D, P], o: Owner) -> Result[Node, FsError]
+    fs.plat.lock(LockId.Buffer(o.loc.block))
+    val parsed = parse(fs.bytes(o.id), o.loc.offset + 112, EXTENT_ROOT_SLOTS, 0)
+    fs.plat.unlock(LockId.Buffer(o.loc.block))
+    val root = parsed match
+        Ok(n) -> n
+        Err(f) -> return Err(fault(o, 0, f))
+    if usize(root.depth) > EXTENT_MAX_DEPTH then return Err(fault(o, 0, NodeFault.Depth))
+    if root.depth > 0 && root.entries.len() == 0 then return Err(fault(o, 0, NodeFault.Header))
+    check_entries(fs, root, 0, LOGICAL_BLOCKS) match
+        Some(f) -> Err(fault(o, 0, f))
+        None -> Ok(root)
+
+// The child at `block`, which its parent's entry gives key `key`, depth `depth` and range [key, hi):
+// its checksum, its owner and generation, its header, and its entries against that range.
+private read_node[D: BlockDevice, P: Platform](fs: *Fs[D, P], o: Owner, block: u64, depth: u16, key: u64, hi: u64) -> Result[Node, FsError]
+    val id = fs.buffer(block)?
+    fs.plat.lock(LockId.Buffer(block))
+    val bytes = fs.bytes(id)
+    var parsed: Result[Node, NodeFault] = Err(NodeFault.Checksum)
+    if verify_block(fs.seed, bytes)
+        if le64(bytes, TAIL_OFFSET) != o.ino
+            parsed = Err(NodeFault.Owner)
+        else if le32(bytes, TAIL_OFFSET + 8) != o.generation
+            parsed = Err(NodeFault.Generation)
+        else
+            parsed = parse(bytes, 0, EXTENT_NODE_SLOTS, block)
+    fs.plat.unlock(LockId.Buffer(block))
+    var n = parsed match
+        Ok(n) -> n
+        Err(f) -> return Err(fault(o, block, f))
+    n.hi = hi
+    if n.depth != depth then return Err(fault(o, block, NodeFault.Depth))
+    if n.entries.len() == 0 then return Err(fault(o, block, NodeFault.Header))
+    if u64(n.entries[0].logical) != key then return Err(fault(o, block, NodeFault.Key))
+    check_entries(fs, n, key, hi) match
+        Some(f) -> Err(fault(o, block, f))
+        None -> Ok(n)
+
+// The path from the root to the leaf that holds (or would hold) logical block `l`: at every index node
+// the last entry whose key is at most `l`, or the first when there is none.
+private descend[D: BlockDevice, P: Platform](fs: *Fs[D, P], o: Owner, l: u64) -> Result[Path, FsError]
+    var nodes: Buf[Node] = buf()
+    var slots: Buf[usize] = buf()
+    var cur = read_root(fs, o)?
+    nodes.push(cur)
+    while cur.depth > 0
+        val i = last_at_most(cur.entries, l) match
+            Some(i) -> i
+            None -> 0
+        val hi = if i + 1 < cur.entries.len() then u64(cur.entries[i + 1].logical) else cur.hi
+        val e = cur.entries[i]
+        cur = read_node(fs, o, e.physical, cur.depth - 1, u64(e.logical), hi)?
+        slots.push(i)
+        nodes.push(cur)
+    Ok(Path(o, nodes, slots))
+
+// -- Lookup -------------------------------------------------------------------------------------------
+
+// What logical block `l` of inode `ino` is (section 9, "Lookup"). A block at or past 2^32 is a hole.
+lookup[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, l: u64) -> Result[Mapping, FsError]
+    if l >= LOGICAL_BLOCKS then return Ok(Mapping.Hole)
+    val o = load_owner(fs, ino)?
+    val leaf = descend(fs, o, l)?.leaf()
+    val i = last_at_most(leaf.entries, l) match
+        Some(i) -> i
+        None -> return Ok(Mapping.Hole)
+    val e = leaf.entries[i]
+    if l >= end_of(e) then return Ok(Mapping.Hole)
+    Ok(Mapping.Mapped(e.physical + (l - u64(e.logical)), u32(end_of(e) - l), e.flags & EXTENT_UNWRITTEN != 0))
+
+// The tree's depth: 0 while every extent is in the inode.
+depth_of[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[u16, FsError]
+    val o = load_owner(fs, ino)?
+    Ok(read_root(fs, o)?.depth)
+
+// -- Changing the leaf --------------------------------------------------------------------------------
+
+// Two extents that may become one (section 9, "Rules"): contiguous logically and physically, the same
+// flags, and no longer than EXTENT_MAX_LEN together.
+private joinable(a: ExtentLeaf, b: ExtentLeaf) -> bool
+    end_of(a) == u64(b.logical) && a.physical + u64(a.len) == b.physical && a.flags == b.flags && u32(a.len) + u32(b.len) <= EXTENT_MAX_LEN
+
+// Merge entry `k` with entry `k + 1` if they may be one.
+private merge_at(entries: Buf[ExtentLeaf], k: usize)
+    if k + 1 >= entries.len() then return
+    val a = entries[k]
+    val b = entries[k + 1]
+    if joinable(a, b)
+        entries[k] = extent_entry(u64(a.logical), u64(a.len) + u64(b.len), a.physical, a.flags)
+        entries.remove(k + 1)
+
+private mark(p: Path, k: usize) = p.nodes.view()[k].dirty = true
+
+private check_tree(t: ExtentTree) -> Result[unit, FsError]
+    if t.node_max < 2 || usize(t.node_max) > EXTENT_NODE_SLOTS then return Err(FsError.Invalid)
+    Ok(())
+
+// Map `e` (section 9, "Insert"). The range must be a hole and inside 2^32 (`TooBig` past it), the
+// physical run data blocks of one group, the length 1 ... EXTENT_MAX_LEN. The new extent is merged
+// with a neighbour in its leaf when the two may be one. The inode's `blocks` grows by `e.len` and by
+// every node the insert adds.
+insert[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, t: ExtentTree, e: Extent) -> Result[unit, FsError]
+    if e.len == 0 || e.len > EXTENT_MAX_LEN then return Err(FsError.Invalid)
+    if e.logical >= LOGICAL_BLOCKS || u64(e.len) > LOGICAL_BLOCKS - e.logical then return Err(FsError.TooBig)
+    if !data_run(fs, e.physical, u64(e.len)) then return Err(FsError.Invalid)
+    check_tree(t)?
+    val o = load_owner(fs, t.ino)?
+    val p = descend(fs, o, e.logical)?
+    val leaf = p.leaf()
+    val pos = last_at_most(leaf.entries, e.logical) match
+        Some(i) -> i + 1
+        None -> 0
+    val end = e.logical + u64(e.len)
+    if pos > 0 && end_of(leaf.entries[pos - 1]) > e.logical then return Err(FsError.Invalid)
+    if pos < leaf.entries.len() && u64(leaf.entries[pos].logical) < end then return Err(FsError.Invalid)
+    if end > leaf.hi then return Err(FsError.Invalid)
+    leaf.entries.insert(pos, extent_entry(e.logical, u64(e.len), e.physical, flags_of(e.unwritten)))
+    merge_at(leaf.entries, pos)
+    if pos > 0 then merge_at(leaf.entries, pos - 1)
+    mark(p, p.nodes.len() - 1)
+    settle(fs, h, t, p, i64(e.len), buf())
+
+// Mark `n` blocks from `l` written (section 9, "Unwritten -> written"). They must lie inside one
+// unwritten extent, which becomes at most three: unwritten, written, unwritten. The written part is
+// merged with a written neighbour when the two may be one. May need a new node, as an insert does.
+convert[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, t: ExtentTree, l: u64, n: u32) -> Result[unit, FsError]
+    if n == 0 || l >= LOGICAL_BLOCKS || u64(n) > LOGICAL_BLOCKS - l then return Err(FsError.Invalid)
+    check_tree(t)?
+    val o = load_owner(fs, t.ino)?
+    val p = descend(fs, o, l)?
+    val leaf = p.leaf()
+    val i = last_at_most(leaf.entries, l) match
+        Some(i) -> i
+        None -> return Err(FsError.Invalid)
+    val e = leaf.entries[i]
+    val s = u64(e.logical)
+    val end = end_of(e)
+    if end < l + u64(n) || e.flags & EXTENT_UNWRITTEN == 0 then return Err(FsError.Invalid)
+    leaf.entries.remove(i)
+    var at = i
+    if end > l + u64(n)
+        leaf.entries.insert(i, extent_entry(l + u64(n), end - l - u64(n), e.physical + (l + u64(n) - s), e.flags))
+    leaf.entries.insert(i, extent_entry(l, u64(n), e.physical + (l - s), 0))
+    if s < l
+        leaf.entries.insert(i, extent_entry(s, l - s, e.physical, e.flags))
+        at = i + 1
+    merge_at(leaf.entries, at)
+    if at > 0 then merge_at(leaf.entries, at - 1)
+    mark(p, p.nodes.len() - 1)
+    settle(fs, h, t, p, 0, buf())
+
+// Unmap logical blocks [a, b) (section 9, "Remove a range"), working down from `b`, one extent at a
+// time, for at most `limit` extents (a truncate or punch step, section 18): an extent wholly inside is
+// removed, one straddling an end is shortened, one straddling both is split in two — which is an
+// insert, and may need a new node (only a punch does that; a truncation, with `b` at 2^32, never
+// does). The unmapped blocks are freed and `blocks` lowered; emptied nodes are freed. Answers the end
+// of what is left to unmap: the range [a, answer) still holds extents to remove; `a` when it is done.
+remove[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, t: ExtentTree, a: u64, b: u64, limit: u32) -> Result[u64, FsError]
+    var hi = if b > LOGICAL_BLOCKS then LOGICAL_BLOCKS else b
+    if a >= hi then return Ok(a)
+    check_tree(t)?
+    var done: u32 = 0
+    while done < limit
+        val o = load_owner(fs, t.ino)?
+        val p = descend(fs, o, hi - 1)?
+        val leaf = p.leaf()
+        val i = last_at_most(leaf.entries, hi - 1) match
+            Some(i) -> i
+            None -> return Ok(a)
+        val e = leaf.entries[i]
+        val s = u64(e.logical)
+        val end = end_of(e)
+        if end <= a then return Ok(a)
+        val cut_lo = if s > a then s else a
+        val cut_hi = if end < hi then end else hi
+        var frees: Buf[Run] = buf()
+        frees.push(Run(e.physical + (cut_lo - s), u32(cut_hi - cut_lo)))
+        leaf.entries.remove(i)
+        if end > hi
+            leaf.entries.insert(i, extent_entry(hi, end - hi, e.physical + (hi - s), e.flags))
+        if s < a
+            leaf.entries.insert(i, extent_entry(s, a - s, e.physical, e.flags))
+        mark(p, p.nodes.len() - 1)
+        settle(fs, h, t, p, -i64(cut_hi - cut_lo), frees)?
+        done += 1
+        if s <= a then return Ok(a)
+        hi = s
+    Ok(hi)
+
+// -- Restoring the rules ------------------------------------------------------------------------------
+
+// How many pieces `c` entries make in nodes of `m`.
+private pieces_of(c: usize, m: usize) -> usize = (c + m - 1) / m
+
+// The size of piece `j` of `c` entries cut into `pieces` as evenly as possible.
+private piece_size(c: usize, pieces: usize, j: usize) -> usize = c / pieces + (if j < c % pieces then 1 else 0)
+
+// Take the entries of `from` beyond its first `keep` into a new buffer.
+private split_off(from: Buf[ExtentLeaf], keep: usize, n: usize) -> Buf[ExtentLeaf]
+    var out: Buf[ExtentLeaf] = buf()
+    for k in keep..<keep + n
+        out.push(from[k])
+    out
+
+// After the leaf of `p` changed in memory: split what overflows, free what emptied, carry keys up,
+// grow or shrink the root, then allocate, declare and write it all, adjust `blocks` by the new and
+// freed nodes and `data` (the extents' own change), and free `frees` (data runs) and the freed nodes.
+private settle[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, t: ExtentTree, p: Path, data: i64, frees: Buf[Run]) -> Result[unit, FsError]
+    val last = p.nodes.len() - 1
+    val nm = usize(t.node_max)
+
+    // The plan: how many new nodes, counted the way the pass below will make them. Nothing changes
+    // until they are all allocated.
+    var needed: usize = 0
+    var change: i64 = 0
+    var k = last
+    while k > 0
+        val n = p.nodes[k]
+        val c = usize(i64(n.entries.len()) + change)
+        val m = if usize(n.max) < nm then usize(n.max) else nm
+        if c == 0
+            change = -1
+        else if c > usize(n.max)
+            val pieces = pieces_of(c, m)
+            needed += pieces - 1
+            change = i64(pieces - 1)
+        else
+            change = 0
+        k -= 1
+    val root = p.nodes[0]
+    val rc = usize(i64(root.entries.len()) + change)
+    if rc > usize(root.max)
+        val pieces = pieces_of(rc, nm)
+        if usize(root.depth) >= EXTENT_MAX_DEPTH || pieces > usize(root.max) then return Err(FsError.TooBig)
+        needed += pieces
+
+    var fresh: Buf[u64] = buf()
+    var runs: Buf[Run] = buf()
+    while fresh.len() < needed
+        val got = alloc_blocks(fs, h, goal_for(fs, t.ino, 0), u32(needed - fresh.len()), t.uid)
+        val run = got match
+            Ok(r) -> r
+            Err(why) ->
+                for r in runs.view()
+                    free_blocks(fs, h, r.first, r.len)?
+                return Err(why)
+        runs.push(run)
+        for b in run.first..<run.first + u64(run.len)
+            fresh.push(b)
+
+    // The pass, from the leaf up.
+    var used: usize = 0
+    var made: Buf[Node] = buf()
+    var freed: Buf[u64] = buf()
+    k = last
+    while k > 0
+        val n = p.nodes[k]
+        val parent = p.nodes[k - 1]
+        val s = p.slots[k - 1]
+        val c = n.entries.len()
+        if c == 0
+            freed.push(n.block)
+            p.nodes.view()[k].dirty = false
+            parent.entries.remove(s)
+            mark(p, k - 1)
+        else
+            if c > usize(n.max)
+                val m = if usize(n.max) < nm then usize(n.max) else nm
+                val pieces = pieces_of(c, m)
+                var from = piece_size(c, pieces, 0)
+                for j in 1..<pieces
+                    val size = piece_size(c, pieces, j)
+                    val child = Node(fresh[used], n.depth, t.node_max, split_off(n.entries, from, size), 0, true)
+                    used += 1
+                    made.push(child)
+                    parent.entries.insert(s + j, index_entry(u64(child.entries[0].logical), child.block))
+                    from += size
+                n.entries.truncate(piece_size(c, pieces, 0))
+                mark(p, k)
+                mark(p, k - 1)
+            if u64(parent.entries[s].logical) != u64(n.entries[0].logical)
+                parent.entries[s] = index_entry(u64(n.entries[0].logical), n.block)
+                mark(p, k - 1)
+        k -= 1
+
+    // The root: grow from the top, or empty back to a leaf, or absorb a lone child that fits.
+    val rcount = root.entries.len()
+    if rcount > usize(root.max)
+        val pieces = pieces_of(rcount, nm)
+        var moved: Buf[ExtentLeaf] = buf()
+        var from: usize = 0
+        for j in 0..<pieces
+            val size = piece_size(rcount, pieces, j)
+            val child = Node(fresh[used], root.depth, t.node_max, split_off(root.entries, from, size), 0, true)
+            used += 1
+            made.push(child)
+            moved.push(index_entry(u64(child.entries[0].logical), child.block))
+            from += size
+        root.entries.clear()
+        root.entries.extend(moved.view())
+        p.nodes.view()[0].depth = root.depth + 1
+    else if rcount == 0
+        p.nodes.view()[0].depth = 0
+    else
+        collapse(fs, p, made, freed)?
+    if used != needed
+        return Err(FsError.Bug)
+
+    // Declare every buffer that changes, then write them.
+    declare(fs, h, p.owner.loc.block, p.owner.id)?
+    var ids: Buf[usize] = buf()
+    for k2 in 1..<p.nodes.len()
+        val n = p.nodes[k2]
+        if n.dirty && !holds(freed, n.block)
+            val id = fs.buffer(n.block)?
+            declare(fs, h, n.block, id)?
+    for n in made.view()
+        val id = fs.buffer(n.block)?
+        declare(fs, h, n.block, id)?
+    for k2 in 1..<p.nodes.len()
+        val n = p.nodes[k2]
+        if n.dirty && !holds(freed, n.block) then write_block_node(fs, p.owner, n)?
+    for n in made.view()
+        write_block_node(fs, p.owner, n)?
+    val blocks = i64(p.owner.blocks) + i64(needed) - i64(freed.len()) + data
+    write_root(fs, p.owner, p.nodes[0], u64(blocks))
+
+    // Free the nodes that emptied (their revoke is the journal's, section 14) and the unmapped data.
+    for b in freed.view()
+        free_blocks(fs, h, b, 1)?
+        fs.revoke(h, b)
+    for r in frees.view()
+        free_blocks(fs, h, r.first, r.len)?
+    Ok(())
+
+private holds(xs: Buf[u64], x: u64) -> bool
+    for y in xs.view()
+        if y == x then return true
+    false
+
+// A root with one index entry whose child fits in the root takes the child's entries, and the tree is
+// one level shorter; repeated while it applies (section 9, "Remove a range").
+private collapse[D: BlockDevice, P: Platform](fs: *Fs[D, P], p: Path, made: Buf[Node], freed: Buf[u64]) -> Result[unit, FsError]
+    loop
+        val root = p.nodes[0]
+        if root.depth == 0 || root.entries.len() != 1 then return Ok(())
+        val e = root.entries[0]
+        var child: Option[Node] = None
+        for k in 1..<p.nodes.len()
+            if p.nodes[k].block == e.physical then child = Some(p.nodes[k])
+        val c = child match
+            Some(n) -> n
+            None -> read_node(fs, p.owner, e.physical, root.depth - 1, u64(e.logical), LOGICAL_BLOCKS)?
+        if c.entries.len() > usize(root.max) then return Ok(())
+        root.entries.clear()
+        root.entries.extend(c.entries.view())
+        p.nodes.view()[0].depth = c.depth
+        freed.push(c.block)
+
+// Declare buffer `id` (block `b`) to `h`, under the buffer's lock.
+private declare[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64, id: usize) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Buffer(b))
+    val r = fs.write_access(h, id)
+    fs.plat.unlock(LockId.Buffer(b))
+    r
+
+// Lay node `n` out at `base` in `bytes`, its unused slots zero up to `end`.
+private lay_out(bytes: []u8, base: usize, end: usize, n: Node)
+    val head: *NodeHeader = at(bytes, base)
+    head.magic = EXTENT_MAGIC
+    head.count = u16(n.entries.len())
+    head.max = n.max
+    head.depth = n.depth
+    for k in 0..<6
+        head.reserved[k] = 0
+    var off = base + sizeof(NodeHeader)
+    for e in n.entries.view()
+        val slot: *ExtentLeaf = at(bytes, off)
+        *slot = e
+        off += sizeof(ExtentLeaf)
+    for k in off..<end
+        bytes[k] = 0
+
+// Write a node block: entries, the tail naming its owner and generation, the checksum.
+private write_block_node[D: BlockDevice, P: Platform](fs: *Fs[D, P], o: Owner, n: Node) -> Result[unit, FsError]
+    val id = fs.buffer(n.block)?
+    fs.plat.lock(LockId.Buffer(n.block))
+    val bytes = fs.bytes(id)
+    lay_out(bytes, 0, TAIL_OFFSET, n)
+    set_tail(bytes, o.ino, o.generation)
+    seal_block(fs.seed, bytes)
+    fs.plat.unlock(LockId.Buffer(n.block))
+    Ok(())
+
+// Write the root into the inode with its new `blocks`, and re-seal the inode.
+private write_root[D: BlockDevice, P: Platform](fs: *Fs[D, P], o: Owner, root: Node, blocks: u64)
+    fs.plat.lock(LockId.Buffer(o.loc.block))
+    val bytes = fs.bytes(o.id)
+    lay_out(bytes, o.loc.offset + 112, o.loc.offset + 240, root)
+    val node: *Inode = at(bytes, o.loc.offset)
+    node.blocks = blocks
+    seal_inode(fs.seed, o.ino, bytes[o.loc.offset..<o.loc.offset + INODE_SIZE])
+    fs.plat.unlock(LockId.Buffer(o.loc.block))

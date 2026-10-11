@@ -540,6 +540,49 @@ this one — fails its check.
 - **Unwritten → written**: writing into an unwritten extent splits it into at most three (unwritten,
   written, unwritten) after the data is on the disk (section 18).
 
+**Clarifications** (stage 4):
+
+- **An index key is exactly its child's first key**, not merely a lower bound for it. An insert below
+  every key lowers the keys on its path; a removal of a node's first entry raises them. A key that is
+  not its child's first key is corrupt, and so is a node block with no entries (an emptied node is
+  freed at once) and a root of depth > 0 with none. With exact keys the last index entry whose key is
+  at most `l` leads to the only leaf that can hold `l` *or the extent before it*, which is what lets an
+  insert detect an overlap and a removal find the last extent below `b` with one descent.
+- **Every node is verified when it is read**: the block's checksum, then its owner and generation
+  (the tail), then the magic and header (`count ≤ max`, `1 ≤ max ≤` the capacity, the reserved bytes
+  0), the depth against the parent's (`EXTENT_MAX_DEPTH` at most for the root), the key, and every
+  entry against the range its parent gives the node. A child pointer, and every extent, must be data
+  blocks of one group clear of the journal; an extent's length is 1 … `EXTENT_MAX_LEN` and its only
+  flag `UNWRITTEN`.
+- **A split cuts the entries into halves**, the first node keeping the larger half, and **growth from
+  the top** moves the root's entries into `⌈count / max⌉` new nodes of the root's old depth (one, with
+  real capacities) and makes the root their index entries. New nodes are written with `max` = the
+  capacity, or a test's smaller value; the root keeps the `max` its inode was created with. Every new
+  node is allocated with section 17's node goal (the inode's group) before anything changes, so a
+  refusal leaves the tree as it was.
+- **A fifth level is refused, not assumed impossible.** The figure above counts *full* nodes; nodes
+  that split into halves can be half full, and a tree whose nodes are all half full holds about
+  7 × 127⁴ ≈ 1.8 × 10⁹ extents at depth 4 — fewer than the 2³¹ one-block extents a pathologically
+  fragmented 16 TiB file could have. An insert (or a punch's split, or a conversion) whose splits would
+  reach a full root at depth 4 answers `EFBIG` and changes nothing. With the small `max` of the host
+  tests it is easily reached, and is tested.
+- **`EXTENT_MAX_LEN` is never the binding limit.** A group's data area is at most
+  `blocks_per_group − 3` < 32768 blocks, and an extent lies in one data area, so the data area bounds
+  every extent first; `EXTENT_MAX_LEN` is what the 16-bit field can carry. Merging is bounded by both.
+- **Merging is done within one leaf**: an inserted extent, and the written part of a conversion, join
+  a neighbour in the same leaf when the two are contiguous logically and physically with equal flags.
+  An extent at a leaf's edge is not joined with one in the next leaf (merging is optional).
+- **Range removal works down from `b`, one extent at a time**, and stops after the step's limit of
+  extents (16 for a truncate step, section 18), answering the end of what is left to remove. An extent
+  wholly inside goes, one straddling `a` or `b` is cut, one straddling both becomes two (the punch
+  case that may need a node). Each unmapped run is freed in the step's handle and `blocks` lowered by
+  it; each emptied node is freed and **revoked** (section 14 — the hook is `Fs.revoke`, filled by stage
+  5).
+- **Credits.** An insert touches, per level of the path, at most the node, its new sibling and the
+  sibling's group bitmap and descriptor, and at the top the inode-table block and the new nodes of a
+  growing root — within `C_EXT`; the data run it maps is the caller's `C_GROUP`. The host tests run
+  every insert, conversion and removal step under exactly those credits.
+
 **Pedagogical notes.** An extent turns "one pointer per block" into "one pointer per run", and the tree
 turns "a flat list of runs" into O(log n) lookup. Holes cost nothing because they are not there. The
 root inside the inode means a file of up to seven runs needs no extra block at all — most files.

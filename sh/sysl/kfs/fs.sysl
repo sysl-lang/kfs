@@ -48,9 +48,40 @@ enum Corruption
     NotDataBlocks(block: u64)
     // An inode number that is reserved or past the last inode.
     BadInodeNumber(ino: u64)
+    // A node of inode `ino`'s extent tree breaks a rule of section 9: `block` is the node's block, 0
+    // for the root in the inode.
+    Extent(ino: u64, block: u64, fault: NodeFault)
+
+// What is wrong with an extent-tree node (section 9).
+enum NodeFault
+    // The block's checksum does not verify.
+    Checksum
+    // The header's magic is not "KFSX".
+    Magic
+    // The block's tail names another inode.
+    Owner
+    // The block's tail names a previous generation of this inode.
+    Generation
+    // The node's depth is not one less than its parent's (the root: more than EXTENT_MAX_DEPTH).
+    Depth
+    // `count` above `max`, `max` 0 or above the capacity, a node block with no entries, or a reserved
+    // header byte that is not 0.
+    Header
+    // An extent of length 0 or above EXTENT_MAX_LEN, an unknown flag, an index entry's reserved bytes
+    // not 0, or a child that is not a data block of the filesystem.
+    Entry
+    // Entries not strictly increasing, or extents that overlap.
+    Order
+    // An entry outside the range its parent gives the node: a key below it, or an extent reaching
+    // past it.
+    Range
+    // An index key that is not its child's first key.
+    Key
 
 enum FsError
     NoSpace
+    // EFBIG: past a file's 2^32 logical blocks, or an extent tree that would need a fifth level.
+    TooBig
     Device(why: DeviceError)
     Open(why: OpenError)
     Corrupt(why: Corruption)
@@ -224,6 +255,13 @@ struct Fs[D: BlockDevice, P: Platform]
 
     // The running transaction's sequence.
     running(self) -> u64 = self.seq
+
+    // A metadata block (an extent-tree node, a directory block, an xattr block) was freed in `h`. The
+    // journal must revoke it in `h`'s transaction (section 14, "Revocation"), or replay of an older copy
+    // could overwrite whatever the block holds next. Stage 3's write-through commit keeps no log, so
+    // there is nothing to revoke yet; stage 5 records the revoke here, and every caller already calls
+    // it.
+    revoke(*self, h: *Handle, b: u64) = ()
 
     // -- Where things are ----------------------------------------------------------------------------
 
