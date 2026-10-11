@@ -1768,6 +1768,95 @@ fails its checksum (`--rebuild-corrupt` clears it, removes names pointing to a c
 reconnects what becomes unreachable). `fsck.kfs` clears `ERROR` and sets `check_time` and
 `mount_count = 0` only when it leaves the filesystem clean.
 
+(Stage 9: how repair runs, and what each diagnostic gets.
+
+- **Modes and exit codes.** With neither flag `fsck.kfs` checks exactly as `-n` does: nothing reaches the
+  disk. A primary superblock restored from its backup and a log replayed by recovery are seen by the passes
+  through a device that keeps every write in memory, so `-n` reports what lies behind them. A log that is
+  not empty is no error in itself — recovery is a mount's ordinary first step — so a run that only replays
+  one exits 0. `--rebuild-corrupt` implies `-y`; `-n` with `-y` or `--rebuild-corrupt`, an unknown option,
+  no image or two are usage errors, exit 16 (e2fsck's). A device that fails, or no superblock that passes
+  (primary and backup), is an operational error, 8. Unknown features: everything is reported and nothing
+  written, 4. A warning repaired (a free slot with a mode, zeroed) makes the exit 1.
+- **Repairs are journaled.** Pass 0's repairs — the primary superblock from its backup (`CLEAN` cleared,
+  since its totals are stale, and `orphan_head` 0, since its list is not the list), a descriptor from the
+  backup's copy or, when that fails too, from the geometry (counts and checksums left to pass 5), an empty
+  journal superblock, a discarded log — are direct writes, each idempotent and followed by a flush. Every
+  other repair runs in ordinary transactions through the buffer layer (a mount's journal without mount's
+  writes or orphan processing), in **rounds**: check, apply the first kind of repair below that has work,
+  checkpoint everything, check again — until the check is clean, a round changes nothing, a round leaves
+  exactly the problems it began with, or 24 rounds have run. A crash anywhere in a repairing run therefore
+  leaves an image recovery makes consistent, and a second run finishes the work; the one visible trace of
+  a crash is that a directory being rebuilt (emptied, then refilled) may lose names, whose inodes the second
+  run links into `/lost+found`. The last write of a clean run is the stamp: the journal's `error` cleared,
+  then block 1 with `ERROR` cleared, `CLEAN`, exact totals, `check_time`, `mount_count` 0.
+- **The kinds, in order**, each a precondition of the next: clear (`--rebuild-corrupt` only); inode fields;
+  bitmaps, counts and the orphan list; duplicate claims (whose copies the allocator places, so the bitmaps
+  must be right first); directories (pass 2); connectivity (pass 3, and pass 4's nameless inodes); link
+  counts and orphans. Passes 3 and 4 judge only a complete census, so their problems appear in a later
+  round's check than pass 2's; the report lists every problem any check of the run found.
+- **Never freed under doubt.** A block no inode claims is freed only when pass 1 walked every allocated
+  inode: an inode it could not walk (a checksum, type, flags or extent tree it rejected) may own it, so with
+  one present the leaked bits stay set (reported, left) until `--rebuild-corrupt` clears that inode. A name
+  of an inode pass 1 could not read is not judged against its type (`DirType`): the inode's own problem is.
+- **Destructive, so `--rebuild-corrupt` only**, beyond the checksum failures listed above: an inode whose
+  type, flags or extent tree is invalid, or a symlink whose size is impossible — clearing is the only
+  repair, so the inode is zeroed and its bitmap bit cleared (its names then dangle and its blocks leak, and
+  later rounds repair both); an xattr block that fails any of its checks (dropped: `xattr_block` 0); a
+  journal superblock that fails (rewritten empty, its next sequence past every one still in the log); a
+  log recovery refuses (discarded from the bad transaction on, `start_seq` past the scan's end).
+- **A directory is rebuilt, never patched.** Any pass-2 problem in a directory rebuilds it from the names
+  it still holds: every written block its extents map is read, the index ignored, and each leaf passing
+  its own checksum, tail and record rules gives up its names; a bad name, a name of a reserved, free or
+  out-of-range inode and a second copy of a name are dropped, each file type is taken from its inode, the
+  directory is emptied (blocks freed, size 0, `INDEXED` cleared) and the names are added back. A block
+  failing its checksum makes the rebuild wait for `--rebuild-corrupt`, since its names are lost to it.
+- **`/lost+found`** is the root's name `lost+found` when it names a directory; missing, it is made (mode
+  0700); naming a non-directory, that inode is moved into a new `/lost+found` as `#<ino>` first. An inode
+  is linked as `#<ino>`, or `#<ino>.<k>` for the first `k` from 1 the directory does not hold; a directory
+  linked there gets `parent` = `/lost+found`, and the link counts follow in the next round. With no room for
+  the name the inode is left as it was — links kept, not freed — and the run exits 4.
+- **Other choices**: a size short of the extents is raised to their end (regular files and directories),
+  never the extents cut, so no byte is lost; a directory's extra names are removed keeping the first found in
+  the directory pass 2 met first (the root keeps none); a cycle's lowest member loses its names and goes to
+  `/lost+found`; the orphan list is cut before its first bad link, and members it no longer reaches, still
+  marked, are put back by the link-count kind (mark cleared, `orphan_add`) and the list processed; an
+  inode with no links and no name is put on the list and processed (freed); a directory is never put on
+  it that way (unreachable, it is reconnected instead).
+
+| diagnostic | repair |
+|---|---|
+| `Super` (checksum, magic, version, geometry) | `-y`: primary restored from the backup |
+| `Super` (a descriptor's checksum or locations) | `-y`: from the backup's copy, else from the geometry |
+| `Super` (device) | none: operational error, exit 8 |
+| `Features` | none: refused, nothing written |
+| `ErrorState`, `JournalError` | `-y`: cleared by the stamp when the run leaves the filesystem clean |
+| `Journal` | `--rebuild-corrupt`: journal superblock rewritten empty |
+| `NeedsRecovery` | recovery runs before the passes (`-n`: in memory) |
+| `LogAudit` | `--rebuild-corrupt`: the log from the refused transaction on discarded |
+| `InodeChecksum`, `InodeMode`, `InodeFlags`, `Extent` | `--rebuild-corrupt`: inode cleared |
+| `InodeParent` | `-y`: a non-directory's cleared; a directory's by `DirParent` |
+| `InodeSize` | `-y`: a device's, FIFO's or socket's size 0; a symlink's: `--rebuild-corrupt` clears it |
+| `DoubleClaim` | `-y`: the later claimant's extent copied — a directory's too, whose copy then fails its tail (`DirBlock`) and is rebuilt; a shared tree node or xattr block fails the later claimant's tail check and goes as that `Extent` or `Xattr` |
+| `BlockCount` | `-y`: `blocks` set to the count |
+| `ExtentPastEnd` | `-y`: size raised to the extents' end (a symlink's: `--rebuild-corrupt` clears it) |
+| `TailNotZero` | `-y`: the tail zeroed |
+| `Unlinked` | `-y`: links from the names; with none, onto the orphan list and processed |
+| `FreeInodeInUse` (warning) | `-y`: the slot zeroed |
+| `Xattr` | `--rebuild-corrupt`: the xattr block dropped |
+| `XattrFeature` | `-y`: XATTR set in the primary superblock and the backups |
+| `DirBlock` | `-y`: directory rebuilt; a checksum failure: `--rebuild-corrupt` |
+| `DirName`, `DirTarget`, `DirType`, `DirDuplicate`, `DirRange`, `DirMark`, `DirReach`, `DirShape` | `-y`: directory rebuilt |
+| `DirUnreachable` | `-y`: linked into `/lost+found`, `parent` set |
+| `DirNamedTwice` | `-y`: the extra names removed |
+| `DirParent` | `-y`: `parent` set to the directory holding its name |
+| `DirCycle` | `-y`: the lowest member's names removed, linked into `/lost+found` |
+| `LinkCount` | `-y`: `links` set to the count; a nameless non-directory linked into `/lost+found` |
+| `BlockBit`, `InodeBit`, `FreeBlocks`, `FreeInodes`, `Directories`, `BlockBitmapCrc`, `InodeBitmapCrc`, `Totals` | `-y`: bitmaps, descriptors and totals rewritten (a leak kept while an inode is unwalkable) |
+| `OrphanMember`, `OrphanCycle` | `-y`: the list cut before the bad link |
+| `OrphanFlag` | `-y`: put back on the list, which is processed |
+)
+
 **Pedagogical note.** With a journal, fsck is not needed after a crash — recovery is. It exists for
 what a journal cannot fix: bugs and bad media. Its passes are the filesystem's invariants written as a
 program, which is why each one has a test that breaks exactly that invariant.

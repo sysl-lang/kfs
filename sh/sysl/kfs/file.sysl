@@ -410,7 +410,7 @@ cut_from[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, keep: u64, op: st
     r
 
 // Unmap [a, b) in steps of at most STEP_EXTENTS extents, one handle of `credits` each, from the end down.
-private remove_steps[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, a: u64, b: u64, credits: u32, op: string, uid: u32) -> Result[unit, FsError]
+private[kfs] remove_steps[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, a: u64, b: u64, credits: u32, op: string, uid: u32) -> Result[unit, FsError]
     var hi = b
     while hi > a
         var h = fs.start(op, credits)

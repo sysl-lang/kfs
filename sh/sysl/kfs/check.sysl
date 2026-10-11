@@ -178,13 +178,22 @@ describe(p: Problem) -> string
         Problem.DirShape(i) -> s"directory $i's blocks, size or flags do not agree"
 
 // Check the filesystem on `dev`.
-check[D: BlockDevice](dev: *D) -> Report
+check[D: BlockDevice](dev: *D) -> Report = examine(dev).rep
+
+// A check's report with what its passes learnt, for the repairer (fsck.sysl): the checker's state when
+// passes 1 to 5 ran, None when pass 0 stopped them.
+private[kfs] struct Examined
+    rep: Report
+    c: Option[Checker]
+
+// The check of `check`, keeping the checker's state.
+private[kfs] examine[D: BlockDevice](dev: *D) -> Examined
     var rep = Report(buf(), buf(), buf(), buf(), 0)
     val m = open(dev) match
         Ok(m) -> m
         Err(e) ->
             rep.add(Problem.Super(e))
-            return rep
+            return Examined(rep, None)
     val sb = m.sb
     if sb.feature_incompat != 0 || sb.feature_ro_compat & ~RO_COMPAT_XATTR != 0 then rep.add(Problem.Features)
     if sb.state & STATE_ERROR != 0 then rep.add(Problem.ErrorState)
@@ -192,13 +201,13 @@ check[D: BlockDevice](dev: *D) -> Report
         Ok(s) -> s
         Err(e) ->
             rep.add(Problem.Journal(e))
-            return rep
+            return Examined(rep, None)
     if st.error != 0 then rep.add(Problem.JournalError(st.error))
     if st.start != 0
         rep.add(Problem.NeedsRecovery)
         audit_log(dev, sb, st, rep)
-        return rep
-    var c = Checker(m, 0, 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), true)
+        return Examined(rep, None)
+    var c = Checker(m, 0, 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), true, buf(), buf(), buf(), buf())
     for _ in 0..<usize(sb.blocks)
         c.owner.push(0)
     for _ in 0..<m.geo.group_count
@@ -212,6 +221,7 @@ check[D: BlockDevice](dev: *D) -> Report
         c.names.push(0)
         c.subdirs.push(0)
         c.namer.push(0)
+        c.ends.push(0)
     var failed = pass1(dev, &c, rep).is_err()
     if !failed
         val before = rep.problems.len()
@@ -224,7 +234,7 @@ check[D: BlockDevice](dev: *D) -> Report
     if !failed then failed = pass5(dev, &c, rep).is_err()
     if failed then rep.add(Problem.Super(OpenError.Device(DeviceError.Io)))
     rep.inodes = c.inodes
-    rep
+    Examined(rep, Some(c))
 
 // What pass 1 leaves for pass 5: the filesystem, which inode claims each block (0 for none) and each
 // group's directories; the blocks the inode being walked has claimed so far and its extents, and the
@@ -251,6 +261,21 @@ private[kfs] struct Checker
     subdirs: Buf[u64]
     namer: Buf[u64]
     complete: bool
+    // For the repairer: every name pass 2 read, in the order read; the inodes pass 1 could not walk (a
+    // checksum, mode, flags or extent tree it rejected), whose blocks are therefore unknown; by inode
+    // number, the end of the last block an inode maps (its extents' end, in blocks); and, for each
+    // `TailNotZero`, the inode and the block holding its last bytes.
+    entries: Buf[NameFound]
+    unsound: Buf[u64]
+    ends: Buf[u64]
+    tails: Buf[u64]
+
+// A name pass 2 read: directory `dir` names inode `ino`, with `file_type`, as `name`.
+private[kfs] struct NameFound
+    dir: u64
+    ino: u64
+    file_type: u8
+    name: Buf[u8]
 
 // A directory for pass 2: its inode's fields and its extents.
 private[kfs] struct DirSeen
@@ -341,6 +366,7 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
                 rep.add(Problem.InodeChecksum(ino))
                 // It may have been a directory, whose names are now beyond counting.
                 c.complete = false
+                c.unsound.push(ino)
                 continue
             val orphan = node.flags & INODE_ORPHAN != 0
             c.flagged[usize(ino)] = orphan
@@ -350,12 +376,14 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
             val t = node.mode & S_IFMT
             if !valid_type(t) || node.mode & ~(S_IFMT | 0o7777) != 0
                 rep.add(Problem.InodeMode(ino))
+                c.unsound.push(ino)
                 continue
             if t == S_IFDIR then c.dirs[usize(grp)] = c.dirs[usize(grp)] + 1
             c.types[usize(ino)] = dt_of(t)
             val f = node.flags
             if f & ~(INODE_INLINE | INODE_INDEXED | INODE_ORPHAN) != 0 || (f & INODE_INLINE != 0 && t != S_IFLNK) || (f & INODE_INDEXED != 0 && t != S_IFDIR)
                 rep.add(Problem.InodeFlags(ino))
+                c.unsound.push(ino)
                 continue
             if (t == S_IFDIR) != (node.parent != 0) then rep.add(Problem.InodeParent(ino))
             val special = t == S_IFCHR || t == S_IFBLK || t == S_IFIFO || t == S_IFSOCK
@@ -378,6 +406,7 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
                 fault match
                     Some(p) ->
                         rep.add(p)
+                        c.unsound.push(ino)
                         continue
                     None -> ()
                 past_end(dev, c, rep, ino, node, t == S_IFREG)?
@@ -411,6 +440,8 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
 private past_end[D: BlockDevice](dev: *D, c: *Checker, rep: Report, ino: u64, node: *Inode, regular: bool) -> Result[unit, DeviceError]
     val bs = u64(BLOCK_SIZE)
     val keep = (node.size + bs - 1) / bs
+    for e in c.extents.view()
+        if u64(e.logical) + u64(e.len) > c.ends[usize(ino)] then c.ends[usize(ino)] = u64(e.logical) + u64(e.len)
     if node.flags & INODE_ORPHAN == 0
         for e in c.extents.view()
             val unwritten = e.flags & EXTENT_UNWRITTEN != 0
@@ -427,6 +458,8 @@ private past_end[D: BlockDevice](dev: *D, c: *Checker, rep: Report, ino: u64, no
             for i in tail..<BLOCK_SIZE
                 if blk[i] != 0
                     rep.add(Problem.TailNotZero(ino))
+                    c.tails.push(ino)
+                    c.tails.push(e.physical + (l - u64(e.logical)))
                     return Ok(())
     Ok(())
 

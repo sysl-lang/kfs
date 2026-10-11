@@ -172,7 +172,8 @@ private walk_index[D: BlockDevice](dev: *D, c: *Checker, rep: Report, d: DirSeen
             return Ok(false)
     Ok(true)
 
-private bad_name(name: []const u8) -> bool
+// A name no directory may hold: empty, `.` or `..`, or holding `/` or NUL.
+private[kfs] bad_name(name: []const u8) -> bool
     if name.len == 0 then return true
     if name.len == 1 && name[0] == u8('.') then return true
     if name.len == 2 && name[0] == u8('.') && name[1] == u8('.') then return true
@@ -205,7 +206,8 @@ private check_leaf[D: BlockDevice](dev: *D, c: *Checker, rep: Report, d: DirSeen
         if reserved || r.ino > count || !c.allocated[usize(r.ino)]
             problem(rep, Problem.DirTarget(d.ino, r.ino))
         else
-            if c.types[usize(r.ino)] != r.file_type then problem(rep, Problem.DirType(d.ino, r.ino))
+            // An inode pass 1 could not read has no type to compare: its own problem is reported.
+            if c.types[usize(r.ino)] != 0 && c.types[usize(r.ino)] != r.file_type then problem(rep, Problem.DirType(d.ino, r.ino))
             // The census of passes 3 and 4.
             c.names[usize(r.ino)] = c.names[usize(r.ino)] + 1
             if c.types[usize(r.ino)] == DT_DIR
@@ -217,6 +219,7 @@ private check_leaf[D: BlockDevice](dev: *D, c: *Checker, rep: Report, d: DirSeen
         for b in name
             copy.push(b)
         names.push(NameSeen(h, copy))
+        c.entries.push(NameFound(d.ino, r.ino, r.file_type, copy))
     Ok(Some(hashes))
 
 private same_bytes(a: Buf[u8], b: Buf[u8]) -> bool

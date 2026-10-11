@@ -1,0 +1,1070 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+import sysl.sync.Atomic
+
+// fsck (kfs/SPEC.md section 23): the checker of check.sysl, and repair on top of it. `fsck.kfs` is a thin
+// host program over `fsck`; everything it does is here, freestanding-clean.
+//
+// **Modes.** `Check` (`-n`, and no flag) writes nothing: the device is wrapped in an `Overlay` that keeps
+// every write in memory, so a primary superblock restored from its backup and a log replayed by recovery
+// are seen by the passes without reaching the disk. `Repair` (`-y`) fixes what can be fixed without
+// losing anything the filesystem still holds intact; `Rebuild` (`-y --rebuild-corrupt`) also clears what
+// fails its checksum, and an inode no pass can walk.
+//
+// **Before the passes** (pass 0): a primary superblock or descriptor that fails its check is restored
+// from the backup section 5 finds (a descriptor the backup lacks too is rebuilt from the geometry, its
+// counts and checksums left to pass 5); a journal superblock that fails is rewritten empty only by
+// `Rebuild`; a log that is not empty is replayed by recovery, as mount would, and a log recovery refuses
+// is discarded only by `Rebuild`. These are direct writes, each followed by a flush, and each idempotent.
+//
+// **The rounds.** Then fsck checks, repairs one kind of problem, and checks again, until the check is
+// clean or nothing more can be done. Every repair runs in ordinary journal transactions through `Fs`, and
+// each round ends with everything checkpointed, so a crash anywhere leaves a filesystem recovery makes
+// consistent and a second run finishes the work. The kinds, in the order tried, each a precondition of
+// the next:
+//
+// 1. **Clear** (`Rebuild` only): an inode whose checksum, type, flags or extent tree fails is zeroed and
+//    its bitmap bit cleared; a symlink of impossible size likewise; an xattr block that fails is dropped.
+// 2. **Inode fields**: `blocks` set to what the inode claims; a non-directory's `parent` cleared; a
+//    device, FIFO or socket's size cleared; a regular file's or directory's size raised to cover what it
+//    maps; a last block's tail zeroed; a free slot with a mode zeroed; the XATTR feature set where an
+//    inode has an xattr block.
+// 3. **Bitmaps and counts** (pass 5): both bitmaps rewritten from what pass 1 found, the descriptors'
+//    counts and checksums, the superblock's totals; an orphan list cut before its first bad link. A
+//    block no inode claims is freed only when pass 1 walked every inode: an inode it could not walk may
+//    own it.
+// 4. **Duplicate claims** (pass 1b): each later claimant's extent holding a doubly claimed block is
+//    copied to new blocks, as e2fsck does, so each file keeps its bytes; an unwritten extent is only
+//    moved. A directory's copy still carries the other's tail, and kind 5 rebuilds it — freeing the copy,
+//    never a block another inode holds.
+// 5. **Directories** (pass 2): a directory with any pass-2 problem is rebuilt from the names it still
+//    holds: a bad name, a name of a free or reserved inode and a second copy of a name are dropped, each
+//    file type is taken from its inode, and the rest are added back to the emptied directory. A block that
+//    fails its checksum is read by nothing, so its names are lost to it (their inodes go to
+//    `/lost+found`): that rebuild waits for `Rebuild`.
+// 6. **Connectivity** (pass 3, and pass 4's names): a directory's extra names removed, a cycle broken,
+//    every directory and every inode with links but no name linked into `/lost+found` as `#<ino>`, which
+//    is created when missing (a non-directory of that name is moved into it first), and every wrong
+//    `parent` corrected.
+// 7. **Link counts and orphans** (pass 4, pass 5's list): `links` set to the names counted; an inode with
+//    no links and no name, and one marked an orphan the list misses, put on the list; then the list is
+//    processed as mount would.
+//
+// When the check is clean, fsck clears `ERROR` and the journal's `error`, sets `CLEAN` with exact totals,
+// `check_time` and `mount_count` 0: one direct write of block 1, and one of the journal superblock.
+
+enum FsckMode
+    Check
+    Repair
+    Rebuild
+
+// e2fsck's exit codes.
+const FSCK_CLEAN: u32 = 0
+const FSCK_FIXED: u32 = 1
+const FSCK_LEFT: u32 = 4
+const FSCK_FAILED: u32 = 8
+const FSCK_USAGE: u32 = 16
+
+// How many check-and-repair rounds a run may take before it gives up on what is left.
+private const FSCK_ROUNDS: u32 = 24
+
+// What a run found and did. `found` is every problem a check of the run reported — the first full check's
+// (after the log was replayed), then whatever a later round's check uncovered — and `warnings` the first
+// check's; `left` what the last check still reports; `done` what fsck did, in order; `code` the exit code.
+struct FsckReport
+    found: Buf[Problem]
+    warnings: Buf[Problem]
+    left: Buf[Problem]
+    done: Buf[string]
+    rounds: u32
+    code: u32
+
+    private note(self, s: string) = self.done.push(s)
+
+// Check, and with `Repair` or `Rebuild` repair, the filesystem on `dev`. `plat` supplies the clock and the
+// locks the transactions take.
+fsck[D: BlockDevice, P: Platform](dev: *D, plat: P, mode: FsckMode) -> FsckReport
+    var out = FsckReport(buf(), buf(), buf(), buf(), 0, FSCK_CLEAN)
+    if mode == FsckMode.Check
+        var ov = overlay(dev)
+        run_fsck(&ov, plat, mode, &out)
+    else
+        run_fsck(dev, plat, mode, &out)
+    out
+
+private fail_run(out: *FsckReport, why: string)
+    out.note(why)
+    out.code = FSCK_FAILED
+
+private run_fsck[D: BlockDevice, P: Platform](dev: *D, plat: P, mode: FsckMode, out: *FsckReport)
+    val repairing = mode != FsckMode.Check
+    // Pass 0: the superblock and the descriptors.
+    var restored = false
+    val first = open(dev)
+    first match
+        Ok(_) -> ()
+        Err(OpenError.Device(_)) ->
+            fail_run(out, "the device failed")
+            return
+        Err(e) ->
+            out.found.push(Problem.Super(e))
+            if !restore_super(dev, e, *out)
+                out.left.push(Problem.Super(e))
+                fail_run(out, "no usable superblock: fsck cannot go on")
+                return
+            restored = true
+    var m = open(dev) match
+        Ok(x) -> x
+        Err(e) ->
+            out.left.push(Problem.Super(e))
+            fail_run(out, "the superblock still fails after its restore")
+            return
+    // Unknown features: fsck refuses to repair what it does not understand (section 21).
+    val unknown = m.sb.feature_incompat != 0 || m.sb.feature_ro_compat & ~RO_COMPAT_XATTR != 0
+    // The journal superblock, then the log.
+    var st = JournalState(0, 0, 0)
+    read_journal_super(dev, m.sb) match
+        Ok(s) -> st = s
+        Err(e) ->
+            out.found.push(Problem.Journal(e))
+            if mode != FsckMode.Rebuild || unknown
+                out.left.push(Problem.Journal(e))
+                out.code = FSCK_LEFT
+                return
+            if empty_journal(dev, m.sb).is_err()
+                fail_run(out, "the device failed")
+                return
+            out.note("the journal superblock was rewritten empty: the log is lost")
+            restored = true
+    if st.start != 0 && !unknown
+        val rec = recover(dev, m.sb) match
+            Ok(r) -> r
+            Err(_) ->
+                fail_run(out, "the device failed during recovery")
+                return
+        out.note(s"recovery replayed ${rec.replayed} transactions from the log")
+        st = rec.st
+        if rec.corrupt
+            val audit = examine(dev).rep
+            for p in audit.problems.view()
+                out.found.push(p)
+            if mode != FsckMode.Rebuild
+                for p in audit.problems.view()
+                    out.left.push(p)
+                out.code = FSCK_LEFT
+                return
+            if discard_log(dev, m.sb, st).is_err()
+                fail_run(out, "the device failed")
+                return
+            out.note("the log from the transaction recovery refused on was discarded")
+            restored = true
+
+    var ex = examine(dev)
+    for p in ex.rep.problems.view()
+        out.found.push(p)
+    for w in ex.rep.warnings.view()
+        out.warnings.push(w)
+    if !repairing || unknown
+        if unknown && repairing then out.note("unknown features: nothing was repaired")
+        finish(out, ex.rep, false, restored)
+        return
+
+    // The rounds.
+    loop
+        if !actionable(ex.rep) || out.rounds == FSCK_ROUNDS then break
+        out.rounds += 1
+        var did: u32 = 0
+        repair_round(dev, plat, mode, ex, *out) match
+            Ok(n) -> did = n
+            Err(FsError.Device(_)) ->
+                fail_run(out, "the device failed during a repair")
+                return
+            Err(_) -> out.note("a repair failed: the rest is left")
+        if did == 0 then break
+        val before = ex.rep
+        ex = examine(dev)
+        // What a repair uncovers — passes 3 and 4 judge only once pass 2 is clean — is found too.
+        for p in ex.rep.problems.view()
+            if !listed(out.found, p) then out.found.push(p)
+        // A round that changed things and left exactly the problems it began with cannot be helped by
+        // another.
+        if same_problems(before, ex.rep) then break
+
+    // The stamp, when nothing is left but what it clears.
+    if !actionable(ex.rep)
+        if stamp(dev, plat).is_err()
+            fail_run(out, "the device failed writing the superblock")
+            return
+        ex = examine(dev)
+    finish(out, ex.rep, true, restored)
+
+// `left` and the exit code from the last report.
+private finish(out: *FsckReport, last: Report, repairing: bool, restored: bool)
+    for p in last.problems.view()
+        out.left.push(p)
+    if out.left.len() != 0
+        out.code = FSCK_LEFT
+    else if repairing && (restored || out.found.len() != 0 || out.warnings.len() != 0)
+        out.code = FSCK_FIXED
+    else if !repairing && out.found.len() != 0
+        out.code = FSCK_LEFT
+    else
+        out.code = FSCK_CLEAN
+
+// Whether a report holds anything a round could act on: a problem other than the two the stamp clears,
+// or a warning.
+private actionable(r: Report) -> bool
+    if r.warnings.len() != 0 then return true
+    for p in r.problems.view()
+        p match
+            Problem.ErrorState -> ()
+            Problem.JournalError(_) -> ()
+            _ -> return true
+    false
+
+private listed(ps: Buf[Problem], p: Problem) -> bool
+    val text = describe(p)
+    for q in ps.view()
+        if describe(q) == text then return true
+    false
+
+private same_problems(a: Report, b: Report) -> bool
+    if a.problems.len() != b.problems.len() || a.warnings.len() != b.warnings.len() then return false
+    for i in 0..<a.problems.len()
+        if describe(a.problems[i]) != describe(b.problems[i]) then return false
+    for i in 0..<a.warnings.len()
+        if describe(a.warnings[i]) != describe(b.warnings[i]) then return false
+    true
+
+// -- Pass 0 -------------------------------------------------------------------------------------------
+
+// Restore the primary superblock (when `e` is about it) and every descriptor that fails from the backup of
+// section 5; a descriptor whose backup fails too is rebuilt from the geometry. False when no superblock can
+// be had.
+private restore_super[D: BlockDevice](dev: *D, e: OpenError, out: FsckReport) -> bool
+    val super_bad = e match
+        OpenError.BadChecksum -> true
+        OpenError.BadMagic -> true
+        OpenError.BadVersion -> true
+        OpenError.BadGeometry -> true
+        _ -> false
+    val backup = find_backup(dev)
+    var blk = block_buf()
+    if super_bad
+        val b = backup match
+            Some(x) -> x
+            None -> return false
+        if dev.read(b.block, blk.view()).is_err() then return false
+        // Its static fields are the filesystem's; its totals are stale (so not CLEAN) and its orphan list
+        // is not the list.
+        val sb: *Superblock = at(blk.view(), 0)
+        sb.state = sb.state & ~STATE_CLEAN
+        sb.orphan_head = 0
+        seal_superblock(blk.view())
+        if dev.write(1, blk.view()).is_err() || dev.flush().is_err() then return false
+        out.note(s"the primary superblock was restored from the backup at block ${b.block}")
+    else
+        if dev.read(1, blk.view()).is_err() then return false
+    val sb: *Superblock = at(blk.view(), 0)
+    if check_superblock(sb, dev.blocks()).is_err() then return false
+    val g = geometry_of(sb)
+    val seed = sb.csum_seed
+    var table = block_buf()
+    var spare = block_buf()
+    for t in 0..<u64(g.gdt_blocks)
+        if dev.read(2 + t, table.view()).is_err() then return false
+        var changed = false
+        for k in 0..<64
+            val grp = u32(t) * 64 + u32(k)
+            if grp >= g.group_count then break
+            val off = usize(k) * 64
+            val d: *GroupDesc = at(table.view(), off)
+            if verify_group_desc(seed, grp, table.view()[off..<off + 64]) && d.block_bitmap == g.block_bitmap(grp) && d.inode_bitmap == g.inode_bitmap(grp) && d.inode_table == g.inode_table(grp)
+                continue
+            var from_backup = false
+            backup match
+                Some(b) ->
+                    if dev.read(b.block + 1 + t, spare.view()).is_ok() && verify_group_desc(seed, grp, spare.view()[off..<off + 64])
+                        for i in off..<off + 64
+                            table[i] = spare[i]
+                        from_backup = true
+                None -> ()
+            if !from_backup
+                for i in off..<off + 64
+                    table[i] = 0
+                d.block_bitmap = g.block_bitmap(grp)
+                d.inode_bitmap = g.inode_bitmap(grp)
+                d.inode_table = g.inode_table(grp)
+                seal_group_desc(seed, grp, table.view()[off..<off + 64])
+            changed = true
+            out.note(if from_backup then s"group ${grp}'s descriptor was restored from the backup" else s"group ${grp}'s descriptor was rebuilt from the geometry")
+        if changed
+            if dev.write(2 + t, table.view()).is_err() || dev.flush().is_err() then return false
+    true
+
+// Write an empty journal superblock whose next sequence follows every one still in the log, so no block
+// left there can be taken for a later transaction's.
+private empty_journal[D: BlockDevice](dev: *D, sb: Superblock) -> Result[unit, DeviceError]
+    var blk = block_buf()
+    var top: u64 = 0
+    for p in 1..<sb.journal_blocks
+        dev.read(sb.journal_start + u64(p), blk.view())?
+        val h: *JournalHeader = at(blk.view(), 0)
+        if h.magic == JOURNAL_MAGIC && h.sequence > top then top = h.sequence
+    write_journal_super(dev, sb, JournalState(0, top + 1, 0))?
+    dev.flush()
+
+// Drop the log recovery refused: `start` 0, the next sequence past the scan's end. The error recovery
+// recorded stays until fsck leaves the filesystem clean.
+private discard_log[D: BlockDevice](dev: *D, sb: Superblock, st: JournalState) -> Result[unit, DeviceError]
+    val sc = scan_log(dev, sb, st)?
+    write_journal_super(dev, sb, JournalState(0, sc.end_seq + 1, st.error))?
+    dev.flush()
+
+// The last write: `ERROR` and the journal's `error` cleared, `CLEAN` with exact totals, the check's time,
+// `mount_count` 0.
+private stamp[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[unit, DeviceError]
+    val m = open(dev) match
+        Ok(m) -> m
+        Err(_) -> return Err(DeviceError.Io)
+    val st = read_journal_super(dev, m.sb) match
+        Ok(s) -> s
+        Err(_) -> return Err(DeviceError.Io)
+    if st.error != 0
+        write_journal_super(dev, m.sb, JournalState(st.start, st.start_seq, 0))?
+        dev.flush()?
+    var blocks: u64 = 0
+    var inodes: u64 = 0
+    for d in m.descs.view()
+        blocks += u64(d.free_blocks)
+        inodes += u64(d.free_inodes)
+    var p = plat
+    var blk = block_buf()
+    dev.read(1, blk.view())?
+    val sb: *Superblock = at(blk.view(), 0)
+    sb.state = (sb.state | STATE_CLEAN) & ~STATE_ERROR
+    sb.free_blocks = blocks
+    sb.free_inodes = inodes
+    sb.check_time = p.now().sec
+    sb.mount_count = 0
+    seal_superblock(blk.view())
+    dev.write(1, blk.view())?
+    dev.flush()
+
+// -- The rounds ---------------------------------------------------------------------------------------
+
+// The filesystem as the repairs see it: the journal and buffers of a mount, none of mount's checks or
+// writes (fsck has made its own), no orphan processing until the repairs ask for it.
+private repair_fs[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D, P], FsError]
+    val m = open(dev)?
+    val st = read_journal_super(dev, m.sb)?
+    var blocks: u64 = 0
+    var inodes: u64 = 0
+    var groups: Buf[GroupState] = buf()
+    for d in m.descs.view()
+        blocks += u64(d.free_blocks)
+        inodes += u64(d.free_inodes)
+        groups.push(GroupState(buf(), 0, false, false))
+    Ok(Fs(dev, plat, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, new_journal(st, false, m.sb.max_transaction), buf(), 0, u16(EXTENT_NODE_SLOTS), u16(DIR_INDEX_SLOTS)))
+
+// One round: the first kind of repair with something to do, then everything checkpointed. Answers how
+// many things it changed.
+private repair_round[D: BlockDevice, P: Platform](dev: *D, plat: P, mode: FsckMode, ex: Examined, out: FsckReport) -> Result[u32, FsError]
+    val c = ex.c match
+        Some(c) -> c
+        None -> return Ok(0)
+    val rep = ex.rep
+    var fs = repair_fs(dev, plat)?
+    var n: u32 = 0
+    if mode == FsckMode.Rebuild then n = clear_corrupt(&fs, c, rep, out)?
+    if n == 0 then n = fix_fields(&fs, c, rep, out)?
+    if n == 0 then n = fix_bitmaps(&fs, c, rep, out)?
+    if n == 0 then n = copy_shared(&fs, c, rep, out)?
+    if n == 0 then n = rebuild_dirs(&fs, c, rep, mode, out)?
+    if n == 0 then n = reconnect(&fs, c, rep, out)?
+    if n == 0 then n = fix_links(&fs, c, rep, out)?
+    fs.checkpoint_all()?
+    Ok(n)
+
+// Edit block `b` in `h`: declared, then changed by `edit`.
+private touch[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64, edit: &Fn([]u8) -> unit) -> Result[unit, FsError]
+    val id = fs.buffer(b)?
+    fs.plat.lock(LockId.Buffer(b))
+    val r = fs.write_access(h, id)
+    if r.is_ok() then edit(fs.bytes(id))
+    fs.plat.unlock(LockId.Buffer(b))
+    r
+
+// Inode `ino`'s slot changed by `edit` and sealed again, in `h`, whatever its checksum was.
+private edit_raw[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, edit: &Fn(*Inode) -> unit) -> Result[unit, FsError]
+    val loc = fs.inode_location(ino)
+    val seed = fs.seed
+    touch(fs, h, loc.block, (b) ->
+        edit(at(b, loc.offset))
+        seal_inode(seed, ino, b[loc.offset..<loc.offset + INODE_SIZE]))
+
+// Inode `ino`'s slot zeroed, in `h`.
+private zero_slot[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> Result[unit, FsError]
+    val loc = fs.inode_location(ino)
+    touch(fs, h, loc.block, (b) ->
+        for k in 0..<INODE_SIZE
+            b[loc.offset + k] = 0)
+
+// A copy of block `b` as the cache has it.
+private block_now[D: BlockDevice, P: Platform](fs: *Fs[D, P], b: u64) -> Result[Buf[u8], FsError]
+    val id = fs.buffer(b)?
+    var copy: Buf[u8] = buf()
+    fs.plat.lock(LockId.Buffer(b))
+    copy.extend(fs.bytes(id))
+    fs.plat.unlock(LockId.Buffer(b))
+    Ok(copy)
+
+private equal_bytes(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// Block `b` made `want` in `h`, if it is not already; whether it changed.
+private put_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64, want: []const u8) -> Result[bool, FsError]
+    val id = fs.buffer(b)?
+    fs.plat.lock(LockId.Buffer(b))
+    val have = fs.bytes(id)
+    var same = true
+    for k in 0..<BLOCK_SIZE
+        if have[k] != want[k]
+            same = false
+            break
+    var r: Result[unit, FsError] = Ok(())
+    if !same
+        r = fs.write_access(h, id)
+        if r.is_ok()
+            val now = fs.bytes(id)
+            for k in 0..<BLOCK_SIZE
+                now[k] = want[k]
+    fs.plat.unlock(LockId.Buffer(b))
+    r?
+    Ok(!same)
+
+// A copy of inode `ino` as the cache has it, its checksum unexamined.
+private inode_now[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Inode, FsError]
+    val loc = fs.inode_location(ino)
+    val b = block_now(fs, loc.block)?
+    val n: *Inode = at(b.view(), loc.offset)
+    Ok(*n)
+
+private one_of(xs: Buf[u64], x: u64) -> bool
+    for y in xs.view()
+        if y == x then return true
+    false
+
+private add_once(xs: Buf[u64], x: u64)
+    if !one_of(xs, x) then xs.push(x)
+
+private special(t: u8) -> bool = t == DT_CHR || t == DT_BLK || t == DT_FIFO || t == DT_SOCK
+
+// -- 1. Clear what fails ------------------------------------------------------------------------------
+
+private clear_corrupt[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, rep: Report, out: FsckReport) -> Result[u32, FsError]
+    var clear: Buf[u64] = buf()
+    var drop_xattr: Buf[u64] = buf()
+    for p in rep.problems.view()
+        p match
+            Problem.InodeChecksum(i) -> add_once(clear, i)
+            Problem.InodeMode(i) -> add_once(clear, i)
+            Problem.InodeFlags(i) -> add_once(clear, i)
+            Problem.Extent(i, _, _) -> add_once(clear, i)
+            Problem.InodeSize(i) -> if c.types[usize(i)] == DT_LNK then add_once(clear, i)
+            Problem.ExtentPastEnd(i, _) -> if c.types[usize(i)] == DT_LNK then add_once(clear, i)
+            Problem.Xattr(i) -> add_once(drop_xattr, i)
+            _ -> ()
+    var n: u32 = 0
+    val g = fs.geo
+    for i in clear.view()
+        var h = fs.start("fsck: clear", C_INODE + 1)
+        val grp = u32((i - 1) / u64(g.inodes_per_group))
+        val slot = usize((i - 1) % u64(g.inodes_per_group))
+        var r = zero_slot(fs, &h, i)
+        if r.is_ok() then r = touch(fs, &h, g.inode_bitmap(grp), (b) -> bit_clear(b, slot))
+        fs.stop(&h)
+        r?
+        out.note(s"inode $i was cleared")
+        n += 1
+    for i in drop_xattr.view()
+        if one_of(clear, i) then continue
+        var h = fs.start("fsck: xattr", C_INODE)
+        val r = edit_raw(fs, &h, i, (x) -> x.xattr_block = 0)
+        fs.stop(&h)
+        r?
+        out.note(s"inode $i's xattr block was dropped")
+        n += 1
+    Ok(n)
+
+// -- 2. Inode fields ----------------------------------------------------------------------------------
+
+private fix_fields[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, rep: Report, out: FsckReport) -> Result[u32, FsError]
+    var n: u32 = 0
+    var feature = false
+    for p in rep.problems.view()
+        var did = ""
+        var h = fs.start("fsck: inode", C_INODE + 2)
+        val r = fix_field(fs, &h, c, p, &did, &feature)
+        fs.stop(&h)
+        r?
+        if did != ""
+            out.note(did)
+            n += 1
+    for w in rep.warnings.view()
+        w match
+            Problem.FreeInodeInUse(i) ->
+                var h = fs.start("fsck: free slot", C_INODE)
+                val r = zero_slot(fs, &h, i)
+                fs.stop(&h)
+                r?
+                out.note(s"free inode $i's slot was zeroed")
+                n += 1
+            _ -> ()
+    Ok(n)
+
+// The repair of one pass-1 problem, in `h`; `did` says what was done, empty for nothing.
+private fix_field[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, c: Checker, p: Problem, did: *string, feature: *bool) -> Result[unit, FsError]
+    p match
+        Problem.InodeParent(i) ->
+            if c.types[usize(i)] == DT_DIR || c.types[usize(i)] == 0 then return Ok(())
+            *did = s"inode $i's parent was cleared"
+            edit_raw(fs, h, i, (x) -> x.parent = 0)
+        Problem.InodeSize(i) ->
+            if !special(c.types[usize(i)]) then return Ok(())
+            *did = s"inode $i's size was cleared"
+            edit_raw(fs, h, i, (x) -> x.size = 0)
+        Problem.BlockCount(i, _, counted) ->
+            *did = s"inode $i's block count was set to $counted"
+            edit_raw(fs, h, i, (x) -> x.blocks = counted)
+        Problem.ExtentPastEnd(i, _) ->
+            val t = c.types[usize(i)]
+            if t != DT_REG && t != DT_DIR then return Ok(())
+            val size = c.ends[usize(i)] * u64(BLOCK_SIZE)
+            *did = s"inode $i's size was raised to $size, the end of what it maps"
+            edit_raw(fs, h, i, (x) -> x.size = size)
+        Problem.TailNotZero(i) -> zero_tail(fs, h, c, i, did)
+        Problem.XattrFeature(_) ->
+            if *feature then return Ok(())
+            *feature = true
+            *did = "the XATTR feature was set"
+            set_xattr_feature(fs, h)
+        _ -> Ok(())
+
+// Zero inode `i`'s last block from its size on: the block pass 1 found (`Checker.tails`).
+private zero_tail[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, c: Checker, i: u64, did: *string) -> Result[unit, FsError]
+    var k: usize = 0
+    while k + 1 < c.tails.len()
+        if c.tails[k] == i
+            val node = inode_now(fs, i)?
+            val from = usize(node.size % u64(BLOCK_SIZE))
+            *did = s"inode $i's last block was zeroed past its size"
+            return touch(fs, h, c.tails[k + 1], (b) ->
+                for x in from..<BLOCK_SIZE
+                    b[x] = 0)
+        k += 2
+    Ok(())
+
+// Set the XATTR feature in the primary superblock and in each backup (groups 1 and G - 1), the static
+// fields every copy shares.
+private set_xattr_feature[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle) -> Result[unit, FsError]
+    var at_blocks: Buf[u64] = buf()
+    at_blocks.push(1)
+    at_blocks.push(fs.geo.group_first(1))
+    if fs.geo.group_count > 2 then at_blocks.push(fs.geo.group_first(fs.geo.group_count - 1))
+    for b in at_blocks.view()
+        val now = block_now(fs, b)?
+        if !verify_superblock(now.view()) then continue
+        touch(fs, h, b, (x) ->
+            val sb: *Superblock = at(x, 0)
+            sb.feature_ro_compat = sb.feature_ro_compat | RO_COMPAT_XATTR
+            seal_superblock(x))?
+    Ok(())
+
+// -- 3. Bitmaps, counts and the orphan list -------------------------------------------------------------
+
+private pass5_problem(p: Problem) -> bool
+    p match
+        Problem.BlockBit(_, _) -> true
+        Problem.InodeBit(_, _) -> true
+        Problem.FreeBlocks(_) -> true
+        Problem.FreeInodes(_) -> true
+        Problem.Directories(_) -> true
+        Problem.BlockBitmapCrc(_) -> true
+        Problem.InodeBitmapCrc(_) -> true
+        Problem.Totals -> true
+        Problem.OrphanMember(_) -> true
+        Problem.OrphanCycle(_) -> true
+        _ -> false
+
+private fix_bitmaps[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, rep: Report, out: FsckReport) -> Result[u32, FsError]
+    var any = false
+    var list = false
+    for p in rep.problems.view()
+        if pass5_problem(p) then any = true
+        p match
+            Problem.OrphanMember(_) -> list = true
+            Problem.OrphanCycle(_) -> list = true
+            _ -> ()
+    if !any then return Ok(0)
+    var n: u32 = 0
+    if list then n += cut_orphan_list(fs, c, out)?
+    val g = fs.geo
+    val seed = fs.seed
+    // A block nothing claims may still be an unwalkable inode's: its bit stays set.
+    val keep_set = c.unsound.len() != 0
+    var free_blocks: u64 = 0
+    var free_inodes: u64 = 0
+    for grp in 0..<g.group_count
+        var h = fs.start("fsck: bitmaps", 3)
+        val r = group_counts(fs, &h, c, grp, keep_set)
+        fs.stop(&h)
+        val counts = r?
+        free_blocks += counts.blocks
+        free_inodes += counts.inodes
+        if counts.changed
+            out.note(s"group ${grp}'s bitmaps, counts and checksums were rewritten")
+            n += 1
+    var h = fs.start("fsck: totals", C_SB)
+    val sbr = block_now(fs, 1)
+    var r: Result[bool, FsError] = Ok(false)
+    sbr match
+        Ok(sbb) ->
+            val sb: *Superblock = at(sbb.view(), 0)
+            sb.free_blocks = free_blocks
+            sb.free_inodes = free_inodes
+            seal_superblock(sbb.view())
+            r = put_block(fs, &h, 1, sbb.view())
+        Err(e) -> r = Err(e)
+    fs.stop(&h)
+    val totals = r?
+    if totals
+        out.note("the superblock's totals were rewritten")
+        n += 1
+    Ok(n)
+
+private struct GroupCounts
+    blocks: u64
+    inodes: u64
+    changed: bool
+
+// Group `grp`'s bitmaps as pass 5 says they must be, its descriptor's counts and checksums with them.
+private group_counts[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, c: Checker, grp: u32, keep_set: bool) -> Result[GroupCounts, FsError]
+    val g = fs.geo
+    val seed = fs.seed
+    var bb = block_now(fs, g.block_bitmap(grp))?
+    var ib = block_now(fs, g.inode_bitmap(grp))?
+    val first = g.group_first(grp)
+    val len = usize(g.group_len(grp))
+    val meta = usize(g.meta_blocks(grp))
+    for i in 0..<(BLOCK_SIZE * 8)
+        val b = first + u64(i)
+        val journal = b >= g.journal_start && b < g.journal_start + u64(g.journal_blocks)
+        val want = i < meta || i >= len || journal || (b < u64(c.owner.len()) && c.owner[usize(b)] != 0)
+        if want then bit_set(bb.view(), i) else if !keep_set then bit_clear(bb.view(), i)
+    val ipg = usize(g.inodes_per_group)
+    for i in 0..<(BLOCK_SIZE * 8)
+        val ino = u64(grp) * u64(g.inodes_per_group) + u64(i) + 1
+        if i >= ipg || ino < FIRST_INO then bit_set(ib.view(), i)
+    var changed = put_block(fs, h, g.block_bitmap(grp), bb.view())?
+    if put_block(fs, h, g.inode_bitmap(grp), ib.view())? then changed = true
+    val db = fs.desc_block(grp)
+    val off = fs.desc_offset(grp)
+    var table = block_now(fs, db)?
+    val d: *GroupDesc = at(table.view(), off)
+    d.free_blocks = count_clear(bb.view(), len)
+    d.free_inodes = count_clear(ib.view(), ipg)
+    d.directories = c.dirs[usize(grp)]
+    d.block_bitmap_crc = bitmap_crc(seed, grp, bb.view())
+    d.inode_bitmap_crc = bitmap_crc(seed, grp, ib.view())
+    seal_group_desc(seed, grp, table.view()[off..<off + 64])
+    if put_block(fs, h, db, table.view())? then changed = true
+    Ok(GroupCounts(u64(d.free_blocks), u64(d.free_inodes), changed))
+
+// Cut the orphan list before its first bad link: a member out of range, free, without `ORPHAN`, or met
+// again. The members after it, still marked, are put back by the link-count round.
+private cut_orphan_list[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, out: FsckReport) -> Result[u32, FsError]
+    val count = fs.sb.inode_count
+    var reached: Buf[u64] = buf()
+    var prev: u64 = 0
+    var ino = c.m.sb.orphan_head
+    while ino != 0
+        val bad = ino < FIRST_INO || ino > count || !c.allocated[usize(ino)] || !c.flagged[usize(ino)] || one_of(reached, ino)
+        if bad
+            var h = fs.start("fsck: orphan list", C_INODE + C_SB)
+            var r: Result[unit, FsError] = Ok(())
+            if prev == 0
+                r = touch(fs, &h, 1, (x) ->
+                    val sb: *Superblock = at(x, 0)
+                    sb.orphan_head = 0
+                    seal_superblock(x))
+            else
+                r = edit_raw(fs, &h, prev, (x) -> x.orphan_next = 0)
+            fs.stop(&h)
+            r?
+            out.note(s"the orphan list was cut before inode $ino")
+            return Ok(1)
+        reached.push(ino)
+        prev = ino
+        val node = inode_now(fs, ino)?
+        ino = node.orphan_next
+    Ok(0)
+
+// -- 4. Duplicate claims ------------------------------------------------------------------------------
+
+private copy_shared[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, rep: Report, out: FsckReport) -> Result[u32, FsError]
+    var inodes: Buf[u64] = buf()
+    var shared: Buf[u64] = buf()
+    for p in rep.problems.view()
+        p match
+            Problem.DoubleClaim(b, i) ->
+                add_once(inodes, i)
+                add_once(shared, b)
+            _ -> ()
+    var n: u32 = 0
+    for i in inodes.view()
+        // A directory's copy still carries the other's tail, so pass 2 then finds it and the directory is
+        // rebuilt — freeing only the copy, never a block another inode holds. An inode pass 1 could not
+        // type has nothing to copy into.
+        if c.types[usize(i)] == 0 then continue
+        val node = inode_now(fs, i)?
+        val loc = fs.inode_location(i)
+        n += copy_in(fs, i, node.generation, loc.block, loc.offset + 112, true, shared, out)?
+    Ok(n)
+
+private shares(shared: Buf[u64], first: u64, len: u64) -> bool
+    for b in shared.view()
+        if b >= first && b < first + len then return true
+    false
+
+// The node at `base` in block `block` (the inode's slot when `in_inode`) and everything under it: each
+// leaf extent holding a shared block copied to a new run, and its entry pointed there.
+private copy_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, generation: u32, block: u64, base: usize, in_inode: bool, shared: Buf[u64], out: FsckReport) -> Result[u32, FsError]
+    val bytes = block_now(fs, block)?
+    val head: *NodeHeader = at(bytes.view(), base)
+    val count = usize(head.count)
+    val leaf = head.depth == 0
+    var n: u32 = 0
+    for i in 0..<count
+        val off = base + sizeof(NodeHeader) + i * sizeof(ExtentLeaf)
+        if !leaf
+            val x: *ExtentIndex = at(bytes.view(), off)
+            n += copy_in(fs, ino, generation, x.child, 0, false, shared, out)?
+            continue
+        val e: *ExtentLeaf = at(bytes.view(), off)
+        val ext = *e
+        if !shares(shared, ext.physical, u64(ext.len)) then continue
+        var h = fs.start("fsck: copy", C_ALLOC + C_INODE + 1)
+        val r = copy_extent(fs, &h, ino, block, off, in_inode, ext)
+        fs.stop(&h)
+        val moved = r?
+        if moved
+            out.note(s"inode $ino's blocks ${ext.physical}..${ext.physical + u64(ext.len) - 1} were copied: they were shared")
+            n += 1
+        else
+            out.note(s"inode $ino's shared blocks from ${ext.physical} could not be copied: no room")
+    Ok(n)
+
+// Copy extent `ext` (at `off` in `block`) to a new run of its length and point the entry there. False
+// when the free space holds no such run.
+private copy_extent[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, block: u64, off: usize, in_inode: bool, ext: ExtentLeaf) -> Result[bool, FsError]
+    val run =alloc_blocks(fs, h, goal_for(fs, ino, 0), u32(ext.len), 0) match
+        Ok(r) -> r
+        Err(FsError.NoSpace) -> return Ok(false)
+        Err(e) -> return Err(e)
+    if run.len < u32(ext.len)
+        free_blocks(fs, h, run.first, run.len)?
+        return Ok(false)
+    if ext.flags & EXTENT_UNWRITTEN == 0
+        var blk = block_buf()
+        for k in 0..<u64(ext.len)
+            fs.dev.read(ext.physical + k, blk.view())?
+            fs.write_new_data(h, run.first + k, blk.view())?
+    val seed = fs.seed
+    val loc = fs.inode_location(ino)
+    touch(fs, h, block, (b) ->
+        put_le64(b, off + 8, run.first)
+        if in_inode then seal_inode(seed, ino, b[loc.offset..<loc.offset + INODE_SIZE]) else seal_block(seed, b))?
+    Ok(true)
+
+// -- 5. Directories -----------------------------------------------------------------------------------
+
+private rebuild_dirs[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, rep: Report, mode: FsckMode, out: FsckReport) -> Result[u32, FsError]
+    var dirs: Buf[u64] = buf()
+    var waiting: Buf[u64] = buf()
+    for p in rep.problems.view()
+        p match
+            Problem.DirBlock(d, _, f) ->
+                add_once(dirs, d)
+                if f == DirFault.Checksum && mode != FsckMode.Rebuild then add_once(waiting, d)
+            Problem.DirName(d, _) -> add_once(dirs, d)
+            Problem.DirTarget(d, _) -> add_once(dirs, d)
+            Problem.DirType(d, _) -> add_once(dirs, d)
+            Problem.DirDuplicate(d) -> add_once(dirs, d)
+            Problem.DirRange(d, _) -> add_once(dirs, d)
+            Problem.DirMark(d, _) -> add_once(dirs, d)
+            Problem.DirReach(d, _) -> add_once(dirs, d)
+            Problem.DirShape(d) -> add_once(dirs, d)
+            _ -> ()
+    var n: u32 = 0
+    for d in dirs.view()
+        if one_of(waiting, d) then continue
+        rebuild_dir(fs, c, d, out)?
+        n += 1
+    Ok(n)
+
+// Every name in a leaf of directory `d` that passes the leaf's own checks: each written block its
+// extents map, read whatever the index says, so a leaf the index lost is read too.
+private salvage[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, d: u64) -> Result[Buf[NameFound], FsError]
+    var found: Buf[NameFound] = buf()
+    for s in c.seen.view()
+        if s.ino != d then continue
+        for e in s.extents.view()
+            if e.flags & EXTENT_UNWRITTEN != 0 then continue
+            for k in 0..<u64(e.len)
+                var blk = block_now(fs, e.physical + k)?
+                if dir_block_fault(fs.seed, blk.view(), d, s.generation).is_some() then continue
+                val recs = leaf_records(blk.view()) match
+                    Ok(r) -> r
+                    Err(_) -> continue
+                for r in recs.view()
+                    if r.ino == 0 then continue
+                    var name: Buf[u8] = buf()
+                    name.extend(rec_name(blk.view(), r))
+                    found.push(NameFound(d, r.ino, r.file_type, name))
+    Ok(found)
+
+// Directory `d` emptied and filled again with the names it holds that may stand.
+private rebuild_dir[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, d: u64, out: FsckReport) -> Result[unit, FsError]
+    val count = fs.sb.inode_count
+    var keep: Buf[NameFound] = buf()
+    var dropped: u32 = 0
+    val held = salvage(fs, c, d)?
+    for e in held.view()
+        val reserved = e.ino == 1 || (e.ino >= 3 && e.ino < FIRST_INO)
+        var again = false
+        for k in keep.view()
+            if equal_bytes(k.name.view(), e.name.view()) then again = true
+        if bad_name(e.name.view()) || reserved || e.ino == 0 || e.ino > count || !c.allocated[usize(e.ino)] || again
+            dropped += 1
+            continue
+        val t = if c.types[usize(e.ino)] != 0 then c.types[usize(e.ino)] else e.file_type
+        keep.push(NameFound(d, e.ino, t, e.name))
+    remove_steps(fs, d, 0, LOGICAL_BLOCKS, C_TRUNCATE_STEP, "fsck: directory", 0)?
+    var h = fs.start("fsck: directory", C_INODE)
+    val r = edit_raw(fs, &h, d, (x) ->
+        x.size = 0
+        x.flags = x.flags & ~INODE_INDEXED)
+    fs.stop(&h)
+    r?
+    var lost: u32 = 0
+    for k in keep.view()
+        add_name(fs, d, k.name.view(), k.ino, k.file_type, 0) match
+            Ok(_) -> ()
+            Err(FsError.NoSpace) -> lost += 1
+            Err(e) -> return Err(e)
+    out.note(s"directory $d was rebuilt: ${keep.len() - usize(lost)} names kept, ${dropped + lost} dropped")
+    Ok(())
+
+// -- 6. Connectivity ----------------------------------------------------------------------------------
+
+private reconnect[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, rep: Report, out: FsckReport) -> Result[u32, FsError]
+    var twice: Buf[u64] = buf()
+    var cycle: Buf[u64] = buf()
+    var lost: Buf[u64] = buf()
+    var parent: Buf[u64] = buf()
+    for p in rep.problems.view()
+        p match
+            Problem.DirNamedTwice(i) -> add_once(twice, i)
+            Problem.DirCycle(i) -> add_once(cycle, i)
+            Problem.DirUnreachable(i) -> add_once(lost, i)
+            Problem.DirParent(i) -> add_once(parent, i)
+            Problem.LinkCount(i, r, counted) -> if nameless(c, i, r, counted) then add_once(lost, i)
+            _ -> ()
+    if twice.len() + cycle.len() + lost.len() + parent.len() == 0 then return Ok(0)
+    var n: u32 = 0
+    // Extra names: the root keeps none, any other directory the first found in its `namer`.
+    for i in twice.view()
+        var kept = i == ROOT_INO
+        for e in c.entries.view()
+            if e.ino != i then continue
+            if !kept && e.dir == c.namer[usize(i)]
+                kept = true
+                continue
+            unname(fs, e, out)?
+            n += 1
+    // A cycle: its lowest member loses its names and is linked into lost+found.
+    for i in cycle.view()
+        for e in c.entries.view()
+            if e.ino == i then unname(fs, e, out)?
+        lost.push(i)
+    var lf: u64 = 0
+    for i in lost.view()
+        if lf == 0
+            lf = lost_found(fs, out) match
+                Ok(x) -> x
+                Err(FsError.NoSpace) ->
+                    out.note("lost+found could not be made: no room")
+                    return Ok(n)
+                Err(e) -> return Err(e)
+        if link_lost(fs, lf, i, c.types[usize(i)], out)? then n += 1
+    for i in parent.view()
+        if one_of(lost, i) then continue
+        val want = if i == ROOT_INO then ROOT_INO else c.namer[usize(i)]
+        if want == 0 then continue
+        var h = fs.start("fsck: parent", C_INODE)
+        val r = change_inode(fs, &h, i, (x) -> x.parent = want)
+        fs.stop(&h)
+        r?
+        out.note(s"directory $i's parent was set to $want")
+        n += 1
+    Ok(n)
+
+// A non-directory with links and no name: pass 4's count of 0 against links recorded.
+private nameless(c: Checker, i: u64, recorded: u32, counted: u64) -> bool = counted == 0 && recorded > 0 && c.types[usize(i)] != DT_DIR
+
+// Remove the name `e` reads (gone already is as good).
+private unname[D: BlockDevice, P: Platform](fs: *Fs[D, P], e: NameFound, out: FsckReport) -> Result[unit, FsError]
+    remove_name(fs, e.dir, e.name.view()) match
+        Ok(_) -> ()
+        Err(FsError.NotFound) -> return Ok(())
+        Err(x) -> return Err(x)
+    out.note(s"directory ${e.dir}'s name for inode ${e.ino} was removed")
+    Ok(())
+
+// `/lost+found`: the directory of that name in the root, made when there is none. A non-directory holding
+// the name is moved into the new directory, as `#<ino>`, first.
+private lost_found[D: BlockDevice, P: Platform](fs: *Fs[D, P], out: FsckReport) -> Result[u64, FsError]
+    val name = "lost+found".bytes
+    val root = Caller(0, 0)
+    lookup_name(fs, ROOT_INO, name) match
+        Ok(e) ->
+            if e.file_type == DT_DIR then return Ok(e.ino)
+            val aside = free_name(fs, ROOT_INO, e.ino)?
+            rename(fs, ROOT_INO, name, ROOT_INO, aside.bytes, RENAME_NOREPLACE, root)?
+            val lf = mkdir(fs, ROOT_INO, name, 0o700, root)?
+            val inside = free_name(fs, lf, e.ino)?
+            rename(fs, ROOT_INO, aside.bytes, lf, inside.bytes, RENAME_NOREPLACE, root)?
+            out.note(s"lost+found was inode ${e.ino}, not a directory: it was moved into a new lost+found, inode $lf")
+            Ok(lf)
+        Err(FsError.NotFound) ->
+            val lf = mkdir(fs, ROOT_INO, name, 0o700, root)?
+            out.note(s"lost+found was missing: it was made, inode $lf")
+            Ok(lf)
+        Err(e) -> Err(e)
+
+// `#<ino>`, or `#<ino>.<k>` for the first `k` from 1 that `dir` does not hold.
+private free_name[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, ino: u64) -> Result[string, FsError]
+    var k: u32 = 0
+    loop
+        val name = if k == 0 then s"#$ino" else s"#$ino.$k"
+        lookup_name(fs, dir, name.bytes) match
+            Ok(_) -> k += 1
+            Err(FsError.NotFound) -> return Ok(name)
+            Err(e) -> return Err(e)
+
+// Link inode `ino` (of type `t`) into lost+found `lf`; a directory's `parent` follows. False when there is
+// no room for the name.
+private link_lost[D: BlockDevice, P: Platform](fs: *Fs[D, P], lf: u64, ino: u64, t: u8, out: FsckReport) -> Result[bool, FsError]
+    val name = free_name(fs, lf, ino)?
+    add_name(fs, lf, name.bytes, ino, t, 0) match
+        Ok(_) -> ()
+        Err(FsError.NoSpace) ->
+            out.note(s"inode $ino could not be linked into lost+found: no room")
+            return Ok(false)
+        Err(e) -> return Err(e)
+    if t == DT_DIR
+        var h = fs.start("fsck: parent", C_INODE)
+        val r = change_inode(fs, &h, ino, (x) -> x.parent = lf)
+        fs.stop(&h)
+        r?
+    out.note(s"inode $ino was linked into lost+found as $name")
+    Ok(true)
+
+// -- 7. Link counts and orphans -----------------------------------------------------------------------
+
+private fix_links[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, rep: Report, out: FsckReport) -> Result[u32, FsError]
+    var n: u32 = 0
+    var orphans: Buf[u64] = buf()
+    var marked: Buf[u64] = buf()
+    for p in rep.problems.view()
+        p match
+            Problem.LinkCount(i, r, counted) ->
+                // One with links and no name waits for lost+found, which had no room for it.
+                if nameless(c, i, r, counted) then continue
+                var h = fs.start("fsck: links", C_INODE)
+                val res = change_inode(fs, &h, i, (x) -> x.links = u32(counted))
+                fs.stop(&h)
+                res?
+                out.note(s"inode $i's link count was set to $counted")
+                n += 1
+            Problem.Unlinked(i) ->
+                // A directory with no links and no name is unreachable: lost+found's, not the list's.
+                if c.complete && c.names[usize(i)] == 0 && c.types[usize(i)] != DT_DIR && c.types[usize(i)] != 0 then orphans.push(i)
+            Problem.OrphanFlag(i) -> marked.push(i)
+            _ -> ()
+    if orphans.len() + marked.len() == 0 then return Ok(n)
+    load_orphans(fs)?
+    for i in marked.view()
+        var h = fs.start("fsck: orphan", C_INODE + C_SB + C_INODE)
+        var r = edit_raw(fs, &h, i, (x) ->
+            x.flags = x.flags & ~INODE_ORPHAN
+            x.orphan_next = 0)
+        if r.is_ok() then r = orphan_add(fs, &h, i)
+        fs.stop(&h)
+        r?
+        out.note(s"inode $i, marked an orphan, was put back on the orphan list")
+        n += 1
+    for i in orphans.view()
+        var h = fs.start("fsck: orphan", C_INODE + C_SB)
+        val r = orphan_add(fs, &h, i)
+        fs.stop(&h)
+        r?
+        out.note(s"inode $i, with no links and no name, was put on the orphan list")
+        n += 1
+    process_orphans(fs)?
+    out.note("the orphan list was processed")
+    Ok(n)
+
+// -- A device that keeps its writes ----------------------------------------------------------------------
+
+// `Check` mode's device: reads see what was written, and nothing written reaches `inner`.
+private[kfs] struct Overlay[D: BlockDevice]
+    inner: *D
+    kept: Buf[u64]
+    data: Buf[u8]
+
+private[kfs] overlay[D: BlockDevice](inner: *D) -> Overlay[D] = Overlay(inner, buf(), buf())
+
+private find_kept(kept: Buf[u64], b: u64) -> Option[usize]
+    for i in 0..<kept.len()
+        if kept[i] == b then return Some(i)
+    None
+
+impl[D: BlockDevice] BlockDevice for Overlay[D]
+    blocks(self) -> u64 = self.inner.blocks()
+
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
+        find_kept(self.kept, b) match
+            Some(i) ->
+                for k in 0..<BLOCK_SIZE
+                    out[k] = self.data[i * BLOCK_SIZE + k]
+                Ok(())
+            None -> self.inner.read(b, out)
+
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+        if data.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        find_kept(self.kept, b) match
+            Some(i) ->
+                for k in 0..<BLOCK_SIZE
+                    self.data[i * BLOCK_SIZE + k] = data[k]
+            None ->
+                self.kept.push(b)
+                self.data.extend(data)
+        Ok(())
+
+    flush(*self) -> Result[unit, DeviceError] = Ok(())

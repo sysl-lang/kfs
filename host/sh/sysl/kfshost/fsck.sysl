@@ -1,0 +1,54 @@
+module keel.kfshost
+@requires(os)
+
+import kfs.keel.kfs.{FSCK_CLEAN, FSCK_FAILED, FSCK_FIXED, FSCK_LEFT, FSCK_USAGE, FsckMode, describe, fsck, host_platform}
+
+// The program `fsck.kfs` as a function of its arguments (kfs/SPEC.md section 23), so the tests run exactly
+// what the command line runs: the text to print and the exit code, e2fsck's.
+
+const FSCK_USAGE_TEXT: string = "usage: fsck.kfs [-n | -y [--rebuild-corrupt]] <image>"
+
+struct FsckOutcome
+    text: string
+    code: u32
+
+private usage(why: string) -> FsckOutcome = FsckOutcome(s"fsck.kfs: ${why}\n${FSCK_USAGE_TEXT}", FSCK_USAGE)
+
+// `fsck.kfs [-n | -y [--rebuild-corrupt]] <image>`: with neither flag, or `-n`, check and write nothing;
+// `-y` repair what is safe; `--rebuild-corrupt` (which implies `-y`) also clear what fails its checksum.
+run_fsck(args: []string) -> FsckOutcome
+    var no = false
+    var yes = false
+    var rebuild = false
+    var path = ""
+    for a in args
+        if a == "-n" then no = true
+        elif a == "-y" then yes = true
+        elif a == "--rebuild-corrupt" then rebuild = true
+        elif a.bytes.len > 0 && a.bytes[0] == u8('-') then return usage(s"unknown option '${a}'")
+        elif path != "" then return usage("one image at a time")
+        else path = a
+    if path == "" then return usage("no image named")
+    if no && (yes || rebuild) then return usage("-n never writes, so it cannot go with -y or --rebuild-corrupt")
+    val mode = if rebuild then FsckMode.Rebuild elif yes then FsckMode.Repair else FsckMode.Check
+    var dev = open_image(path) match
+        Ok(d) -> d
+        Err(_) -> return FsckOutcome(s"fsck.kfs: cannot open ${path}", FSCK_FAILED)
+    var plat = host_platform()
+    plat.clock = host_now()
+    val r = fsck(&dev, plat, mode)
+    dev.close()
+    var text = ""
+    for p in r.found.view()
+        text = text + s"problem: ${describe(p)}\n"
+    for w in r.warnings.view()
+        text = text + s"warning: ${describe(w)}\n"
+    for d in r.done.view()
+        text = text + s"done: ${d}\n"
+    for p in r.left.view()
+        text = text + s"left: ${describe(p)}\n"
+    var verdict = "fsck could not finish"
+    if r.code == FSCK_CLEAN then verdict = "clean"
+    elif r.code == FSCK_FIXED then verdict = "errors corrected, clean now"
+    elif r.code == FSCK_LEFT then verdict = s"${r.left.len()} problems left uncorrected"
+    FsckOutcome(text + s"fsck.kfs: ${path}: ${verdict}", r.code)
