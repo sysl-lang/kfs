@@ -60,6 +60,8 @@ enum Corruption
     OrphanList(ino: u64)
     // Directory `ino`'s block at logical `block` breaks a rule of section 10.
     Directory(ino: u64, block: u64, fault: DirFault)
+    // Inode `ino`'s xattr block `block` fails its checksum or its tail, or breaks a rule of section 13.
+    Xattr(ino: u64, block: u64)
 
 // What is wrong with an extent-tree node (section 9).
 enum NodeFault
@@ -109,6 +111,21 @@ enum FsError
     NameTooLong
     // ENOTDIR: a directory operation on an inode that is not a directory.
     NotDirectory
+    // EISDIR: an operation on a non-directory given a directory.
+    IsDirectory
+    // ENOTEMPTY: removing or replacing a directory that holds names.
+    NotEmpty
+    // EMLINK: an inode already at LINK_MAX links.
+    TooManyLinks
+    // EPERM: linking a directory; a device node made by anyone but uid 0; mknod of a directory.
+    NotPermitted
+    // EBUSY: removing the root; renaming `.` or `..`.
+    Busy
+    // ENODATA: no such extended attribute.
+    NoData
+    // ERANGE: an extended attribute's name of 0 or more than 255 bytes, or a buffer too small for an
+    // attribute's value or the list of names.
+    Range
 
 impl From[DeviceError] for FsError
     from(e: DeviceError) -> FsError = FsError.Device(e)
@@ -504,7 +521,7 @@ mount[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D, P], FsError
         write_journal_super(dev, m.sb, st)?
         dev.flush()?
         m = open(dev)?
-    val read_only = rec.corrupt || m.sb.state & STATE_ERROR != 0 || m.sb.feature_ro_compat != 0 || !dev.has_flush()
+    val read_only = rec.corrupt || m.sb.state & STATE_ERROR != 0 || m.sb.feature_ro_compat & ~RO_COMPAT_XATTR != 0 || !dev.has_flush()
 
     var blocks: u64 = 0
     var inodes: u64 = 0

@@ -457,7 +457,8 @@ time before 1970 is a negative `_sec` with a non-negative `_nsec`.
 - **The tail of the last block is zero**: bytes from `size` to the end of the block holding byte
   `size − 1` read as zero on the disk. Truncation zeroes them (section 18); writes never put bytes
   there.
-- A device, FIFO or socket has `size` 0 and `blocks` 0.
+- A device, FIFO or socket has `size` 0 and no block but its xattr block (section 13): `blocks` is 0,
+  or 1 with an xattr block.
 
 An inode on the orphan list is exempt from the second: blocks past its end are what the list is
 freeing (section 16). The tail is checked only in a written block; one under an unwritten extent, or a
@@ -858,6 +859,16 @@ and returned but not enforced.
 Xattrs are the ro_compat feature `XATTR` (section 21): set by the first `setxattr`, so a driver that
 does not know them can read the filesystem but must not write it (it would leak xattr blocks when
 freeing inodes).
+
+(Stage 8.) The calls take the namespace apart from the name, as the kernel splits `user.foo`: a
+namespace outside 1-4 is `EINVAL`; a name of 0 or more than 255 bytes `ERANGE` (Linux's answer). A
+change rewrites the block whole, in one transaction with the inode (`C_XATTR`); the feature bit is set in
+the transaction that allocates the filesystem's first xattr block, and stays. `XATTR_CREATE` on an
+existing attribute is `EEXIST`, `XATTR_REPLACE` on a missing one `ENODATA`, both together `EINVAL`.
+`getxattr` and `listxattr` with an empty buffer answer the length, with a short one `ERANGE`; the list
+is each `prefix.name` and a NUL, in the block's order. A block failing its checksum, its tail or a rule
+above (records tiling `used` exactly, `count` of them and at least one, names 1-255 bytes, sorted with
+none twice) is corruption.
 
 ---
 
@@ -1309,7 +1320,9 @@ symlink never points at an unwritten block.
 ### `linkat`
 
 One transaction: the target's `links` + 1 and `ctime`; dir add in the new parent. Directories cannot
-be linked (`EPERM`). **Crash**: links and names always agree.
+be linked (`EPERM`). **Crash**: links and names always agree. (Stage 8: an inode whose last name has
+gone — open, on the orphan list — cannot be linked again, `ENOENT`, as Linux; one at `LINK_MAX` is
+`EMLINK`.)
 
 ### `unlinkat` (a non-directory)
 
@@ -1327,6 +1340,12 @@ last component is `EINVAL`. One transaction: dir remove in the parent; parent `l
 the victim's `links` = 0 and `ctime`; the group's `directories` − 1; orphan add. Then delete as for
 unlink. An empty directory owns no blocks, so its delete is one step. A process whose cwd it was keeps
 a reference; lookups in it answer `ENOENT`.
+(Stage 8: a descriptor's `directories` counts the directory inodes allocated in its group — what fsck
+can count — so it drops when the inode is freed, in the delete's last transaction, not at the rmdir;
+a removed directory still held open is still counted. `..` as the last component is `ENOTEMPTY`, as
+Linux. The root has no name to remove: rmdir of `/` is the path layer's `EBUSY`, and a name that reaches
+the root, which only a broken directory holds, is refused `EBUSY` too. Nothing new is made in a
+removed directory: `ENOENT`.)
 
 ### Delete (free a zero-link inode)
 
@@ -1360,6 +1379,15 @@ destination name referring to the source, the victim's count down and the victim
 if it reached 0). The destination name is never missing and the source is never reachable by both
 names, because every one of those changes is in the same transaction. Delete of the victim follows as
 for unlink.
+
+(Stage 8, the checks as Linux makes them.) `.` or `..` as either last component is `EBUSY`; flags other
+than the three forms, or NOREPLACE with EXCHANGE, `EINVAL`. NOREPLACE with **any** existing destination
+is `EEXIST`, a hard link of the source included — the no-op is for flags 0 (and EXCHANGE, where both
+names already name the one inode). A destination directory that is an ancestor of the source holds it,
+so it is `ENOTEMPTY`, found before its lock is taken; for EXCHANGE, a destination directory above the
+source's parent is a move into its own subtree, `EINVAL`. A new name may not go into a removed
+directory (`ENOENT`). `EMLINK` is checked only where a parent's count grows: a directory replacing a
+directory adds one `..` to the new parent and takes one away.
 
 ### `read`
 
@@ -1578,6 +1606,14 @@ the fields it means to. So nothing writes back a stale copy, and `orphan_next`, 
 operations take `inode.lock` themselves (`LockId.Inode`, rank 3) and hold it across every handle of a
 split operation; `icache.lock` (a leaf) guards the in-memory inode table.
 
+(Stage 8.) The namespace operations name rules 1 and 2 too: `LockId.Rename` and `LockId.Dir(ino)`, the
+latter the same `inode.lock` as `LockId.Inode(ino)`, named for the rule it is taken under. A rename takes
+`rename_lock` whenever the parents differ; one inside a single directory changes no ancestry, so its
+parent's lock is enough even when a directory moves (Linux's choice too). Every check that reads the
+tree's shape — the subtree walk, which of two parents is the other's ancestor — runs under it, before
+any child's lock is taken. The host platform checks the order: rank 2 locks may be held together,
+rank 3 ones in increasing number, and an inode's lock taken again under either name is a deadlock.
+
 ---
 
 ## 20. statfs
@@ -1701,6 +1737,16 @@ directory reached by no name is linked into `/lost+found` as `#<ino>` and its `p
 **Pass 4 — link counts.** Count every name of every inode (for a directory, 2 + subdirectories, the
 root's own name counting as the first). With `-y`: correct `links`; an inode with `links > 0` and no
 name goes to `/lost+found`; one with `links = 0` not on the orphan list is put on it and processed.
+
+(Stage 8: passes 3 and 4 work from a census pass 2 takes as it reads every directory — the names naming
+each inode, each directory's names of directories, the first directory found naming each directory —
+and run only when it is complete: every directory sound in pass 1 and read by pass 2 without a problem,
+since a name hidden in a broken block would make every count after it wrong. A cycle — names upward from
+a directory that come back to it without reaching the root — is reported once, at its lowest-numbered
+member. A directory rmdir removed while held open (links 0, on the orphan list) is named by nothing and
+counts only its names and subdirectories, which must come to its 0. Pass 1 also checks a symlink in a
+block for a size of 129 to 4095 bytes, and every xattr block: inside a group's data area, its checksum
+and tail, section 13's record rules, and the `XATTR` feature set.)
 
 **Pass 5 — bitmaps, counts, orphans.** Rebuild both bitmaps from pass 1 (metadata, journal, claimed
 blocks, allocated inodes) and compare: report every leaked block and every claimed-but-free block, every
@@ -1994,6 +2040,16 @@ rmdir and rename between parents; rename onto a hard link of itself is a no-op; 
 file keeps it readable through its descriptor and frees it at close; the every-write crash loop over
 **each** operation, the visible state being exactly before or after; statfs counts move by the right
 amounts after commit.
+(Stage 8: the package's calls name an object as a directory and one name in it — the last component
+path resolution leaves; the walk, following symlinks, is the kernel's (stage 12). Every refusal is found
+before the handle opens, so it changes nothing; a failure inside the handle — no room for a directory
+split — gives back the inode and a symlink's block in the same handle. `mknod` of `S_IFDIR` is `EPERM`
+and of `S_IFLNK` or no type `EINVAL`, as Linux; a FIFO or socket stores no device numbers. `setattr`
+takes the fields present — permission bits (the type stays), owner, `atime`/`mtime` as `UTIME_NOW`,
+`UTIME_OMIT` or a time — and a size, which grows in the same transaction and shrinks through truncate,
+the other fields riding in its first transaction. `errno` maps every error to Linux's number. With the
+checker's passes 3 and 4 in place, every test image is a consistent namespace: the earlier stages'
+inodes are made by create and named in the root, and their extra names are links.)
 
 ### Stage 9 — fsck
 

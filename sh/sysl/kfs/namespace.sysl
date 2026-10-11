@@ -1,0 +1,636 @@
+module keel.kfs
+
+// The namespace operations of kfs/SPEC.md section 18 — create, mknod, mkdir, symlink, readlink, link,
+// unlink, rmdir and rename — over the directory code (dir.sysl), the inode layer (inode.sysl), the
+// allocator and the orphan list; and statfs (section 20).
+//
+// **A name is a parent and a component.** Every call names its object as a directory and one name in
+// it, as `openat`/`mkdirat`/`renameat2` do once path resolution has found the last component; the path
+// walk itself, symlinks followed and all, is the kernel's.
+//
+// **One transaction each.** Every operation here is one handle: whatever it changes — the new inode, the
+// names, the link counts, the parents' times, the orphan list — commits together or not at all. What
+// follows an unlink, an rmdir or a rename-over of an inode that lost its last link and that nothing
+// holds open is its delete (file.sysl), in steps of its own, under the inode's lock: a crash before the
+// delete finishes leaves the inode on the orphan list for the next mount.
+//
+// **Checks before the handle.** Every refusal — a name already there, a non-empty directory, a move into
+// its own subtree, a link count at LINK_MAX — is found before the handle is opened, so a refused call
+// changes nothing. A failure inside the handle (out of space while a directory splits) gives back what it
+// allocated in the same handle.
+//
+// **Locks** (section 19): the rename lock when a rename crosses directories; the directories' locks
+// (`LockId.Dir`), an ancestor before its descendant, else in increasing number; then the non-directories'
+// (`LockId.Inode`) in increasing number; then the handle. A rename inside one directory changes no
+// ancestry, so the parent's lock is enough there even when a directory moves.
+
+// Who is calling: the owner a new inode gets, and whose reserve its blocks may come from.
+struct Caller
+    uid: u32
+    gid: u32
+
+// A device's numbers (section 12).
+struct DeviceNumbers
+    major: u32
+    minor: u32
+
+// The Linux errno a system call answers for `e` (as a positive number). A device error, corruption and
+// a bug in KFS are all `EIO`: the journal has aborted, and the error the next mount finds is that.
+errno(e: FsError) -> u32
+    e match
+        FsError.NoSpace -> 28
+        FsError.TooBig -> 27
+        FsError.Device(_) -> 5
+        FsError.Open(_) -> 5
+        FsError.Corrupt(_) -> 5
+        FsError.Bug -> 5
+        FsError.Invalid -> 22
+        FsError.ReadOnly -> 30
+        FsError.Exists -> 17
+        FsError.NotFound -> 2
+        FsError.NameTooLong -> 36
+        FsError.NotDirectory -> 20
+        FsError.IsDirectory -> 21
+        FsError.NotEmpty -> 39
+        FsError.TooManyLinks -> 31
+        FsError.NotPermitted -> 1
+        FsError.Busy -> 16
+        FsError.NoData -> 61
+        FsError.Range -> 34
+
+// The `DT_*` type a name records for an inode of mode `mode`.
+dt_of_mode(mode: u16) -> u8
+    val t = mode & S_IFMT
+    if t == S_IFREG then return DT_REG
+    if t == S_IFDIR then return DT_DIR
+    if t == S_IFLNK then return DT_LNK
+    if t == S_IFCHR then return DT_CHR
+    if t == S_IFBLK then return DT_BLK
+    if t == S_IFIFO then return DT_FIFO
+    if t == S_IFSOCK then return DT_SOCK
+    DT_UNKNOWN
+
+// A device node's numbers, from its `data` (section 8).
+device_numbers(n: Inode) -> DeviceNumbers
+    var major: u32 = 0
+    var minor: u32 = 0
+    for k in 0..<4
+        major = major | (u32(n.data[k]) << (8 * k))
+        minor = minor | (u32(n.data[4 + k]) << (8 * k))
+    DeviceNumbers(major, minor)
+
+// `st_rdev` in Linux's encoding (section 12); 0 for anything but a device.
+rdev(n: Inode) -> u64
+    val t = n.mode & S_IFMT
+    if t != S_IFCHR && t != S_IFBLK then return 0
+    val d = device_numbers(n)
+    val major = u64(d.major)
+    val minor = u64(d.minor)
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & ~u64(0xff)) << 12) | ((major & ~u64(0xfff)) << 32)
+
+private is_dot_name(name: []const u8) -> bool = name.len == 1 && name[0] == u8('.')
+private is_dotdot_name(name: []const u8) -> bool = name.len == 2 && name[0] == u8('.') && name[1] == u8('.')
+
+// A name a new entry may take: `.` and `..` exist already (`Exists`); past NAME_MAX bytes is
+// `NameTooLong`; empty, or holding `/` or NUL, `Invalid`.
+private new_name(name: []const u8) -> Result[unit, FsError]
+    if is_dot_name(name) || is_dotdot_name(name) then return Err(FsError.Exists)
+    if name.len > NAME_MAX then return Err(FsError.NameTooLong)
+    if name.len == 0 then return Err(FsError.Invalid)
+    for b in name
+        if b == u8('/') || b == 0 then return Err(FsError.Invalid)
+    Ok(())
+
+// Directory `dir` as a parent for a new name: a directory (`NotDirectory`) that has not been removed
+// (`NotFound`: a removed directory takes no new names, section 18, `rmdir`).
+private live_parent[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64) -> Result[Inode, FsError]
+    val p = read_inode(fs, dir)?
+    if p.mode & S_IFMT != S_IFDIR then return Err(FsError.NotDirectory)
+    if p.links == 0 then return Err(FsError.NotFound)
+    Ok(p)
+
+// `NotFound` as the answer that the name is free, anything else passed on.
+private absent[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[unit, FsError]
+    lookup_held(fs, dir, name) match
+        Ok(_) -> Err(FsError.Exists)
+        Err(FsError.NotFound) -> Ok(())
+        Err(e) -> Err(e)
+
+// Whether directory `dir` is `anc` or lies below it: `parent` walked from `dir` up to the root (section
+// 18, `renameat2`). A walk longer than the inode count, or a `parent` of 0, is corruption.
+private inside[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, anc: u64) -> Result[bool, FsError]
+    var p = dir
+    var steps: u64 = 0
+    loop
+        if p == anc then return Ok(true)
+        if p == fs.sb.root_ino then return Ok(false)
+        val up = read_inode(fs, p)?.parent
+        steps += 1
+        if up == 0 || steps > fs.sb.inode_count then return Err(fs.corrupt(Corruption.Inode(p)))
+        p = up
+
+// -- Making an inode with a name ----------------------------------------------------------------------
+
+// Create a regular file `name` in directory `dir`, of permission bits `perm` (section 18, "Create").
+create[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8, perm: u16, who: Caller) -> Result[u64, FsError]
+    if perm & ~u16(0o7777) != 0 then return Err(FsError.Invalid)
+    make(fs, "create", dir, name, S_IFREG | perm, DeviceNumbers(0, 0), "".bytes, who)
+
+// `mknodat`: a regular file, a character or block device of numbers `dev`, a FIFO or a socket (section
+// 12). Only uid 0 makes a device (`NotPermitted`); a directory is mkdir's (`NotPermitted`, as Linux), a
+// symlink symlink's (`Invalid`).
+mknod[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8, mode: u16, dev: DeviceNumbers, who: Caller) -> Result[u64, FsError]
+    val t = mode & S_IFMT
+    if t == S_IFDIR then return Err(FsError.NotPermitted)
+    if t != S_IFREG && t != S_IFCHR && t != S_IFBLK && t != S_IFIFO && t != S_IFSOCK then return Err(FsError.Invalid)
+    if (t == S_IFCHR || t == S_IFBLK) && who.uid != 0 then return Err(FsError.NotPermitted)
+    make(fs, "mknod", dir, name, mode, dev, "".bytes, who)
+
+// `mkdirat` (section 18): a new directory, `links` 2, `parent` set, no blocks; the parent gains a link
+// (`TooManyLinks` at LINK_MAX).
+mkdir[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8, perm: u16, who: Caller) -> Result[u64, FsError]
+    if perm & ~u16(0o7777) != 0 then return Err(FsError.Invalid)
+    make(fs, "mkdir", dir, name, S_IFDIR | perm, DeviceNumbers(0, 0), "".bytes, who)
+
+// `symlinkat` (section 11): a target of 1 to SYMLINK_MAX bytes (`Invalid` when empty, `NameTooLong`
+// past it), in the inode up to SYMLINK_INLINE_MAX bytes, else in one block written as ordered data.
+symlink[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8, target: []const u8, who: Caller) -> Result[u64, FsError]
+    if target.len == 0 then return Err(FsError.Invalid)
+    if target.len > SYMLINK_MAX then return Err(FsError.NameTooLong)
+    make(fs, "symlink", dir, name, S_IFLNK | 0o777, DeviceNumbers(0, 0), target, who)
+
+private make[D: BlockDevice, P: Platform](fs: *Fs[D, P], op: string, dir: u64, name: []const u8, mode: u16, dev: DeviceNumbers, target: []const u8, who: Caller) -> Result[u64, FsError]
+    new_name(name)?
+    fs.plat.lock(LockId.Dir(dir))
+    val r = make_held(fs, op, dir, name, mode, dev, target, who)
+    fs.plat.unlock(LockId.Dir(dir))
+    r
+
+private make_held[D: BlockDevice, P: Platform](fs: *Fs[D, P], op: string, dir: u64, name: []const u8, mode: u16, dev: DeviceNumbers, target: []const u8, who: Caller) -> Result[u64, FsError]
+    val parent = live_parent(fs, dir)?
+    absent(fs, dir, name)?
+    val is_dir = mode & S_IFMT == S_IFDIR
+    if is_dir && parent.links >= LINK_MAX then return Err(FsError.TooManyLinks)
+    val block = mode & S_IFMT == S_IFLNK && target.len > SYMLINK_INLINE_MAX
+    var h = fs.start(op, if block then C_SYMLINK_BLOCK else C_CREATE)
+    val r = make_in(fs, &h, dir, name, mode, dev, target, who)
+    fs.stop(&h)
+    r
+
+// The transaction: allocate and fill the inode, add the name, and for a directory the parent's link.
+// A name that cannot be added (no room for a split) gives the inode, and a symlink's block, back.
+private make_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, dir: u64, name: []const u8, mode: u16, dev: DeviceNumbers, target: []const u8, who: Caller) -> Result[u64, FsError]
+    val t = mode & S_IFMT
+    val is_dir = t == S_IFDIR
+    val ino = alloc_inode(fs, h, NewInode(mode, who.uid, who.gid, if is_dir then 2 else 1, dir))?
+    var block = false
+    if t == S_IFCHR || t == S_IFBLK
+        change_inode(fs, h, ino, (n) ->
+            for k in 0..<4
+                n.data[k] = u8((dev.major >> (8 * k)) & 0xFF)
+                n.data[4 + k] = u8((dev.minor >> (8 * k)) & 0xFF))?
+    else if t == S_IFLNK && target.len <= SYMLINK_INLINE_MAX
+        change_inode(fs, h, ino, (n) ->
+            for k in 0..<SYMLINK_INLINE_MAX
+                n.data[k] = if k < target.len then target[k] else 0
+            n.flags = n.flags | INODE_INLINE
+            n.size = u64(target.len))?
+    else if t == S_IFLNK
+        symlink_block(fs, h, ino, target, who.uid) match
+            Ok(_) -> block = true
+            Err(e) ->
+                give_back(fs, h, ino, false)?
+                return Err(e)
+    dir_add(fs, h, dir, name, ino, dt_of_mode(mode), who.uid) match
+        Ok(_) -> ()
+        Err(e) ->
+            give_back(fs, h, ino, block)?
+            return Err(e)
+    if is_dir then change_inode(fs, h, dir, (n) -> n.links += 1)?
+    Ok(ino)
+
+// A symlink's target in a block of its own: allocated, mapped at logical block 0, written as ordered
+// data (the bytes past the target zero), and the size set.
+private symlink_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, target: []const u8, uid: u32) -> Result[unit, FsError]
+    val run = alloc_blocks(fs, h, goal_for(fs, ino, 0), 1, uid)?
+    insert(fs, h, ExtentTree(ino, uid, fs.node_max), Extent(0, 1, run.first, false)) match
+        Ok(_) -> ()
+        Err(e) ->
+            free_blocks(fs, h, run.first, 1)?
+            return Err(e)
+    var blk = block_buf()
+    for k in 0..<target.len
+        blk[k] = target[k]
+    fs.write_new_data(h, run.first, blk.view())?
+    note_dirty(fs, ino, run.first)
+    change_inode(fs, h, ino, (n) -> n.size = u64(target.len))?
+    note_change(fs, ino, h.seq, true)
+    Ok(())
+
+// Undo an allocation inside its own handle: the symlink's block, then the inode.
+private give_back[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, block: bool) -> Result[unit, FsError]
+    if block then remove(fs, h, ExtentTree(ino, 0, fs.node_max), 0, 1, 1)?
+    free_inode(fs, h, ino)?
+    forget_core(fs, ino)
+    Ok(())
+
+// -- readlink -----------------------------------------------------------------------------------------
+
+// `readlinkat` (section 11): the target's first `out.len` bytes, no terminator; answers how many. Not a
+// symlink, or an empty buffer, is `Invalid`.
+readlink[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, out: []u8) -> Result[usize, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = readlink_locked(fs, ino, out)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private readlink_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, out: []u8) -> Result[usize, FsError]
+    val node = read_inode(fs, ino)?
+    if node.mode & S_IFMT != S_IFLNK || out.len == 0 then return Err(FsError.Invalid)
+    val n = if node.size < u64(out.len) then usize(node.size) else out.len
+    if node.flags & INODE_INLINE != 0
+        for k in 0..<n
+            out[k] = node.data[k]
+        return Ok(n)
+    val b = lookup(fs, ino, 0)? match
+        Mapping.Mapped(b, _, false) -> b
+        _ -> return Err(fs.corrupt(Corruption.Inode(ino)))
+    var blk = block_buf()
+    fs.read_data(b, blk.view())?
+    for k in 0..<n
+        out[k] = blk[k]
+    Ok(n)
+
+// -- link ---------------------------------------------------------------------------------------------
+
+// `linkat` (section 18): a new name `name` in `dir` for inode `ino`, its `links` + 1 and `ctime`. A
+// directory is `NotPermitted`; an inode with no links left (unlinked, still open) `NotFound`; one at
+// LINK_MAX `TooManyLinks`.
+link[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, dir: u64, name: []const u8, who: Caller) -> Result[unit, FsError]
+    new_name(name)?
+    // An inode's type never changes, so both are read before the locks: the parent's lock is taken as a
+    // directory's, and the target's as a non-directory's.
+    if read_inode(fs, ino)?.mode & S_IFMT == S_IFDIR then return Err(FsError.NotPermitted)
+    if read_inode(fs, dir)?.mode & S_IFMT != S_IFDIR then return Err(FsError.NotDirectory)
+    fs.plat.lock(LockId.Dir(dir))
+    fs.plat.lock(LockId.Inode(ino))
+    val r = link_held(fs, ino, dir, name, who)
+    fs.plat.unlock(LockId.Inode(ino))
+    fs.plat.unlock(LockId.Dir(dir))
+    r
+
+private link_held[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, dir: u64, name: []const u8, who: Caller) -> Result[unit, FsError]
+    live_parent(fs, dir)?
+    val node = read_inode(fs, ino)?
+    if node.links == 0 then return Err(FsError.NotFound)
+    if node.links >= LINK_MAX then return Err(FsError.TooManyLinks)
+    absent(fs, dir, name)?
+    val now = fs.plat.now()
+    var h = fs.start("link", C_LINK)
+    var r = dir_add(fs, &h, dir, name, ino, dt_of_mode(node.mode), who.uid)
+    if r.is_ok()
+        r = change_inode(fs, &h, ino, (n) ->
+            n.links += 1
+            set_ctime(n, now))
+    fs.stop(&h)
+    r
+
+// -- unlink and rmdir ---------------------------------------------------------------------------------
+
+// `unlinkat` of a non-directory (section 18): the name goes, the inode loses a link and, at its last,
+// joins the orphan list in the same transaction; then, with nothing holding it open, it is deleted. A
+// directory (`.` and `..` included) is `IsDirectory`.
+unlink[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[unit, FsError]
+    if is_dot_name(name) || is_dotdot_name(name) then return Err(FsError.IsDirectory)
+    fs.plat.lock(LockId.Dir(dir))
+    val r = unlink_held(fs, dir, name)
+    fs.plat.unlock(LockId.Dir(dir))
+    finish_victim(fs, r?)
+
+// What an unlink, rmdir or rename leaves to do once its transaction is done: an inode that has lost its
+// last link and is still locked, to delete unless something holds it open.
+private struct Victim
+    ino: u64
+    dir: bool
+    gone: bool
+
+private no_victim() -> Victim = Victim(0, false, false)
+
+private unlink_held[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[Victim, FsError]
+    val e = lookup_held(fs, dir, name)?
+    if e.file_type == DT_DIR then return Err(FsError.IsDirectory)
+    fs.plat.lock(LockId.Inode(e.ino))
+    val r = drop_name(fs, dir, name, e.ino)
+    if r.is_err() || !r.unwrap().gone then fs.plat.unlock(LockId.Inode(e.ino))
+    r
+
+// The transaction of an unlink: the name, the link, and the orphan list at the last. The victim's lock
+// is held; when it has no links left it stays held for `finish_victim`.
+private drop_name[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8, ino: u64) -> Result[Victim, FsError]
+    val node = read_inode(fs, ino)?
+    if node.mode & S_IFMT == S_IFDIR then return Err(FsError.IsDirectory)
+    if node.links == 0 then return Err(fs.corrupt(Corruption.Inode(ino)))
+    val last = node.links == 1
+    val now = fs.plat.now()
+    var h = fs.start("unlink", C_UNLINK)
+    val r = drop_name_in(fs, &h, dir, name, ino, last, now)
+    fs.stop(&h)
+    r?
+    Ok(Victim(ino, false, last))
+
+private drop_name_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, dir: u64, name: []const u8, ino: u64, last: bool, now: Time) -> Result[unit, FsError]
+    dir_remove(fs, h, dir, name)?
+    change_inode(fs, h, ino, (n) ->
+        n.links -= 1
+        set_ctime(n, now))?
+    if last then orphan_add(fs, h, ino)?
+    Ok(())
+
+// After the transaction: delete a victim with no links that nothing holds open, then let its lock go.
+private finish_victim[D: BlockDevice, P: Platform](fs: *Fs[D, P], v: Victim) -> Result[unit, FsError]
+    if !v.gone then return Ok(())
+    val r = if held_open(fs, v.ino) then Ok(()) else delete_locked(fs, v.ino)
+    if v.dir then fs.plat.unlock(LockId.Dir(v.ino)) else fs.plat.unlock(LockId.Inode(v.ino))
+    r
+
+// `unlinkat AT_REMOVEDIR` (section 18): an empty directory's name goes, the parent loses the link its
+// `..` gave, the victim's `links` becomes 0 and it joins the orphan list; then the delete. `.` is
+// `Invalid`, `..` `NotEmpty` (as Linux); a non-directory `NotDirectory`; one with names `NotEmpty`; the
+// root `Busy`.
+rmdir[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[unit, FsError]
+    if is_dot_name(name) then return Err(FsError.Invalid)
+    if is_dotdot_name(name) then return Err(FsError.NotEmpty)
+    fs.plat.lock(LockId.Dir(dir))
+    val r = rmdir_held(fs, dir, name)
+    fs.plat.unlock(LockId.Dir(dir))
+    finish_victim(fs, r?)
+
+private rmdir_held[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[Victim, FsError]
+    val e = lookup_held(fs, dir, name)?
+    if e.file_type != DT_DIR then return Err(FsError.NotDirectory)
+    if e.ino == fs.sb.root_ino || e.ino == dir then return Err(FsError.Busy)
+    fs.plat.lock(LockId.Dir(e.ino))
+    val r = drop_dir(fs, dir, name, e.ino)
+    if r.is_err() then fs.plat.unlock(LockId.Dir(e.ino))
+    r
+
+private drop_dir[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8, ino: u64) -> Result[Victim, FsError]
+    val node = read_inode(fs, ino)?
+    if node.mode & S_IFMT != S_IFDIR then return Err(FsError.NotDirectory)
+    if !dir_empty(fs, ino)? then return Err(FsError.NotEmpty)
+    val now = fs.plat.now()
+    var h = fs.start("rmdir", C_UNLINK)
+    val r = drop_dir_in(fs, &h, dir, name, ino, now)
+    fs.stop(&h)
+    r?
+    Ok(Victim(ino, true, true))
+
+private drop_dir_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, dir: u64, name: []const u8, ino: u64, now: Time) -> Result[unit, FsError]
+    dir_remove(fs, h, dir, name)?
+    change_inode(fs, h, dir, (n) -> n.links -= 1)?
+    change_inode(fs, h, ino, (n) ->
+        n.links = 0
+        set_ctime(n, now))?
+    orphan_add(fs, h, ino)
+
+// -- rename -------------------------------------------------------------------------------------------
+
+// `renameat2` (section 18) of `old_name` in `old_dir` to `new_name` in `new_dir`, with `flags` 0,
+// RENAME_NOREPLACE or RENAME_EXCHANGE. Checks first: the source exists (`NotFound`); `.` or `..` on
+// either side is `Busy`; a destination naming the source's own inode is a successful no-op (but
+// NOREPLACE answers `Exists` for any destination); a directory may not move into its own subtree
+// (`Invalid`); a directory replaces only an empty directory (`NotDirectory`, `NotEmpty`) and a
+// non-directory only a non-directory (`IsDirectory`); a parent gaining a link must be below LINK_MAX
+// (`TooManyLinks`). EXCHANGE needs both names (`NotFound`). Then one transaction holds all of it.
+rename[D: BlockDevice, P: Platform](fs: *Fs[D, P], old_dir: u64, old_name: []const u8, new_dir: u64, new_name: []const u8, flags: u32, who: Caller) -> Result[unit, FsError]
+    if flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 || flags == RENAME_NOREPLACE | RENAME_EXCHANGE then return Err(FsError.Invalid)
+    if is_dot_name(old_name) || is_dotdot_name(old_name) || is_dot_name(new_name) || is_dotdot_name(new_name) then return Err(FsError.Busy)
+    val crossing = old_dir != new_dir
+    if crossing then fs.plat.lock(LockId.Rename)
+    var r = lock_parents(fs, old_dir, new_dir)
+    var v = no_victim()
+    if r.is_ok()
+        val got = rename_held(fs, old_dir, old_name, new_dir, new_name, flags, who)
+        got match
+            Ok(x) -> v = x
+            Err(e) -> r = Err(e)
+        unlock_parents(fs, old_dir, new_dir)
+    if crossing then fs.plat.unlock(LockId.Rename)
+    r?
+    finish_victim(fs, v)
+
+// The two parents' locks in rule 2's order: an ancestor before its descendant, else the lower number
+// first (one lock when they are the same directory). The ancestry is read under the rename lock.
+private lock_parents[D: BlockDevice, P: Platform](fs: *Fs[D, P], a: u64, b: u64) -> Result[unit, FsError]
+    if a == b
+        fs.plat.lock(LockId.Dir(a))
+        return Ok(())
+    val a_first = if inside(fs, b, a)? then true else if inside(fs, a, b)? then false else a < b
+    if a_first
+        fs.plat.lock(LockId.Dir(a))
+        fs.plat.lock(LockId.Dir(b))
+    else
+        fs.plat.lock(LockId.Dir(b))
+        fs.plat.lock(LockId.Dir(a))
+    Ok(())
+
+private unlock_parents[D: BlockDevice, P: Platform](fs: *Fs[D, P], a: u64, b: u64)
+    fs.plat.unlock(LockId.Dir(a))
+    if a != b then fs.plat.unlock(LockId.Dir(b))
+
+// One side of a rename: its name's entry, and whether the inode is a directory.
+private struct Side
+    ino: u64
+    file_type: u8
+    dir: bool
+
+private side_of[D: BlockDevice, P: Platform](fs: *Fs[D, P], e: DirEntry) -> Result[Side, FsError]
+    val n = read_inode(fs, e.ino)?
+    Ok(Side(e.ino, e.file_type, n.mode & S_IFMT == S_IFDIR))
+
+private rename_held[D: BlockDevice, P: Platform](fs: *Fs[D, P], old_dir: u64, old_name: []const u8, new_dir: u64, new_name: []const u8, flags: u32, who: Caller) -> Result[Victim, FsError]
+    val src = side_of(fs, lookup_held(fs, old_dir, old_name)?)?
+    var dst: Option[Side] = None
+    lookup_held(fs, new_dir, new_name) match
+        Ok(e) -> dst = Some(side_of(fs, e)?)
+        Err(FsError.NotFound) -> ()
+        Err(e) -> return Err(e)
+    val exchange = flags == RENAME_EXCHANGE
+    if exchange && dst.is_none() then return Err(FsError.NotFound)
+    if dst.is_some() && flags == RENAME_NOREPLACE then return Err(FsError.Exists)
+    if dst.is_some() && dst.unwrap().ino == src.ino then return Ok(no_victim())
+    // Inside one directory nothing can move into itself, and neither side can be the other's ancestor.
+    val crossing = old_dir != new_dir
+    if crossing && src.dir && inside(fs, new_dir, src.ino)? then return Err(FsError.Invalid)
+    if exchange
+        val d = dst.unwrap()
+        if crossing && d.dir && inside(fs, old_dir, d.ino)? then return Err(FsError.Invalid)
+        return exchange_locked(fs, old_dir, old_name, src, new_dir, new_name, d)
+    dst match
+        Some(d) ->
+            if src.dir && !d.dir then return Err(FsError.NotDirectory)
+            if !src.dir && d.dir then return Err(FsError.IsDirectory)
+            // A destination that is an ancestor of the source holds it, and is found so before its lock
+            // would be taken out of order.
+            if crossing && d.dir && inside(fs, old_dir, d.ino)? then return Err(FsError.NotEmpty)
+        None -> ()
+    move_locked(fs, old_dir, old_name, src, new_dir, new_name, dst, who)
+
+// The moved inode's lock and the victim's, in rules 2 and 3's order: directories before non-directories,
+// and within each kind in increasing number.
+private lock_two[D: BlockDevice, P: Platform](fs: *Fs[D, P], a: Side, b: Side)
+    val a_first = if a.dir != b.dir then a.dir else a.ino < b.ino
+    if a_first
+        lock_side(fs, a)
+        lock_side(fs, b)
+    else
+        lock_side(fs, b)
+        lock_side(fs, a)
+
+private lock_side[D: BlockDevice, P: Platform](fs: *Fs[D, P], s: Side)
+    if s.dir then fs.plat.lock(LockId.Dir(s.ino)) else fs.plat.lock(LockId.Inode(s.ino))
+
+private unlock_side[D: BlockDevice, P: Platform](fs: *Fs[D, P], s: Side)
+    if s.dir then fs.plat.unlock(LockId.Dir(s.ino)) else fs.plat.unlock(LockId.Inode(s.ino))
+
+// How a parent's link count moves in a rename.
+private struct Deltas
+    old_dir: i32
+    new_dir: i32
+
+// A rename with flags 0 or NOREPLACE: the destination name added, or rewritten in place over the victim
+// (which loses its link — a directory all of them — and joins the orphan list at 0); the source name
+// removed; a directory moving between parents takes its `parent` and its `..` link with it.
+private move_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], old_dir: u64, old_name: []const u8, src: Side, new_dir: u64, new_name: []const u8, dst: Option[Side], who: Caller) -> Result[Victim, FsError]
+    dst match
+        Some(d) -> lock_two(fs, src, d)
+        None -> lock_side(fs, src)
+    val r = move_checked(fs, old_dir, old_name, src, new_dir, new_name, dst, who)
+    unlock_side(fs, src)
+    dst match
+        Some(d) -> if r.is_err() || !r.unwrap().gone then unlock_side(fs, d)
+        None -> ()
+    r
+
+private move_checked[D: BlockDevice, P: Platform](fs: *Fs[D, P], old_dir: u64, old_name: []const u8, src: Side, new_dir: u64, new_name: []const u8, dst: Option[Side], who: Caller) -> Result[Victim, FsError]
+    var victim = no_victim()
+    var d = Deltas(0, 0)
+    if src.dir && old_dir != new_dir
+        d.old_dir -= 1
+        d.new_dir += 1
+    dst match
+        Some(v) ->
+            if v.dir && !dir_empty(fs, v.ino)? then return Err(FsError.NotEmpty)
+            if v.dir then d.new_dir -= 1
+            victim = Victim(v.ino, v.dir, v.dir || read_inode(fs, v.ino)?.links == 1)
+        // A new name may not go into a removed directory.
+        None -> live_parent(fs, new_dir)?
+    if d.new_dir > 0 && read_inode(fs, new_dir)?.links >= LINK_MAX then return Err(FsError.TooManyLinks)
+    val now = fs.plat.now()
+    var h = fs.start("rename", C_RENAME)
+    val r = move_in(fs, &h, old_dir, old_name, src, new_dir, new_name, dst, victim, d, now, who)
+    fs.stop(&h)
+    r?
+    Ok(victim)
+
+private move_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, old_dir: u64, old_name: []const u8, src: Side, new_dir: u64, new_name: []const u8, dst: Option[Side], victim: Victim, d: Deltas, now: Time, who: Caller) -> Result[unit, FsError]
+    dst match
+        Some(v) ->
+            dir_rewrite(fs, h, new_dir, new_name, src.ino, src.file_type)?
+            val whole = v.dir
+            change_inode(fs, h, v.ino, (n) ->
+                if whole then n.links = 0 else n.links -= 1
+                set_ctime(n, now))?
+            if victim.gone then orphan_add(fs, h, v.ino)?
+        None -> dir_add(fs, h, new_dir, new_name, src.ino, src.file_type, who.uid)?
+    dir_remove(fs, h, old_dir, old_name)?
+    adjust_parents(fs, h, old_dir, new_dir, d)?
+    val moves = src.dir && old_dir != new_dir
+    change_inode(fs, h, src.ino, (n) ->
+        if moves then n.parent = new_dir
+        set_ctime(n, now))
+
+// The parents' link counts by `d` (one inode when they are the same directory).
+private adjust_parents[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, old_dir: u64, new_dir: u64, d: Deltas) -> Result[unit, FsError]
+    if old_dir == new_dir
+        val total = d.old_dir + d.new_dir
+        if total != 0 then change_inode(fs, h, old_dir, (n) -> n.links = u32(i64(n.links) + i64(total)))?
+        return Ok(())
+    val a = d.old_dir
+    val b = d.new_dir
+    if a != 0 then change_inode(fs, h, old_dir, (n) -> n.links = u32(i64(n.links) + i64(a)))?
+    if b != 0 then change_inode(fs, h, new_dir, (n) -> n.links = u32(i64(n.links) + i64(b)))?
+    Ok(())
+
+// RENAME_EXCHANGE: both names rewritten in place with each other's inode and type; a directory that
+// changes parents takes its `parent` and its `..` link with it.
+private exchange_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], old_dir: u64, old_name: []const u8, src: Side, new_dir: u64, new_name: []const u8, dst: Side) -> Result[Victim, FsError]
+    lock_two(fs, src, dst)
+    val r = exchange_checked(fs, old_dir, old_name, src, new_dir, new_name, dst)
+    unlock_side(fs, src)
+    unlock_side(fs, dst)
+    r?
+    Ok(no_victim())
+
+private exchange_checked[D: BlockDevice, P: Platform](fs: *Fs[D, P], old_dir: u64, old_name: []const u8, src: Side, new_dir: u64, new_name: []const u8, dst: Side) -> Result[unit, FsError]
+    var d = Deltas(0, 0)
+    val crossing = old_dir != new_dir
+    if crossing && src.dir && !dst.dir
+        d.old_dir -= 1
+        d.new_dir += 1
+    if crossing && dst.dir && !src.dir
+        d.new_dir -= 1
+        d.old_dir += 1
+    if d.new_dir > 0 && read_inode(fs, new_dir)?.links >= LINK_MAX then return Err(FsError.TooManyLinks)
+    if d.old_dir > 0 && read_inode(fs, old_dir)?.links >= LINK_MAX then return Err(FsError.TooManyLinks)
+    val now = fs.plat.now()
+    var h = fs.start("rename", C_RENAME)
+    val r = exchange_in(fs, &h, old_dir, old_name, src, new_dir, new_name, dst, d, now)
+    fs.stop(&h)
+    r
+
+private exchange_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, old_dir: u64, old_name: []const u8, src: Side, new_dir: u64, new_name: []const u8, dst: Side, d: Deltas, now: Time) -> Result[unit, FsError]
+    dir_rewrite(fs, h, old_dir, old_name, dst.ino, dst.file_type)?
+    dir_rewrite(fs, h, new_dir, new_name, src.ino, src.file_type)?
+    adjust_parents(fs, h, old_dir, new_dir, d)?
+    val crossing = old_dir != new_dir
+    val src_moves = crossing && src.dir
+    val dst_moves = crossing && dst.dir
+    change_inode(fs, h, src.ino, (n) ->
+        if src_moves then n.parent = new_dir
+        set_ctime(n, now))?
+    change_inode(fs, h, dst.ino, (n) ->
+        if dst_moves then n.parent = old_dir
+        set_ctime(n, now))
+
+// -- statfs -------------------------------------------------------------------------------------------
+
+// What `statfs` answers (section 20), in Linux's `struct statfs` terms.
+struct StatFs
+    f_type: u64
+    bsize: u64
+    frsize: u64
+    blocks: u64
+    bfree: u64
+    bavail: u64
+    files: u64
+    ffree: u64
+    fsid: u64
+    namelen: u64
+    flags: u64
+
+// `statfs` (section 20): the data blocks (every group's less its metadata, less the journal), the free
+// totals as the atomics hold them — a block freed by a transaction that has not committed is not yet
+// free here — the reserve kept from `bavail`, the inodes past the reserved ones. No lock.
+statfs[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> StatFs
+    var data: u64 = 0
+    for g in 0..<fs.geo.group_count
+        data += u64(fs.geo.data_blocks(g))
+    data -= u64(fs.geo.journal_blocks)
+    val free = fs.free_blocks_total.load()
+    val avail = if free > fs.sb.reserved_blocks then free - fs.sb.reserved_blocks else 0
+    var fsid: u64 = 0
+    for k in 0..<8
+        fsid = fsid | (u64(fs.sb.uuid[k]) << (8 * k))
+    val flags = (if fs.read_only() || fs.aborted() then ST_RDONLY else 0) | ST_RELATIME
+    StatFs(KFS_STATFS_MAGIC, u64(BLOCK_SIZE), u64(BLOCK_SIZE), data, free, avail, fs.sb.inode_count - (FIRST_INO - 1), fs.free_inodes_total.load(), fsid, u64(NAME_MAX), flags)

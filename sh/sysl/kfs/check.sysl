@@ -6,7 +6,7 @@ import sysl.buf.{Buf, buf}
 // nothing else — it shares no state with a mounted `Fs`, only the format's codecs, so it can disagree
 // with the code that wrote the image. It reports every problem it finds in one run and writes nothing.
 //
-// The passes so far, each with the checks for what exists at this stage (later stages add theirs):
+// The passes:
 //
 // - **Pass 0** — the superblock and every descriptor (`open`: checksums, magic, version, geometry,
 //   locations), unknown features, `ERROR`, the journal superblock and its `error`. A log that is not
@@ -23,15 +23,17 @@ import sysl.buf.{Buf, buf}
 //   a regular file (an inode on the orphan list is exempt: freeing those blocks is the work the list
 //   records); and the tail of a written last block zero from `size` on. A free inode's slot with a
 //   mode is a warning.
+//   Its xattr block: inside a group's data area, its checksum and tail, section 13's records, and the
+//   XATTR feature set. A symlink in a block: a size the inode could not hold, and no more than
+//   SYMLINK_MAX.
 // - **Pass 2** (checkdir.sysl) — every directory whose inode and tree pass 1 found sound: its blocks
-//   under section 10's rules, its names, and its index.
+//   under section 10's rules, its names, and its index; and the census passes 3 and 4 count from.
+// - **Passes 3 and 4** (checklinks.sysl) — connectivity and link counts, when the census is complete.
 // - **Pass 5** — each group's block bitmap against what it must be (metadata, the journal, the bits
 //   past the group's end, and the claimed blocks, nothing else), the inode bitmap against the slots in
 //   use, the descriptor's free counts, `directories` and both bitmap checksums, and the superblock's
 //   totals when `CLEAN` says they are exact. Then the orphan list from the superblock's head: every
 //   member an allocated inode with `ORPHAN`, no cycle, and no `ORPHAN` on an inode the list misses.
-//
-// Not yet checked, because nothing writes them yet: xattr blocks.
 
 enum Problem
     // Pass 0.
@@ -86,6 +88,19 @@ enum Problem
     DirType(ino: u64, target: u64)
     // A name the directory holds twice.
     DirDuplicate(ino: u64)
+    // Pass 1: inode `ino`'s xattr block fails its checksum or tail or a rule of section 13; and an xattr
+    // block on a filesystem without the XATTR feature.
+    Xattr(ino: u64)
+    XattrFeature(ino: u64)
+    // Pass 3: directory `ino` is reached by no name, by more than one, its `parent` is not the directory
+    // holding its name (the root's: not itself), or it lies on a cycle of names that never reaches the
+    // root.
+    DirUnreachable(ino: u64)
+    DirNamedTwice(ino: u64)
+    DirParent(ino: u64)
+    DirCycle(ino: u64)
+    // Pass 4: inode `ino` records `recorded` links and the names counted give it `counted`.
+    LinkCount(ino: u64, recorded: u32, counted: u64)
     // A name in the leaf at `block` whose hash lies outside the leaf's range.
     DirRange(ino: u64, block: u64)
     // The leaf at `block` is keyed `h | 1` and the leaf before it holds no name of hash `h`.
@@ -150,6 +165,13 @@ describe(p: Problem) -> string
         Problem.DirTarget(i, t) -> s"directory $i names inode $t, which is not an allocated ordinary inode"
         Problem.DirType(i, t) -> s"directory $i's name for inode $t has the wrong file type"
         Problem.DirDuplicate(i) -> s"directory $i holds a name twice"
+        Problem.Xattr(i) -> s"inode $i's xattr block breaks a rule"
+        Problem.XattrFeature(i) -> s"inode $i has an xattr block and the XATTR feature is not set"
+        Problem.DirUnreachable(i) -> s"directory $i is reached by no name"
+        Problem.DirNamedTwice(i) -> s"directory $i is reached by more than one name"
+        Problem.DirParent(i) -> s"directory $i's parent is not the directory that names it"
+        Problem.DirCycle(i) -> s"directory $i lies on a cycle of names that never reaches the root"
+        Problem.LinkCount(i, r, c) -> s"inode $i records $r links and has $c"
         Problem.DirRange(i, b) -> s"directory $i's leaf $b holds a name outside its range"
         Problem.DirMark(i, b) -> s"directory $i's leaf $b is marked a continuation the leaf before it does not begin"
         Problem.DirReach(i, b) -> s"directory $i's block $b is reached twice, or not at all"
@@ -164,7 +186,7 @@ check[D: BlockDevice](dev: *D) -> Report
             rep.add(Problem.Super(e))
             return rep
     val sb = m.sb
-    if sb.feature_incompat != 0 || sb.feature_ro_compat != 0 then rep.add(Problem.Features)
+    if sb.feature_incompat != 0 || sb.feature_ro_compat & ~RO_COMPAT_XATTR != 0 then rep.add(Problem.Features)
     if sb.state & STATE_ERROR != 0 then rep.add(Problem.ErrorState)
     val st = read_journal_super(dev, sb) match
         Ok(s) -> s
@@ -176,7 +198,7 @@ check[D: BlockDevice](dev: *D) -> Report
         rep.add(Problem.NeedsRecovery)
         audit_log(dev, sb, st, rep)
         return rep
-    var c = Checker(m, 0, 0, buf(), buf(), buf(), buf(), buf(), buf(), buf())
+    var c = Checker(m, 0, 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), true)
     for _ in 0..<usize(sb.blocks)
         c.owner.push(0)
     for _ in 0..<m.geo.group_count
@@ -185,8 +207,20 @@ check[D: BlockDevice](dev: *D) -> Report
         c.allocated.push(false)
         c.flagged.push(false)
         c.types.push(0)
+        c.links.push(0)
+        c.parents.push(0)
+        c.names.push(0)
+        c.subdirs.push(0)
+        c.namer.push(0)
     var failed = pass1(dev, &c, rep).is_err()
-    if !failed then failed = pass2(dev, &c, rep).is_err()
+    if !failed
+        val before = rep.problems.len()
+        failed = pass2(dev, &c, rep).is_err()
+        // Passes 3 and 4 count names, so they judge only a complete count: every directory read whole.
+        if rep.problems.len() != before then c.complete = false
+    if !failed && c.complete
+        pass3(&c, rep)
+        pass4(&c, rep)
     if !failed then failed = pass5(dev, &c, rep).is_err()
     if failed then rep.add(Problem.Super(OpenError.Device(DeviceError.Io)))
     rep.inodes = c.inodes
@@ -208,6 +242,15 @@ private[kfs] struct Checker
     // found sound.
     types: Buf[u8]
     seen: Buf[DirSeen]
+    // For passes 3 and 4, by inode number: `links` and `parent` as pass 1 read them; the names pass 2
+    // found naming it; for a directory, the names in it naming directories, and the first directory
+    // found naming it. `complete` stays true while every directory has been read whole.
+    links: Buf[u32]
+    parents: Buf[u64]
+    names: Buf[u64]
+    subdirs: Buf[u64]
+    namer: Buf[u64]
+    complete: bool
 
 // A directory for pass 2: its inode's fields and its extents.
 private[kfs] struct DirSeen
@@ -296,9 +339,13 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
             val problems_before = rep.problems.len()
             if !verify_inode(seed, ino, slot)
                 rep.add(Problem.InodeChecksum(ino))
+                // It may have been a directory, whose names are now beyond counting.
+                c.complete = false
                 continue
             val orphan = node.flags & INODE_ORPHAN != 0
             c.flagged[usize(ino)] = orphan
+            c.links[usize(ino)] = node.links
+            c.parents[usize(ino)] = node.parent
             if node.links == 0 && !orphan then rep.add(Problem.Unlinked(ino))
             val t = node.mode & S_IFMT
             if !valid_type(t) || node.mode & ~(S_IFMT | 0o7777) != 0
@@ -312,8 +359,11 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
                 continue
             if (t == S_IFDIR) != (node.parent != 0) then rep.add(Problem.InodeParent(ino))
             val special = t == S_IFCHR || t == S_IFBLK || t == S_IFIFO || t == S_IFSOCK
-            if special && (node.size != 0 || node.blocks != 0) then rep.add(Problem.InodeSize(ino))
+            // Its only block may be its xattr block (sections 8 and 13).
+            if special && (node.size != 0 || node.blocks > u64(if node.xattr_block != 0 then 1 else 0)) then rep.add(Problem.InodeSize(ino))
             if t == S_IFLNK && f & INODE_INLINE != 0 && (node.size == 0 || node.size > u64(SYMLINK_INLINE_MAX)) then rep.add(Problem.InodeSize(ino))
+            // A target in a block is one too long for the inode, and no longer than SYMLINK_MAX (section 11).
+            if t == S_IFLNK && f & INODE_INLINE == 0 && (node.size <= u64(SYMLINK_INLINE_MAX) || node.size > u64(SYMLINK_MAX)) then rep.add(Problem.InodeSize(ino))
             c.count = 0
             c.extents.clear()
             if t == S_IFREG || t == S_IFDIR || (t == S_IFLNK && f & INODE_INLINE == 0)
@@ -337,9 +387,21 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
                     ex.extend(c.extents.view())
                     c.seen.push(DirSeen(ino, node.generation, f, node.size, ex))
             if node.xattr_block != 0
-                claim(c, rep, node.xattr_block, ino)
-                c.count += 1
+                if c.m.sb.feature_ro_compat & RO_COMPAT_XATTR == 0 then rep.add(Problem.XattrFeature(ino))
+                if !data_run(c.m, node.xattr_block, 1)
+                    rep.add(Problem.Xattr(ino))
+                else
+                    claim(c, rep, node.xattr_block, ino)
+                    c.count += 1
+                    var xb = block_buf()
+                    dev.read(node.xattr_block, xb.view())?
+                    if !verify_owned_block(seed, xb.view(), ino, node.generation) || xattr_records(xb.view()).is_none() then rep.add(Problem.Xattr(ino))
             if node.blocks != c.count then rep.add(Problem.BlockCount(ino, node.blocks, c.count))
+    // A directory pass 1 found unsound is not read by pass 2, so its names go uncounted.
+    var dirs: u64 = 0
+    for grp in 0..<g.group_count
+        dirs += u64(c.dirs[usize(grp)])
+    if dirs != u64(c.seen.len()) then c.complete = false
     Ok(())
 
 // Section 8's invariants about the end of the file, over the extents the walk collected: none written

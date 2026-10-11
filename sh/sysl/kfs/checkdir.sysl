@@ -21,6 +21,8 @@ import sysl.buf.{Buf, buf}
 //   when the next key carries the mark; a marked key `h | 1` only after a leaf holding a name of hash
 //   `h`; every index entry naming a mapped block; every block reached once, and every mapped block
 //   reached.
+// - **The census** passes 3 and 4 count from (checklinks.sysl): every name of an allocated ordinary
+//   inode counted against it, and a directory's names of directories against the directory.
 
 // Where one logical block of the directory is, and whether the walk has reached it.
 private struct Mapped
@@ -202,8 +204,13 @@ private check_leaf[D: BlockDevice](dev: *D, c: *Checker, rep: Report, d: DirSeen
         val reserved = r.ino == 1 || (r.ino >= 3 && r.ino < FIRST_INO)
         if reserved || r.ino > count || !c.allocated[usize(r.ino)]
             problem(rep, Problem.DirTarget(d.ino, r.ino))
-        else if c.types[usize(r.ino)] != r.file_type
-            problem(rep, Problem.DirType(d.ino, r.ino))
+        else
+            if c.types[usize(r.ino)] != r.file_type then problem(rep, Problem.DirType(d.ino, r.ino))
+            // The census of passes 3 and 4.
+            c.names[usize(r.ino)] = c.names[usize(r.ino)] + 1
+            if c.types[usize(r.ino)] == DT_DIR
+                c.subdirs[usize(d.ino)] = c.subdirs[usize(d.ino)] + 1
+                if c.namer[usize(r.ino)] == 0 then c.namer[usize(r.ino)] = d.ino
         val h = dir_hash(c.m.sb.hash_seed[0..<16], name)
         hashes.push(h)
         var copy: Buf[u8] = buf()

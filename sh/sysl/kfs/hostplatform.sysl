@@ -8,8 +8,11 @@ import sysl.buf.{Buf, buf}
 //
 // The bookkeeping is what makes it more than a stub. Every acquisition is checked against section 19's
 // order (`rank`): taking a lock while holding one of the same or a higher rank panics, which is how a
-// host test catches the two-group-locks mistake or a buffer lock taken outside its group lock. Every
-// release must be of a lock that is held. `fatal` panics unless a test asked to record it.
+// host test catches the two-group-locks mistake or a buffer lock taken outside its group lock. The two
+// exceptions are rule 2's directories, held together (their ancestor order is not something a lock name
+// can show), and rule 3's non-directories, held together in increasing number; an inode's lock taken
+// while it is held, under either name, panics. Every release must be of a lock that is held. `fatal`
+// panics unless a test asked to record it.
 //
 // **A simulated commit thread.** With `committer_thread` set, `wake_committer` answers that a thread
 // was woken, as the kernel's does; nothing runs it, so the test plays that thread itself by calling
@@ -51,15 +54,22 @@ private key_of(l: LockId) -> u64
         LockId.Group(g) -> u64(g)
         LockId.Buffer(b) -> b
         LockId.Inode(i) -> i
+        LockId.Dir(i) -> i
         _ -> 0
 
 impl Platform for HostPlatform
     lock(*self, l: LockId)
         val r = rank(l)
+        val k = key_of(l)
         for i in 0..<self.held_rank.len()
-            if self.held_rank[i] >= r then panic("keel.kfs: a lock taken out of section 19's order")
+            val hr = self.held_rank[i]
+            val hk = self.held_key[i]
+            // `Dir(n)` and `Inode(n)` are one lock: taking it twice is a deadlock.
+            if (hr == 2 || hr == 3) && (r == 2 || r == 3) && hk == k then panic("keel.kfs: an inode's lock taken while it is held")
+            val together = (hr == 2 && r == 2) || (hr == 3 && r == 3 && hk < k)
+            if hr >= r && !together then panic("keel.kfs: a lock taken out of section 19's order")
         self.held_rank.push(r)
-        self.held_key.push(key_of(l))
+        self.held_key.push(k)
         if r == 6
             self.group_locks += 1
             var groups: u32 = 0

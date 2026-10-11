@@ -1,0 +1,282 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// Extended attributes (kfs/SPEC.md section 13): every attribute of an inode in one block of its own, the
+// inode's `xattr_block`, counted in its `blocks`.
+//
+// The block is read whole and checked — its checksum, its tail naming this inode at this generation, its
+// magic and section 13's record rules — and a change is made by rewriting it whole from the list in
+// memory, in one transaction with the inode (`C_XATTR`). The first attribute allocates the block, the
+// last one's removal frees it (with its revoke), and the first block the filesystem ever gets sets the
+// ro_compat feature XATTR in the superblock in the same transaction: a driver that does not know xattrs
+// must not write the filesystem, or it would leak these blocks when it frees inodes (section 21).
+//
+// The callers are the kernel's xattr calls, which have taken the namespace off the name: `ns` is
+// XATTR_USER, XATTR_TRUSTED, XATTR_SECURITY or XATTR_SYSTEM, `name` the rest. Every call takes the
+// inode's lock.
+
+// One attribute.
+struct Xattr
+    namespace: u8
+    name: Buf[u8]
+    value: Buf[u8]
+
+// The bytes a record takes: its 4-byte header, the name and the value, padded to 4.
+xattr_record_size(name_len: usize, value_len: usize) -> usize = (4 + name_len + value_len + 3) / 4 * 4
+
+// The prefix a namespace's names are listed with.
+xattr_prefix(ns: u8) -> string
+    if ns == XATTR_USER then return "user."
+    if ns == XATTR_TRUSTED then return "trusted."
+    if ns == XATTR_SECURITY then return "security."
+    "system."
+
+// Whether (an, a) sorts before (bn, b): by namespace, then by name, bytewise, a prefix first.
+private sorts_before(an: u8, a: []const u8, bn: u8, b: []const u8) -> bool
+    if an != bn then return an < bn
+    val n = if a.len < b.len then a.len else b.len
+    for i in 0..<n
+        if a[i] != b[i] then return a[i] < b[i]
+    a.len < b.len
+
+private equal_bytes(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+private copy_bytes(src: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for b in src
+        out.push(b)
+    out
+
+// The attributes in xattr block `bytes`, checked against section 13: the magic; `used` inside the area
+// and exactly the records' bytes; `count` records, at least one; each name 1 to 255 bytes in a known
+// namespace; sorted by (namespace, name) with no name twice. None when a rule fails. The checksum and the
+// tail are the caller's.
+xattr_records(bytes: []u8) -> Option[Buf[Xattr]]
+    val head: *XattrHeader = at(bytes, 0)
+    if head.magic != XATTR_MAGIC then return None
+    val end = 8 + usize(head.used)
+    if usize(head.used) > XATTR_AREA || head.count == 0 then return None
+    var out: Buf[Xattr] = buf()
+    var off: usize = 8
+    while off < end
+        if off + 4 > end then return None
+        val r: *XattrRecordHeader = at(bytes, off)
+        val nl = usize(r.name_len)
+        val vl = usize(r.value_len)
+        val size = xattr_record_size(nl, vl)
+        if nl == 0 || r.namespace < XATTR_USER || r.namespace > XATTR_SYSTEM || off + size > end then return None
+        val name = copy_bytes(bytes[off + 4..<off + 4 + nl])
+        val value = copy_bytes(bytes[off + 4 + nl..<off + 4 + nl + vl])
+        if out.len() > 0
+            val p = out[out.len() - 1]
+            if !sorts_before(p.namespace, p.name.view(), r.namespace, name.view()) then return None
+        out.push(Xattr(r.namespace, name, value))
+        off += size
+    if out.len() != usize(head.count) then return None
+    Some(out)
+
+// The bytes the attributes take together.
+private xattr_bytes(attrs: Buf[Xattr]) -> usize
+    var n: usize = 0
+    for a in attrs.view()
+        n += xattr_record_size(a.name.len(), a.value.len())
+    n
+
+// Lay `attrs` out in `bytes` as an xattr block, everything up to the tail rewritten.
+private pack_xattrs(bytes: []u8, attrs: Buf[Xattr])
+    for k in 0..<TAIL_OFFSET
+        bytes[k] = 0
+    var off: usize = 8
+    for a in attrs.view()
+        val r: *XattrRecordHeader = at(bytes, off)
+        r.namespace = a.namespace
+        r.name_len = u8(a.name.len())
+        r.value_len = u16(a.value.len())
+        for k in 0..<a.name.len()
+            bytes[off + 4 + k] = a.name[k]
+        for k in 0..<a.value.len()
+            bytes[off + 4 + a.name.len() + k] = a.value[k]
+        off += xattr_record_size(a.name.len(), a.value.len())
+    val head: *XattrHeader = at(bytes, 0)
+    head.magic = XATTR_MAGIC
+    head.count = u16(attrs.len())
+    head.used = u16(off - 8)
+
+// Inode `ino`'s attributes (none without a block). A block that fails its checks is corruption.
+private load_xattrs[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, node: Inode) -> Result[Buf[Xattr], FsError]
+    if node.xattr_block == 0 then return Ok(buf())
+    val b = node.xattr_block
+    val id = fs.buffer(b)?
+    fs.plat.lock(LockId.Buffer(b))
+    val bytes = fs.bytes(id)
+    val got = if verify_owned_block(fs.seed, bytes, ino, node.generation) then xattr_records(bytes) else None
+    fs.plat.unlock(LockId.Buffer(b))
+    got match
+        Some(x) -> Ok(x)
+        None -> Err(fs.corrupt(Corruption.Xattr(ino, b)))
+
+private find_xattr(attrs: Buf[Xattr], ns: u8, name: []const u8) -> Option[usize]
+    for i in 0..<attrs.len()
+        if attrs[i].namespace == ns && equal_bytes(attrs[i].name.view(), name) then return Some(i)
+    None
+
+// A namespace and a name as the calls take them: a namespace of section 13 (`Invalid`), a name of 1 to
+// 255 bytes (`Range`, as Linux answers).
+private xattr_name_ok(ns: u8, name: []const u8) -> Result[unit, FsError]
+    if ns < XATTR_USER || ns > XATTR_SYSTEM then return Err(FsError.Invalid)
+    if name.len == 0 || name.len > XATTR_NAME_MAX then return Err(FsError.Range)
+    Ok(())
+
+// `setxattr` (section 13): set attribute `name` of namespace `ns` on inode `ino` to `value`, for a caller
+// of uid `uid` (whose reserve a new block may not take). With XATTR_CREATE an attribute already there is
+// `Exists`; with XATTR_REPLACE a missing one is `NoData`. More than the block holds — every attribute of
+// the inode together past XATTR_AREA bytes — is `NoSpace`.
+setxattr[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, ns: u8, name: []const u8, value: []const u8, flags: u32, uid: u32) -> Result[unit, FsError]
+    xattr_name_ok(ns, name)?
+    if flags & ~(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == XATTR_CREATE | XATTR_REPLACE then return Err(FsError.Invalid)
+    fs.plat.lock(LockId.Inode(ino))
+    val r = set_locked(fs, ino, ns, name, value, flags, uid)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private set_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, ns: u8, name: []const u8, value: []const u8, flags: u32, uid: u32) -> Result[unit, FsError]
+    val node = read_inode(fs, ino)?
+    var attrs = load_xattrs(fs, ino, node)?
+    val found = find_xattr(attrs, ns, name)
+    if found.is_some() && flags == XATTR_CREATE then return Err(FsError.Exists)
+    if found.is_none() && flags == XATTR_REPLACE then return Err(FsError.NoData)
+    if value.len > XATTR_AREA then return Err(FsError.NoSpace)
+    val x = Xattr(ns, copy_bytes(name), copy_bytes(value))
+    found match
+        Some(i) -> attrs[i] = x
+        None ->
+            var k: usize = 0
+            while k < attrs.len() && sorts_before(attrs[k].namespace, attrs[k].name.view(), ns, name)
+                k += 1
+            attrs.insert(k, x)
+    if xattr_bytes(attrs) > XATTR_AREA then return Err(FsError.NoSpace)
+    val now = fs.plat.now()
+    var h = fs.start("setxattr", C_XATTR)
+    val r = write_xattrs(fs, &h, ino, node, attrs, uid, now)
+    fs.stop(&h)
+    r
+
+// Write `attrs` as inode `ino`'s block — allocated when it has none, with the feature marked — and the
+// inode's `xattr_block`, `blocks` and `ctime`.
+private write_xattrs[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, node: Inode, attrs: Buf[Xattr], uid: u32, now: Time) -> Result[unit, FsError]
+    var b = node.xattr_block
+    val fresh = b == 0
+    if fresh then b = alloc_blocks(fs, h, goal_for(fs, ino, 0), 1, uid)?.first
+    val id = fs.buffer(b)?
+    fs.plat.lock(LockId.Buffer(b))
+    val declared = fs.write_access(h, id)
+    fs.plat.unlock(LockId.Buffer(b))
+    declared?
+    fs.plat.lock(LockId.Buffer(b))
+    val bytes = fs.bytes(id)
+    pack_xattrs(bytes, attrs)
+    set_tail(bytes, ino, node.generation)
+    seal_block(fs.seed, bytes)
+    fs.plat.unlock(LockId.Buffer(b))
+    val block = b
+    change_inode(fs, h, ino, (n) ->
+        n.xattr_block = block
+        if fresh then n.blocks += 1
+        set_ctime(n, now))?
+    if fresh then mark_xattr_feature(fs, h)?
+    Ok(())
+
+// Set the ro_compat feature XATTR in the superblock, in `h`, unless it is set already.
+private mark_xattr_feature[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle) -> Result[unit, FsError]
+    if fs.sb.feature_ro_compat & RO_COMPAT_XATTR != 0 then return Ok(())
+    val id = fs.buffer(1)?
+    fs.plat.lock(LockId.Buffer(1))
+    val declared = fs.write_access(h, id)
+    fs.plat.unlock(LockId.Buffer(1))
+    declared?
+    fs.plat.lock(LockId.Buffer(1))
+    val sb: *Superblock = at(fs.bytes(id), 0)
+    sb.feature_ro_compat = sb.feature_ro_compat | RO_COMPAT_XATTR
+    seal_superblock(fs.bytes(id))
+    fs.plat.unlock(LockId.Buffer(1))
+    fs.sb.feature_ro_compat = fs.sb.feature_ro_compat | RO_COMPAT_XATTR
+    Ok(())
+
+// `removexattr` (section 13): a missing attribute is `NoData`. The last one's removal frees the block.
+removexattr[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, ns: u8, name: []const u8) -> Result[unit, FsError]
+    xattr_name_ok(ns, name)?
+    fs.plat.lock(LockId.Inode(ino))
+    val r = remove_locked(fs, ino, ns, name)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private remove_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, ns: u8, name: []const u8) -> Result[unit, FsError]
+    val node = read_inode(fs, ino)?
+    var attrs = load_xattrs(fs, ino, node)?
+    val i = find_xattr(attrs, ns, name) match
+        Some(i) -> i
+        None -> return Err(FsError.NoData)
+    attrs.remove(i)
+    val now = fs.plat.now()
+    var h = fs.start("removexattr", C_XATTR)
+    val r = if attrs.len() == 0 then drop_xattr_block(fs, &h, ino, node.xattr_block, now) else write_xattrs(fs, &h, ino, node, attrs, 0, now)
+    fs.stop(&h)
+    r
+
+private drop_xattr_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, b: u64, now: Time) -> Result[unit, FsError]
+    free_blocks(fs, h, b, 1)?
+    fs.revoke(h, b)
+    change_inode(fs, h, ino, (n) ->
+        n.xattr_block = 0
+        n.blocks -= 1
+        set_ctime(n, now))
+
+// `getxattr` (section 13): the value of attribute `name` into `out`; answers its length. An empty `out`
+// asks for the length alone; one too short is `Range`; a missing attribute `NoData`.
+getxattr[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, ns: u8, name: []const u8, out: []u8) -> Result[usize, FsError]
+    xattr_name_ok(ns, name)?
+    fs.plat.lock(LockId.Inode(ino))
+    val r = get_locked(fs, ino, ns, name, out)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private get_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, ns: u8, name: []const u8, out: []u8) -> Result[usize, FsError]
+    val node = read_inode(fs, ino)?
+    val attrs = load_xattrs(fs, ino, node)?
+    val i = find_xattr(attrs, ns, name) match
+        Some(i) -> i
+        None -> return Err(FsError.NoData)
+    val v = attrs[i].value
+    if out.len == 0 then return Ok(v.len())
+    if out.len < v.len() then return Err(FsError.Range)
+    for k in 0..<v.len()
+        out[k] = v[k]
+    Ok(v.len())
+
+// `listxattr` (section 13): every attribute's full name — its namespace's prefix, the name, a NUL — in
+// order, into `out`; answers the bytes. An empty `out` asks for the length alone; one too short is
+// `Range`.
+listxattr[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, out: []u8) -> Result[usize, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = list_locked(fs, ino, out)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private list_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, out: []u8) -> Result[usize, FsError]
+    val node = read_inode(fs, ino)?
+    val attrs = load_xattrs(fs, ino, node)?
+    var all: Buf[u8] = buf()
+    for a in attrs.view()
+        all.extend(xattr_prefix(a.namespace).bytes)
+        all.extend(a.name.view())
+        all.push(0)
+    if out.len == 0 then return Ok(all.len())
+    if out.len < all.len() then return Err(FsError.Range)
+    for k in 0..<all.len()
+        out[k] = all[k]
+    Ok(all.len())

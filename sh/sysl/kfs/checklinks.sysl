@@ -1,0 +1,64 @@
+module keel.kfs
+
+// The checker's passes 3 and 4 (kfs/SPEC.md section 23), over the census pass 2 takes while it reads
+// every directory: how many names name each inode, how many of a directory's names name directories, and
+// the first directory found naming each directory. They run only when the census is complete — every
+// directory sound in pass 1 and read whole by pass 2 — since a name a broken block hides would make every
+// count after it wrong.
+//
+// - **Pass 3 — connectivity.** The root is named by no name and its `parent` is itself. Every other
+//   directory still linked is named exactly once, its `parent` is the directory holding that name, and
+//   following the names upward from it reaches the root: a chain that comes back to where it started is
+//   a cycle, reported once, at its lowest-numbered member. A directory that rmdir removed while it was
+//   held open (no links, on the orphan list) is named by nothing and is not judged here.
+// - **Pass 4 — link counts.** An inode's `links` is the names naming it; a directory adds one for its
+//   own `.` and one for each subdirectory's `..`, and the root one for its own name. A removed directory
+//   counts its names and subdirectories only, which must come to its 0.
+
+// Whether inode `ino` is one the passes judge: allocated, sound in pass 1, and the root or ordinary.
+private judged(c: *Checker, ino: u64) -> bool
+    c.allocated[usize(ino)] && c.types[usize(ino)] != 0 && (ino == ROOT_INO || ino >= FIRST_INO)
+
+// A directory with no links on the orphan list: removed, kept for whoever holds it open.
+private removed(c: *Checker, ino: u64) -> bool = c.links[usize(ino)] == 0 && c.flagged[usize(ino)]
+
+private[kfs] pass3(c: *Checker, rep: Report)
+    val count = c.m.sb.inode_count
+    for ino in 1..<(count + 1)
+        if !judged(c, ino) || c.types[usize(ino)] != DT_DIR || removed(c, ino) then continue
+        if ino == ROOT_INO
+            if c.parents[usize(ino)] != ROOT_INO then rep.problems.push(Problem.DirParent(ino))
+            if c.names[usize(ino)] != 0 then rep.problems.push(Problem.DirNamedTwice(ino))
+            continue
+        val n = c.names[usize(ino)]
+        if n == 0
+            rep.problems.push(Problem.DirUnreachable(ino))
+            continue
+        if n > 1 then rep.problems.push(Problem.DirNamedTwice(ino))
+        if c.parents[usize(ino)] != c.namer[usize(ino)] then rep.problems.push(Problem.DirParent(ino))
+        if on_cycle(c, ino, count) then rep.problems.push(Problem.DirCycle(ino))
+
+// Whether directory `ino` lies on a cycle of names and is its lowest-numbered member: the names upward
+// from it come back to it without reaching the root.
+private on_cycle(c: *Checker, ino: u64, count: u64) -> bool
+    var p = c.namer[usize(ino)]
+    var lowest = ino
+    var steps: u64 = 0
+    while steps <= count
+        if p == 0 || p == ROOT_INO then return false
+        if p == ino then return lowest == ino
+        if p < lowest then lowest = p
+        p = c.namer[usize(p)]
+        steps += 1
+    false
+
+private[kfs] pass4(c: *Checker, rep: Report)
+    val count = c.m.sb.inode_count
+    for ino in 1..<(count + 1)
+        if !judged(c, ino) then continue
+        var want = c.names[usize(ino)]
+        if c.types[usize(ino)] == DT_DIR
+            want += c.subdirs[usize(ino)]
+            if !removed(c, ino) then want += 1
+        if ino == ROOT_INO then want += 1
+        if u64(c.links[usize(ino)]) != want then rep.problems.push(Problem.LinkCount(ino, c.links[usize(ino)], want))

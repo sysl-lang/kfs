@@ -66,6 +66,45 @@ const C_DELETE_LAST: u32 = C_INODE + C_GROUP + C_INODE + C_GROUP
 // unmapped, with a revoke.
 const C_DIR_ADD: u32 = u32(DIR_MAX_LEVELS) + 1 + (u32(DIR_MAX_LEVELS) + 1) * C_ALLOC
 const C_DIR_DEL: u32 = u32(DIR_MAX_LEVELS) + 2 + (u32(DIR_MAX_LEVELS) + 1) * (C_GROUP + C_EXT) + 1
+// The namespace operations (section 14, "Credits"; section 18 says what each writes). Create, mknod,
+// mkdir and an inline symlink: the new inode's group, its block and the parent's, and the name. A
+// symlink whose target needs a block allocates and maps one more run. A link: the target's block and
+// the parent's, and the name. An unlink or rmdir: the parent, the victim, the victim's orphan-list
+// neighbour, the name, the superblock. A rename of any form: both parents, the moved inode and the
+// victim, a name added and one removed, the superblock.
+const C_CREATE: u32 = C_GROUP + 2 * C_INODE + C_DIR_ADD
+const C_SYMLINK_BLOCK: u32 = C_CREATE + C_ALLOC
+const C_LINK: u32 = 2 * C_INODE + C_DIR_ADD
+const C_UNLINK: u32 = 3 * C_INODE + C_DIR_DEL + C_SB
+const C_RENAME: u32 = 4 * C_INODE + C_DIR_ADD + C_DIR_DEL + C_SB
+// setattr of anything but a shrinking size: the inode. setxattr and removexattr: the inode, the xattr
+// block's group, the xattr block, and the superblock the first one marks with the XATTR feature.
+const C_SETATTR: u32 = C_INODE
+const C_XATTR: u32 = C_INODE + C_GROUP + 2
+
+// The longest symlink target: PATH_MAX less its terminating NUL (section 3).
+const SYMLINK_MAX: usize = PATH_MAX - 1
+
+// `renameat2`'s flags (Linux's values).
+const RENAME_NOREPLACE: u32 = 1
+const RENAME_EXCHANGE: u32 = 2
+
+// `setxattr`'s flags (Linux's values).
+const XATTR_CREATE: u32 = 1
+const XATTR_REPLACE: u32 = 2
+
+// The longest extended attribute name, without its namespace prefix, and the bytes every attribute of an
+// inode shares: the xattr block from its 8-byte header to its tail (section 13).
+const XATTR_NAME_MAX: usize = 255
+const XATTR_AREA: usize = TAIL_OFFSET - 8
+
+// The feature bits of section 21.
+const RO_COMPAT_XATTR: u32 = 1
+
+// statfs (section 20): `f_type`, and the `f_flags` bits (Linux's `ST_*`).
+const KFS_STATFS_MAGIC: u64 = 0x4B46_5331
+const ST_RDONLY: u64 = 1
+const ST_RELATIME: u64 = 0x1000
 
 // Directory positions (section 10, "readdir positions"): `.`, `..`, and the end; an entry's is its
 // hash halved, which lies between them.

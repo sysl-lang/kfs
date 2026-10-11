@@ -25,9 +25,10 @@ import sysl.buf.{Buf, buf}
 // mark honest (`fix_mark`), then frees what it emptied: unmapped with the reserve's right (uid 0) — a
 // freed block can split an extent, and a removal must not fail for want of space — and revoked.
 //
-// The callers hold the directory's inode lock (section 19); `dir_add` and `dir_remove` take the caller's
-// handle, with C_DIR_ADD and C_DIR_DEL credits for their part. `add_name` and `remove_name` are the same
-// with a handle of their own; `lookup_name` and `read_dir` take the lock themselves.
+// The callers hold the directory's inode lock (section 19, `LockId.Dir`); `dir_add`, `dir_remove` and
+// `dir_rewrite` take the caller's handle, with C_DIR_ADD and C_DIR_DEL credits for their part. `add_name`
+// and `remove_name` are the same with a handle of their own; `lookup_name` and `read_dir` take the lock
+// themselves, `lookup_held` is lookup for a caller that has it.
 
 // What a name names.
 struct DirEntry
@@ -423,12 +424,13 @@ private visit[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, name: []const 
 // What `name` names in directory `dir`: `.` and `..` from the inode, without reading a block; else its
 // entry, or `NotFound`.
 lookup_name[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[DirEntry, FsError]
-    fs.plat.lock(LockId.Inode(dir))
-    val r = lookup_locked(fs, dir, name)
-    fs.plat.unlock(LockId.Inode(dir))
+    fs.plat.lock(LockId.Dir(dir))
+    val r = lookup_held(fs, dir, name)
+    fs.plat.unlock(LockId.Dir(dir))
     r
 
-private lookup_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[DirEntry, FsError]
+// `lookup_name` for a caller that holds the directory's lock.
+lookup_held[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[DirEntry, FsError]
     val d = load_dir(fs, dir)?
     if is_dot(name) then return Ok(DirEntry(dir, DT_DIR))
     if is_dotdot(name) then return Ok(DirEntry(d.parent, DT_DIR))
@@ -478,11 +480,11 @@ dir_add[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, dir: u64, name: 
 
 // `dir_add` in a handle of its own, under the directory's lock: the directory's half of a link.
 add_name[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8, ino: u64, file_type: u8, uid: u32) -> Result[unit, FsError]
-    fs.plat.lock(LockId.Inode(dir))
+    fs.plat.lock(LockId.Dir(dir))
     var h = fs.start("add name", C_INODE + C_DIR_ADD)
     val r = dir_add(fs, &h, dir, name, ino, file_type, uid)
     fs.stop(&h)
-    fs.plat.unlock(LockId.Inode(dir))
+    fs.plat.unlock(LockId.Dir(dir))
     r
 
 // Put `n` into `leaf` in place if a record has room for it; false when none has.
@@ -626,12 +628,42 @@ dir_remove[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, dir: u64, nam
 
 // `dir_remove` in a handle of its own, under the directory's lock: the directory's half of an unlink.
 remove_name[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, name: []const u8) -> Result[DirEntry, FsError]
-    fs.plat.lock(LockId.Inode(dir))
+    fs.plat.lock(LockId.Dir(dir))
     var h = fs.start("remove name", C_INODE + C_DIR_DEL)
     val r = dir_remove(fs, &h, dir, name)
     fs.stop(&h)
-    fs.plat.unlock(LockId.Inode(dir))
+    fs.plat.unlock(LockId.Dir(dir))
     r
+
+// Point `name` in directory `dir` at inode `ino` of type `file_type`, in place, in `h`: the record's
+// `ino` and `file_type` are rewritten and the name never leaves the directory (section 18, `renameat2`).
+// Answers what the name named before; a name not there is `NotFound`. The caller holds the directory's
+// lock.
+dir_rewrite[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, dir: u64, name: []const u8, ino: u64, file_type: u8) -> Result[DirEntry, FsError]
+    if is_dot(name) || is_dotdot(name) then return Err(FsError.Invalid)
+    valid_name(name)?
+    if ino == 0 then return Err(FsError.Invalid)
+    val d = load_dir(fs, dir)?
+    val v = visit(fs, d, name, name_hash(fs, name))?
+    val i = v.found match
+        Some(i) -> i
+        None -> return Err(FsError.NotFound)
+    val leaf = v.leaves[v.leaves.len() - 1].leaf
+    val was = DirEntry(leaf.names[i].ino, leaf.names[i].file_type)
+    val id = declare_block(fs, h, leaf.phys)?
+    fs.plat.lock(LockId.Buffer(leaf.phys))
+    val bytes = fs.bytes(id)
+    val r: *DirRecordHeader = at(bytes, leaf.recs[leaf.rec_of[i]].off)
+    r.ino = ino
+    r.file_type = file_type
+    seal_block(fs.seed, bytes)
+    fs.plat.unlock(LockId.Buffer(leaf.phys))
+    finish_change(fs, h, d, 0, 0)?
+    Ok(was)
+
+// Whether directory `dir` holds no name: an empty directory owns no blocks (section 10, rule 4). The
+// caller holds its lock.
+dir_empty[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64) -> Result[bool, FsError] = Ok(load_dir(fs, dir)?.size == 0)
 
 // Remove name `i` from `leaf` in place.
 private drop_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, leaf: Leaf, i: usize) -> Result[unit, FsError]
@@ -793,9 +825,9 @@ private listed(name: []const u8, ino: u64, file_type: u8, pos: u64) -> Listed = 
 // (its hash halved) is at least `pos`, in hash order. A run of one position is never cut: if the first
 // does not fit, `Invalid` (EINVAL).
 read_dir[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, pos: u64, room: usize) -> Result[Listing, FsError]
-    fs.plat.lock(LockId.Inode(dir))
+    fs.plat.lock(LockId.Dir(dir))
     val r = read_dir_locked(fs, dir, pos, room)
-    fs.plat.unlock(LockId.Inode(dir))
+    fs.plat.unlock(LockId.Dir(dir))
     r
 
 private read_dir_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, pos: u64, room: usize) -> Result[Listing, FsError]

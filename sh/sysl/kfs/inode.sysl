@@ -210,26 +210,3 @@ held_open[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> bool
     find_core(fs, ino) match
         Some(i) -> fs.incore[i].held > 0
         None -> false
-
-// The inode's half of `unlinkat` (section 18): `links` − 1 and `ctime`, and on the last link the orphan
-// list, in one transaction; then, with nothing holding it open, the delete. The directory's half is
-// the directory code's, in the same transaction.
-drop_link[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
-    fs.plat.lock(LockId.Inode(ino))
-    val r = drop_link_locked(fs, ino)
-    fs.plat.unlock(LockId.Inode(ino))
-    r
-
-private drop_link_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
-    val node = read_inode(fs, ino)?
-    if node.links == 0 then return Err(FsError.Invalid)
-    val last = node.links == 1
-    val now = fs.plat.now()
-    var h = fs.start("unlink", C_INODE + C_SB)
-    var r = change_inode(fs, &h, ino, (n) ->
-        n.links -= 1
-        set_ctime(n, now))
-    if r.is_ok() && last then r = orphan_add(fs, &h, ino)
-    fs.stop(&h)
-    r?
-    if last && !held_open(fs, ino) then delete_locked(fs, ino) else Ok(())

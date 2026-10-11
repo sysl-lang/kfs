@@ -15,11 +15,17 @@ module keel.kfs
 //
 // Plus one exit for a bug in KFS itself (`fatal`): the kernel stops, a host test fails.
 
-// Every lock of section 19 that the package takes. The rename lock and a directory's lock are taken by
-// the code above the package, so they have no names here yet.
+// Every lock of section 19 that the package takes.
 enum LockId
+    // `rename_lock`: the shape of the directory tree while a rename moves a directory or crosses
+    // directories (sleeping, one per filesystem).
+    Rename
+    // `inode.lock` of a directory, named for rule 2 of the order: taken ancestor before descendant, and
+    // two directories neither of which is the other's ancestor in increasing number. It is the same lock
+    // as `Inode` of the same number; the name says which rule it is taken under.
+    Dir(ino: u64)
     // `inode.lock` of a non-directory: its fields, its extent tree, its open count (sleeping). A split
-    // operation holds it from its first step to its last.
+    // operation holds it from its first step to its last. Taken in increasing number (rule 3).
     Inode(ino: u64)
     // `orphans.lock`: the orphan list (sleeping).
     Orphans
@@ -37,11 +43,14 @@ enum LockId
     Icache
 
 // Where a lock sits in section 19's order: a lock may be taken only while every lock held ranks
-// strictly lower. Rules 1-2 (the rename lock and directories' locks) are above everything here, and
-// rule 4, opening a handle, comes between an inode's lock and the orphan list's; the leaves share rank 8
-// and none may be held while taking another.
+// strictly lower, except that several directories' locks (rank 2) may be held together, in the order
+// rule 2 gives, and several non-directories' locks (rank 3) in increasing number. Rule 4, opening a
+// handle, comes between an inode's lock and the orphan list's; the leaves share rank 8 and none may be
+// held while taking another.
 rank(l: LockId) -> u32
     l match
+        LockId.Rename -> 1
+        LockId.Dir(_) -> 2
         LockId.Inode(_) -> 3
         LockId.Orphans -> 5
         LockId.Group(_) -> 6

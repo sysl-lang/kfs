@@ -2,8 +2,8 @@ module keel.kfs
 
 import sysl.buf.{Buf, buf}
 
-// Files (kfs/SPEC.md section 18): read; write and append in chunks; truncate both ways; fallocate's
-// preallocation and punch; fsync and fdatasync; delete. Over the inode layer (inode.sysl), the extent
+// Files (kfs/SPEC.md section 18): read; write and append in chunks; truncate both ways; setattr;
+// fallocate's preallocation and punch; fsync and fdatasync; delete. Over the inode layer (inode.sysl), the extent
 // tree (extent.sysl), the orphan list (orphan.sysl) and the journal.
 //
 // **Locks.** Every entry point takes the inode's lock (section 19) and holds it to the end, across every
@@ -285,6 +285,104 @@ private truncate_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, si
     r?
     if !remains then return Ok(())
     if listed then remove_steps(fs, ino, keep, LOGICAL_BLOCKS, C_TRUNCATE_STEP, "truncate", 0) else cut_from(fs, ino, keep, "truncate")
+
+// -- setattr ------------------------------------------------------------------------------------------
+
+// A time `setattr` sets: left as it is (`UTIME_OMIT`), now (`UTIME_NOW`), or a given time.
+enum TimeSet
+    Omit
+    Now
+    At(t: Time)
+
+// What `setattr` changes: every field that is present. `mode` is the permission bits (the type stays).
+struct SetAttr
+    mode: Option[u16]
+    uid: Option[u32]
+    gid: Option[u32]
+    size: Option[u64]
+    atime: TimeSet
+    mtime: TimeSet
+
+// A `SetAttr` that changes nothing, to fill in.
+no_change() -> SetAttr = SetAttr(None, None, None, None, TimeSet.Omit, TimeSet.Omit)
+
+// `chmod`, `chown`, `utimensat` and `truncate` on inode `ino` (section 18), for a caller of uid `uid`:
+// one transaction sets every field asked for, and `ctime` to now when anything is asked. A size goes
+// through truncate's rules: growing is in the same transaction; shrinking's first transaction carries the
+// other fields too, and its steps follow. A size on a directory is `IsDirectory`, on anything else that is
+// not a regular file `Invalid`; past 16 TiB `TooBig`; mode bits outside 0o7777 `Invalid`.
+setattr[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, a: SetAttr, uid: u32) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = setattr_locked(fs, ino, a, uid)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private setattr_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, a: SetAttr, uid: u32) -> Result[unit, FsError]
+    val node = read_inode(fs, ino)?
+    a.mode match
+        Some(m) -> if m & ~u16(0o7777) != 0 then return Err(FsError.Invalid)
+        None -> ()
+    var shrink = false
+    var grow = false
+    a.size match
+        Some(s) ->
+            val t = node.mode & S_IFMT
+            if t == S_IFDIR then return Err(FsError.IsDirectory)
+            if t != S_IFREG then return Err(FsError.Invalid)
+            if s > MAX_FILE_SIZE then return Err(FsError.TooBig)
+            shrink = s < node.size
+            grow = s > node.size
+        None -> ()
+    val times = a.atime match
+        TimeSet.Omit -> a.mtime match
+            TimeSet.Omit -> false
+            _ -> true
+        _ -> true
+    val anything = a.mode.is_some() || a.uid.is_some() || a.gid.is_some() || times || grow || shrink
+    if !anything then return Ok(())
+    val now = fs.plat.now()
+    if !shrink
+        var h = fs.start("setattr", C_SETATTR)
+        var r: Result[unit, FsError] = Ok(())
+        if grow then r = resize(fs, &h, ino, a.size.unwrap(), now)
+        if r.is_ok() then r = set_fields(fs, &h, ino, a, now)
+        fs.stop(&h)
+        return r
+    val size = a.size.unwrap()
+    val keep = blocks_for(size)
+    val remains = last_extent(fs, ino)? match
+        Some(e) -> e.logical + u64(e.len) > keep
+        None -> false
+    val listed = on_orphan_list(fs, ino)
+    var h = fs.start("setattr", C_INODE + C_SB)
+    var r = shrink_first(fs, &h, ino, size, now, remains && !listed)
+    if r.is_ok() then r = set_fields(fs, &h, ino, a, now)
+    fs.stop(&h)
+    r?
+    if !remains then return Ok(())
+    if listed then remove_steps(fs, ino, keep, LOGICAL_BLOCKS, C_TRUNCATE_STEP, "truncate", 0) else cut_from(fs, ino, keep, "truncate")
+
+// Every field but the size, and `ctime`.
+private set_fields[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, a: SetAttr, now: Time) -> Result[unit, FsError]
+    change_inode(fs, h, ino, (n) ->
+        a.mode match
+            Some(m) -> n.mode = (n.mode & S_IFMT) | m
+            None -> ()
+        a.uid match
+            Some(u) -> n.uid = u
+            None -> ()
+        a.gid match
+            Some(g) -> n.gid = g
+            None -> ()
+        a.atime match
+            TimeSet.Now -> set_atime(n, now)
+            TimeSet.At(t) -> set_atime(n, t)
+            TimeSet.Omit -> ()
+        a.mtime match
+            TimeSet.Now -> set_mtime(n, now)
+            TimeSet.At(t) -> set_mtime(n, t)
+            TimeSet.Omit -> ()
+        set_ctime(n, now))
 
 private resize[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, size: u64, now: Time) -> Result[unit, FsError]
     change_inode(fs, h, ino, (n) ->
