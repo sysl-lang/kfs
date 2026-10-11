@@ -1,0 +1,242 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+// Formats of several shapes, each checked against locations worked out here from section 4's rule rather
+// than through `Geometry`: two groups with the journal in the last, three and five groups, groups of 4096
+// and of 32768 blocks, and 65 groups, whose descriptor table takes a second block. A sparse device keeps
+// only the blocks written, so the large shapes cost a few hundred blocks of memory.
+
+import sysl.buf.{Buf, buf}
+
+// A block device that stores only the blocks written to it; the rest read as zero. Reads of `failing`
+// answer Io (0 is no such block: KFS never reads block 0).
+struct Sparse
+    count: u64
+    numbers: Buf[u64]
+    contents: Buf[u8]
+    failing: u64
+
+    // The slot block `b` was last written to, if any.
+    slot(*self, b: u64) -> Option[usize]
+        var i = self.numbers.len()
+        while i > 0
+            i -= 1
+            if self.numbers[i] == b then return Some(i)
+        None
+
+    written(self) -> usize = self.numbers.len()
+
+impl BlockDevice for Sparse
+    blocks(self) -> u64 = self.count
+
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
+        if out.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        if b >= self.count then return Err(DeviceError.OutOfRange)
+        if self.failing != 0 && b == self.failing then return Err(DeviceError.Io)
+        self.slot(b) match
+            Some(i) ->
+                for k in 0..<BLOCK_SIZE
+                    out[k] = self.contents[i * BLOCK_SIZE + k]
+            None ->
+                for k in 0..<BLOCK_SIZE
+                    out[k] = 0
+        Ok(())
+
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+        if data.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        if b >= self.count then return Err(DeviceError.OutOfRange)
+        self.slot(b) match
+            Some(i) ->
+                for k in 0..<BLOCK_SIZE
+                    self.contents[i * BLOCK_SIZE + k] = data[k]
+            None ->
+                self.numbers.push(b)
+                for k in 0..<BLOCK_SIZE
+                    self.contents.push(data[k])
+        Ok(())
+
+    flush(*self) -> Result[unit, DeviceError] = Ok(())
+
+sparse(count: u64) -> Sparse = Sparse(count, buf(), buf(), 0)
+
+private seeded(salt: u8) -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i) * 3 + salt)
+    e
+
+// Format a sparse device of `blocks` blocks under `o`, or fail the test.
+sparse_formatted(blocks: u64, o: Options) -> Sparse
+    var dev = sparse(blocks)
+    val e = seeded(5)
+    format(&dev, o, e.view(), 1_700_000_000) match
+        Ok(_) -> dev
+        Err(_) -> panic("the format was refused")
+
+block_of[D: BlockDevice](dev: *D, b: u64) -> Buf[u8]
+    var out = new_block()
+    assert(dev.read(b, out.view()).is_ok())
+    out
+
+private equal(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// Inodes of a few hundred per group and no more: `bytes_per_inode` large enough that every group has 16.
+const FEW_INODES: u32 = 1_073_741_824
+
+// Check everything a fresh format promises against numbers computed here: `groups` groups of `bpg` blocks
+// and `ipg` inodes, a journal of `journal` blocks, the filesystem ending at `end`.
+private check_shape(dev: *Sparse, groups: u32, bpg: u32, ipg: u32, journal: u32, end: u64)
+    val m = open(dev) match
+        Ok(m) -> m
+        Err(_) -> panic("the filesystem did not open")
+    val gdt = (groups + 63) / 64
+    assert_eq(m.sb.group_count, groups)
+    assert_eq(m.sb.blocks_per_group, bpg)
+    assert_eq(m.sb.inodes_per_group, ipg)
+    assert_eq(m.sb.journal_blocks, journal)
+    assert_eq(m.sb.max_transaction, journal / 4)
+    assert_eq(m.sb.blocks, end)
+    assert_eq(m.sb.gdt_blocks, gdt)
+    assert_eq(m.sb.inode_count, u64(groups) * u64(ipg))
+
+    // The journal: the start of group G / 2's data area.
+    val jg = groups / 2
+    val jcopy = jg == 0 || jg == 1 || jg == groups - 1
+    val jstart = 1 + u64(jg) * u64(bpg) + (if jcopy then 1 + u64(gdt) else 0) + 2 + u64(ipg / 16)
+    assert_eq(m.sb.journal_start, jstart)
+
+    var free_blocks: u64 = 0
+    var free_inodes: u64 = 0
+    for g in 0..<groups
+        val first = 1 + u64(g) * u64(bpg)
+        val copy = g == 0 || g == 1 || g == groups - 1
+        val copies: u64 = if copy then 1 + u64(gdt) else 0
+        val meta = copies + 2 + u64(ipg / 16)
+        val stop = if first + u64(bpg) > end then end else first + u64(bpg)
+        val len = stop - first
+        val d = m.desc(g)
+        assert_eq(d.block_bitmap, first + copies)
+        assert_eq(d.inode_bitmap, first + copies + 1)
+        assert_eq(d.inode_table, first + copies + 2)
+        assert_eq(d.flags, if copy then GROUP_COPY else 0)
+        assert_eq(d.directories, if g == 0 then u32(2) else u32(0))
+
+        // Block bitmap: metadata, journal, the root's leaf and everything past the end set; the rest clear.
+        val bb = block_of(dev, d.block_bitmap)
+        var clear: u32 = 0
+        for k in 0..<u64(BLOCK_SIZE * 8)
+            val b = first + k
+            val used = k < meta || k >= len || (b >= jstart && b < jstart + u64(journal)) || (g == 0 && k == meta)
+            assert_eq(bit_test(bb.view(), usize(k)), used)
+            if !used then clear += 1
+        assert_eq(d.free_blocks, clear)
+        assert_eq(d.block_bitmap_crc, bitmap_crc(m.seed, g, bb.view()))
+        free_blocks += u64(clear)
+
+        // Inode bitmap: 1-11 in group 0, and everything past the group's inodes.
+        val ib = block_of(dev, d.inode_bitmap)
+        var iclear: u32 = 0
+        for k in 0..<BLOCK_SIZE * 8
+            val used = k >= usize(ipg) || (g == 0 && k < 11)
+            assert_eq(bit_test(ib.view(), k), used)
+            if !used then iclear += 1
+        assert_eq(d.free_inodes, iclear)
+        assert_eq(d.inode_bitmap_crc, bitmap_crc(m.seed, g, ib.view()))
+        free_inodes += u64(iclear)
+
+        // The descriptor verifies against its own group number and not its neighbour's.
+        val table = block_of(dev, 2 + u64(g / 64))
+        val off = usize(g % 64) * 64
+        assert(verify_group_desc(m.seed, g, table.view()[off..<off + 64]))
+        assert(!verify_group_desc(m.seed, g + 1, table.view()[off..<off + 64]))
+
+        // Copy groups carry the superblock and every table block, byte for byte.
+        if copy && g != 0
+            assert(equal(block_of(dev, first).view(), block_of(dev, 1).view()))
+            for t in 0..<u64(gdt)
+                assert(equal(block_of(dev, first + 1 + t).view(), block_of(dev, 2 + t).view()))
+        if !copy
+            assert(le32(block_of(dev, first).view(), 0) != SUPER_MAGIC)
+    assert_eq(m.sb.free_blocks, free_blocks)
+    assert_eq(m.sb.free_inodes, free_inodes)
+    assert_eq(free_inodes, u64(groups) * u64(ipg) - 11)
+
+    // Entries past the last group in the last table block are zero.
+    val last_table = block_of(dev, 2 + u64(gdt - 1))
+    for i in usize(groups - (gdt - 1) * 64) * 64..<BLOCK_SIZE
+        assert_eq(last_table.view()[i], 0)
+
+    // Reserved inodes 1 and 3-10: zero, which is mode 0; the root and lost+found verify.
+    val itable = block_of(dev, m.desc(0).inode_table)
+    for i in 0..<256
+        assert_eq(itable.view()[i], 0)
+    for i in 512..<2560
+        assert_eq(itable.view()[i], 0)
+    assert(verify_inode(m.seed, 2, itable.view()[256..<512]))
+    assert(verify_inode(m.seed, 11, itable.view()[2560..<2816]))
+    // The root's one leaf is the first data block of group 0, owned by inode 2 at generation 1.
+    val leaf = block_of(dev, m.desc(0).inode_table + u64(ipg / 16))
+    assert(verify_owned_block(m.seed, leaf.view(), 2, 1))
+    // The journal superblock verifies and says the log is empty.
+    val jsb = block_of(dev, jstart)
+    assert(verify_sector(m.seed, jsb.view()))
+    assert_eq(le32(jsb.view(), 16), journal)
+    assert_eq(le32(jsb.view(), 24), 0)
+
+    // Nothing was written to block 0 or past the end.
+    for i in 0..<dev.written()
+        assert(dev.numbers[i] != 0)
+        assert(dev.numbers[i] < end)
+
+@test("two groups, the journal in the last: the smallest filesystem's every location, bit and copy")
+shape_two_groups()
+    var dev = sparse_formatted(3205, default_options())
+    check_shape(&dev, 2, 2048, 1024, 1024, 3205)
+
+@test("three groups: the journal in group 1, a copy group, and the last group's copies")
+shape_three_groups()
+    var dev = sparse_formatted(1 + 3 * 2048, default_options())
+    check_shape(&dev, 3, 2048, 1024, 1024, 1 + 3 * 2048)
+
+@test("five groups: the journal in group 2, which is no copy group")
+shape_five_groups()
+    var dev = sparse_formatted(1 + 5 * 2048, default_options())
+    check_shape(&dev, 5, 2048, 1024, 1024, 1 + 5 * 2048)
+
+@test("groups of 4096 with a last group of exactly its metadata and 64 data blocks")
+shape_groups_of_4096()
+    val end: u64 = 1 + 3 * 4096 + 132 + 64
+    var dev = sparse_formatted(end, Options(0, RESERVED_DEFAULT, 4096, 0))
+    check_shape(&dev, 4, 4096, 2048, 1024, end)
+
+@test("groups of 32768, the largest: two groups, the journal in the last with 64 data blocks besides it")
+shape_groups_of_32768()
+    val end: u64 = 1 + 32768 + 5 + 1024 + 64
+    var dev = sparse_formatted(end, Options(FEW_INODES, RESERVED_DEFAULT, 32768, 1024))
+    check_shape(&dev, 2, 32768, 16, 1024, end)
+    assert(geometry(end - 1, Options(FEW_INODES, RESERVED_DEFAULT, 32768, 1024)).is_err())
+
+@test("65 groups: the descriptor table is two blocks, group 64's descriptor opens the second, and every copy has both")
+shape_sixty_five_groups()
+    val end: u64 = 1 + 64 * 2048 + 6 + 64
+    val o = Options(FEW_INODES, RESERVED_DEFAULT, 2048, 1024)
+    var dev = sparse_formatted(end, o)
+    check_shape(&dev, 65, 2048, 16, 1024, end)
+    // One block fewer and the 65th group is dropped: 64 groups and one table block.
+    val g = geometry(end - 1, o) match
+        Ok(g) -> g
+        Err(_) -> panic("refused")
+    assert_eq(g.group_count, 64)
+    assert_eq(g.gdt_blocks, 1)
+    assert_eq(g.blocks, 1 + 64 * 2048)
+
+@test("64 groups exactly fill one table block, and its last entry is the 64th descriptor")
+shape_sixty_four_groups()
+    val end: u64 = 1 + 64 * 2048
+    var dev = sparse_formatted(end, Options(FEW_INODES, RESERVED_DEFAULT, 2048, 1024))
+    check_shape(&dev, 64, 2048, 16, 1024, end)

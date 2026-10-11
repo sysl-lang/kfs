@@ -119,6 +119,9 @@ private dump_leaf(leaf: []u8) -> string
         if len < 16 || at_off + len > TAIL_OFFSET
             s = s + s"    [offset ${at_off}] corrupt record length ${len}\n"
             break
+        if 12 + usize(rec.name_len) > len
+            s = s + s"    [offset ${at_off}] corrupt name length ${rec.name_len}\n"
+            break
         val name = str_cast(leaf[at_off + 12..<at_off + 12 + usize(rec.name_len)])
         val free = if rec.ino == 0 then " (free)" else ""
         s = s + s"    [offset ${at_off}] ino ${rec.ino} rec_len ${len} type ${dt_text(rec.file_type)} name '${name}'${free}\n"

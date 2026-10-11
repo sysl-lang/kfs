@@ -1,0 +1,225 @@
+module keel.kfshost
+@tests
+@requires(os)
+
+// The image-file device at its edges: the first and last block, one past the end, every wrong length,
+// which error each refusal answers, and an image that cannot be opened for writing, does not exist, shrank
+// under the device, or whose device was closed.
+
+import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
+import sysl.buf.{Buf, buf}
+import sysl.fs
+
+private filled(fill: u8, n: usize) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for _ in 0..<n
+        b.push(fill)
+    b
+
+private image(path: string, blocks: u64) -> FileDevice[fs.File]
+    create_image(path, blocks) match
+        Ok(d) -> d
+        Err(_) -> panic("could not create the image")
+
+private kind(r: Result[unit, DeviceError]) -> i64
+    r match
+        Ok(_) -> 0
+        Err(DeviceError.OutOfRange) -> 1
+        Err(DeviceError.BadLength) -> 2
+        Err(DeviceError.Io) -> 3
+
+private open_kind(r: Result[FileDevice[fs.File], DeviceError]) -> i64
+    r match
+        Ok(d) ->
+            var dev = d
+            dev.close()
+            0
+        Err(DeviceError.OutOfRange) -> 1
+        Err(DeviceError.BadLength) -> 2
+        Err(DeviceError.Io) -> 3
+
+@test("block 0 and the last block round-trip; one past the end is OutOfRange for a read and a write")
+filedev_first_last_and_past()
+    val path = "/tmp/keel-kfshost-edges.img"
+    var d = image(path, 4)
+    val a = filled(0x5A, BLOCK_SIZE)
+    val z = filled(0xA5, BLOCK_SIZE)
+    assert_eq(kind(d.write(0, a.view())), 0)
+    assert_eq(kind(d.write(3, z.view())), 0)
+    var out = filled(0, BLOCK_SIZE)
+    assert_eq(kind(d.read(0, out.view())), 0)
+    assert_eq(out.view()[0], 0x5A)
+    assert_eq(out.view()[BLOCK_SIZE - 1], 0x5A)
+    assert_eq(kind(d.read(3, out.view())), 0)
+    assert_eq(out.view()[0], 0xA5)
+    assert_eq(out.view()[BLOCK_SIZE - 1], 0xA5)
+    assert_eq(kind(d.read(2, out.view())), 0)
+    assert_eq(out.view()[0], 0)
+    assert_eq(kind(d.read(4, out.view())), 1)
+    assert_eq(kind(d.write(4, a.view())), 1)
+    assert_eq(kind(d.read(0xFFFF_FFFF_FFFF_FFFF, out.view())), 1)
+    assert_eq(kind(d.write(0xFFFF_FFFF_FFFF_FFFF, a.view())), 1)
+    assert(d.close())
+    // The refused write past the end did not grow the file.
+    var again = open_image(path) match
+        Ok(x) -> x
+        Err(_) -> panic("could not reopen")
+    assert_eq(again.blocks(), 4)
+    assert(again.close())
+    assert(fs.remove_file(path).is_ok())
+
+@test("an empty, a one-short and a one-long buffer are BadLength, before the range is looked at")
+filedev_bad_lengths()
+    val path = "/tmp/keel-kfshost-lengths.img"
+    var d = image(path, 2)
+    var big = filled(1, BLOCK_SIZE + 1)
+    for n in [0, 1, BLOCK_SIZE - 1, BLOCK_SIZE + 1]
+        val len = usize(n)
+        assert_eq(kind(d.read(0, big.view()[0..<len])), 2)
+        assert_eq(kind(d.write(0, big.view()[0..<len])), 2)
+        assert_eq(kind(d.write(7, big.view()[0..<len])), 2)
+    var out = filled(9, BLOCK_SIZE)
+    assert_eq(kind(d.read(0, out.view())), 0)
+    assert_eq(out.view()[0], 0)
+    assert(d.close())
+    assert(fs.remove_file(path).is_ok())
+
+@test("an image that cannot be opened for writing is Io: read-only, missing, in a missing directory, or a directory")
+filedev_unopenable_images()
+    val path = "/tmp/keel-kfshost-readonly.img"
+    var d = image(path, 2)
+    assert(d.close())
+    assert(fs.set_permissions(path, 0o444).is_ok())
+    assert_eq(open_kind(open_image(path)), 3)
+    assert(fs.set_permissions(path, 0o644).is_ok())
+    assert_eq(open_kind(open_image(path)), 0)
+    assert(fs.remove_file(path).is_ok())
+    assert_eq(open_kind(open_image("/tmp/keel-kfshost-not-there.img")), 3)
+    assert_eq(open_kind(open_image("/tmp/keel-kfshost-no-such-dir/x.img")), 3)
+    assert_eq(open_kind(open_image("/tmp")), 3)
+    create_image("/tmp/keel-kfshost-no-such-dir/x.img", 2) match
+        Ok(_) -> panic("an image was made in a missing directory")
+        Err(e) -> assert(e == DeviceError.Io)
+
+@test("an image of 4097 bytes is BadLength; an empty image opens with no blocks and refuses every block")
+filedev_odd_and_empty_images()
+    val odd = "/tmp/keel-kfshost-4097.img"
+    assert(fs.write_bytes(odd, filled(0, BLOCK_SIZE + 1).view()).is_ok())
+    assert_eq(open_kind(open_image(odd)), 2)
+    assert(fs.remove_file(odd).is_ok())
+    val empty = "/tmp/keel-kfshost-empty.img"
+    var none: Buf[u8] = buf()
+    assert(fs.write_bytes(empty, none.view()).is_ok())
+    var d = open_image(empty) match
+        Ok(x) -> x
+        Err(_) -> panic("an empty image did not open")
+    assert_eq(d.blocks(), 0)
+    var out = filled(0, BLOCK_SIZE)
+    assert_eq(kind(d.read(0, out.view())), 1)
+    assert(d.close())
+    assert(fs.remove_file(empty).is_ok())
+
+@test("a file shorter than the device declares: a read past its end is Io, and a write there grows it back")
+filedev_file_shrank()
+    val path = "/tmp/keel-kfshost-shrank.img"
+    var d = image(path, 8)
+    val data = filled(0x77, BLOCK_SIZE)
+    assert_eq(kind(d.write(4, data.view())), 0)
+    // Another handle cuts the file to five blocks while the device still says eight.
+    var other = fs.open_update(path) match
+        Ok(f) -> f
+        Err(_) -> panic("could not open the image again")
+    assert(other.truncate(5 * 4096).is_ok())
+    assert(other.close().is_ok())
+    var out = filled(0, BLOCK_SIZE)
+    assert_eq(kind(d.read(4, out.view())), 0)
+    assert_eq(out.view()[0], 0x77)
+    assert_eq(kind(d.read(5, out.view())), 3)
+    assert_eq(kind(d.read(7, out.view())), 3)
+    assert_eq(kind(d.write(7, data.view())), 0)
+    assert_eq(kind(d.read(7, out.view())), 0)
+    assert_eq(out.view()[BLOCK_SIZE - 1], 0x77)
+    assert(d.close())
+    assert(fs.remove_file(path).is_ok())
+
+@test("a closed device answers Io for a read, a write and a flush, and writes nothing")
+filedev_closed_device()
+    val path = "/tmp/keel-kfshost-closed.img"
+    var d = image(path, 2)
+    assert(d.close())
+    var out = filled(0, BLOCK_SIZE)
+    val data = filled(0x33, BLOCK_SIZE)
+    assert_eq(kind(d.read(0, out.view())), 3)
+    assert_eq(kind(d.write(1, data.view())), 3)
+    assert_eq(kind(d.flush()), 3)
+    // Closing twice is harmless.
+    assert(d.close())
+    val bytes = fs.read_bytes(path) match
+        Ok(b) -> b
+        Err(_) -> panic("could not read the image")
+    assert_eq(bytes.len, 2 * BLOCK_SIZE)
+    for x in bytes
+        assert_eq(x, 0)
+    assert(fs.remove_file(path).is_ok())
+
+@test("creating an image over an existing file empties it to the size asked")
+filedev_create_replaces()
+    val path = "/tmp/keel-kfshost-replace.img"
+    assert(fs.write_bytes(path, filled(0xEE, 3 * BLOCK_SIZE + 7).view()).is_ok())
+    var d = image(path, 2)
+    assert_eq(d.blocks(), 2)
+    var out = filled(1, BLOCK_SIZE)
+    assert_eq(kind(d.read(1, out.view())), 0)
+    for x in out.view()
+        assert_eq(x, 0)
+    assert(d.close())
+    var again = open_image(path) match
+        Ok(x) -> x
+        Err(_) -> panic("could not reopen")
+    assert_eq(again.blocks(), 2)
+    assert(again.close())
+    assert(fs.remove_file(path).is_ok())
+
+// A file that records a failed write or read as `fs.File` does -- it answers the call normally and says so
+// afterwards through `broken` -- and whose flush succeeds.
+private struct FailingFile
+    private bad_writes: bool
+    private bad_reads: bool
+    private failed_now: bool
+
+impl ImageFile for FailingFile
+    seek_to(*self, to: long) -> bool = true
+    fill(*self, out: []u8) -> usize
+        if self.bad_reads then self.failed_now = true
+        out.len
+    put(*self, data: []const u8)
+        if self.bad_writes then self.failed_now = true
+    sync(*self) -> bool = true
+    broken(*self) -> bool = self.failed_now
+    release(*self) -> bool = true
+
+@test("a write the file records as failed is an Io error, though the flush succeeds")
+filedev_failed_write_is_io()
+    var d = device_over(FailingFile(true, false, false), 4)
+    val data = filled(7, BLOCK_SIZE)
+    assert_eq(kind(d.write(1, data.view())), 3)
+
+@test("a read the file records as failed is an Io error")
+filedev_failed_read_is_io()
+    var d = device_over(FailingFile(false, true, false), 4)
+    var out = filled(0, BLOCK_SIZE)
+    assert_eq(kind(d.read(1, out.view())), 3)
+
+@test("a file that has failed makes the next flush an Io error")
+filedev_failed_flush_is_io()
+    var d = device_over(FailingFile(false, false, true), 4)
+    assert_eq(kind(d.flush()), 3)
+
+@test("a healthy file's write, read and flush are all Ok through the same seam")
+filedev_healthy_seam_ok()
+    var d = device_over(FailingFile(false, false, false), 4)
+    val data = filled(7, BLOCK_SIZE)
+    var out = filled(0, BLOCK_SIZE)
+    assert_eq(kind(d.write(1, data.view())), 0)
+    assert_eq(kind(d.read(1, out.view())), 0)
+    assert_eq(kind(d.flush()), 0)

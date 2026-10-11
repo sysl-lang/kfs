@@ -1,0 +1,159 @@
+module keel.kfshost
+@tests
+@requires(os)
+
+// mkfs.kfs and kfsdump at their edges: every option at zero, at its largest and one past, numbers that are
+// not numbers, a refusal that must leave an existing file alone, and a dump of a damaged leaf.
+
+import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice}
+import sysl.buf.{Buf, buf}
+import sysl.fs
+import sysl.text.Search
+
+private seed_bytes() -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i) * 7 + 3)
+    e
+
+private mkfs_ok(args: []string) -> string
+    val e = seed_bytes()
+    run_mkfs(args, e.view(), 1_700_000_000) match
+        Ok(text) -> text
+        Err(why) -> panic(s"mkfs.kfs failed: ${why}")
+
+private mkfs_err(args: []string) -> string
+    val e = seed_bytes()
+    run_mkfs(args, e.view(), 1_700_000_000) match
+        Ok(_) -> panic("mkfs.kfs succeeded")
+        Err(why) -> why
+
+@test("mkfs.kfs refuses -i 0, -g 0 and -j 0 with the option's own reason; -m 0 is a reserve of nothing")
+mkfs_zero_options()
+    val path = "/tmp/keel-kfshost-zero.img"
+    assert(mkfs_err([path, "8192", "-i", "0"]).contains("bytes per inode must be at least 4096"))
+    assert(mkfs_err([path, "8192", "-g", "0"]).contains("power of two from 2048 to 32768"))
+    assert(mkfs_err([path, "8192", "-j", "0"]).contains("the journal must be 1024 to 16384 blocks"))
+    assert(!fs.exists(path))
+    assert(mkfs_ok([path, "8192", "-m", "0"]).contains("8192 blocks"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("each option at its least and its greatest accepted value, and one past each")
+mkfs_option_bounds()
+    val path = "/tmp/keel-kfshost-bounds.img"
+    assert(mkfs_ok([path, "8192", "-i", "4096"]).contains("2048 inodes each"))
+    assert(mkfs_err([path, "8192", "-i", "4095"]).contains("at least 4096"))
+    assert(mkfs_ok([path, "8192", "-i", "4294967294"]).contains("16 inodes each"))
+    assert(mkfs_err([path, "8192", "-i", "4294967295"]).contains("4294967295 is too large for -i"))
+    assert(mkfs_ok([path, "8192", "-m", "100"]).contains("8192 blocks"))
+    assert(mkfs_err([path, "8192", "-m", "101"]).contains("at most 100"))
+    assert(mkfs_err([path, "8192", "-m", "4294967295"]).contains("too large for -m"))
+    assert(mkfs_ok([path, "8192", "-g", "2048"]).contains("groups of 2048 blocks"))
+    assert(mkfs_err([path, "8192", "-g", "2047"]).contains("power of two"))
+    assert(mkfs_err([path, "8192", "-g", "65536"]).contains("power of two"))
+    assert(mkfs_err([path, "8192", "-g", "32769"]).contains("power of two"))
+    assert(mkfs_ok([path, "8192", "-j", "1024"]).contains("journal 1024 blocks"))
+    assert(mkfs_err([path, "8192", "-j", "1023"]).contains("1024 to 16384"))
+    assert(mkfs_err([path, "8192", "-j", "16385"]).contains("1024 to 16384"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("mkfs.kfs at the largest group size and journal: -g 32768 -j 16384 on two groups of 32768")
+mkfs_largest_group_and_journal()
+    val path = "/tmp/keel-kfshost-largest.img"
+    val text = mkfs_ok([path, "65537", "-g", "32768", "-j", "16384", "-i", "1073741824"])
+    assert(text.contains("65537 blocks, 2 groups of 32768 blocks, 16 inodes each, journal 16384 blocks at 32774"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("block counts that are not numbers are refused: negative, fractional, hexadecimal, empty, 19 digits")
+mkfs_bad_numbers()
+    val path = "/tmp/keel-kfshost-numbers.img"
+    for bad in ["-5", "8192.0", "0x2000", "", "1234567890123456789", "8 192"]
+        assert(mkfs_err([path, bad]).contains("is not a number of blocks"))
+    assert(mkfs_err([path, "8192", "-i", "-1"]).contains("is not a number"))
+    assert(mkfs_err([path, "8192", "-g"]).contains("-g needs a number"))
+    assert(mkfs_err([path, "8192", "-j"]).contains("-j needs a number"))
+    assert(mkfs_err([path, "8192", "-m"]).contains("-m needs a number"))
+    assert(mkfs_err([path, "8192", "i", "4096"]).contains("unknown option 'i'"))
+    assert(mkfs_err([]).contains("usage: mkfs.kfs"))
+    assert(!fs.exists(path))
+
+@test("a refused size leaves an existing file exactly as it was, and creates no file where there was none")
+mkfs_refusal_leaves_file_alone()
+    val path = "/tmp/keel-kfshost-keep.img"
+    var keep: Buf[u8] = buf()
+    for i in 0..<100
+        keep.push(u8(i))
+    assert(fs.write_bytes(path, keep.view()).is_ok())
+    assert(mkfs_err([path, "3204"]).contains("fewer than two groups"))
+    assert(mkfs_err([path, "0"]).contains("fewer than two groups"))
+    assert(mkfs_err([path, "8192", "-j", "4096"]).contains("journal does not fit"))
+    val after = fs.read_bytes(path) match
+        Ok(b) -> b
+        Err(_) -> panic("the file is gone")
+    assert_eq(after.len, 100)
+    for i in 0..<100
+        assert_eq(after[i], u8(i))
+    assert(fs.remove_file(path).is_ok())
+    assert(mkfs_err([path, "100"]).contains("fewer than two groups"))
+    assert(!fs.exists(path))
+
+@test("a size too large for any descriptor table is refused before an image is made")
+mkfs_too_large()
+    val path = "/tmp/keel-kfshost-huge.img"
+    assert(mkfs_err([path, "999999999999999999"]).contains("too large"))
+    // 2,027,329 groups of 32768: one more than a copy group's table leaves room for.
+    assert(mkfs_err([path, "66431516673"]).contains("too large"))
+    assert(!fs.exists(path))
+
+@test("the smallest filesystem through mkfs.kfs: 3205 blocks, two groups, the journal at the start of group 1's data")
+mkfs_smallest()
+    val path = "/tmp/keel-kfshost-smallest.img"
+    assert(mkfs_ok([path, "3205"]).contains("3205 blocks, 2 groups of 2048 blocks, 1024 inodes each, journal 1024 blocks at 2117"))
+    assert(fs.remove_file(path).is_ok())
+
+private dump_ok(args: []string) -> string
+    run_dump(args) match
+        Ok(text) -> text
+        Err(why) -> panic(s"kfsdump failed: ${why}")
+
+@test("kfsdump of inodes at the edges: 1 is reserved and zero, 4096 is the last, 4097 does not exist")
+dump_inode_edges()
+    val path = "/tmp/keel-kfshost-dump-edges.img"
+    mkfs_ok([path, "8192"])
+    val one = dump_ok([path, "inode", "1"])
+    assert(one.contains("inode 1: block 5 offset 0  checksum BAD"))
+    assert(one.contains("mode        0o0 "))
+    val last = dump_ok([path, "inode", "4096"])
+    assert(last.contains("inode 4096: block "))
+    assert(last.contains("offset 3840"))
+    run_dump([path, "inode", "4097"]) match
+        Ok(_) -> panic("inode 4097 was dumped")
+        Err(why) -> assert(why.contains("inode 4097 does not exist (1 ..= 4096)"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("kfsdump of a leaf whose last record claims a name longer than the record reports it, rather than reading past the block")
+dump_corrupt_leaf()
+    val path = "/tmp/keel-kfshost-dump-leaf.img"
+    mkfs_ok([path, "8192"])
+    var d = open_image(path) match
+        Ok(x) -> x
+        Err(_) -> panic("no image")
+    // The root's leaf is block 69. Shorten its one record to end at 4064 and put a 16-byte record there
+    // whose name is 255 bytes long.
+    var leaf: Buf[u8] = buf()
+    for _ in 0..<BLOCK_SIZE
+        leaf.push(0)
+    assert(d.read(69, leaf.view()).is_ok())
+    leaf.view()[16] = u8(4056 & 0xFF)
+    leaf.view()[17] = u8(4056 >> 8)
+    leaf.view()[4064] = 12
+    leaf.view()[4072] = 16
+    leaf.view()[4074] = 255
+    leaf.view()[4075] = 8
+    assert(d.write(69, leaf.view()).is_ok())
+    assert(d.close())
+    val text = dump_ok([path, "inode", "2"])
+    assert(text.contains("checksum and owner BAD"))
+    assert(text.contains("[offset 8] ino 11 rec_len 4056 type dir name 'lost+found'"))
+    assert(text.contains("[offset 4064] corrupt name length 255"))
+    assert(fs.remove_file(path).is_ok())

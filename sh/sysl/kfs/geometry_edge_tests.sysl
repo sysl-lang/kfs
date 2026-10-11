@@ -1,0 +1,148 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+// Geometry at its edges: each option at its minimum, its maximum and one past each; the inode count at the
+// multiple-of-16 rounding; the default journal at its clamps; the last group around the 64th group, where
+// its metadata grows by a table block; and sizes too large for any descriptor table.
+
+private why(r: Result[Geometry, GeometryError]) -> i64
+    r match
+        Ok(_) -> 0
+        Err(GeometryError.TooSmall) -> 1
+        Err(GeometryError.JournalDoesNotFit) -> 2
+        Err(GeometryError.BadBlocksPerGroup) -> 3
+        Err(GeometryError.BadBytesPerInode) -> 4
+        Err(GeometryError.BadReservedPercent) -> 5
+        Err(GeometryError.BadJournalBlocks) -> 6
+        Err(GeometryError.TooLarge) -> 7
+
+private shape(blocks: u64, o: Options) -> Geometry
+    geometry(blocks, o) match
+        Ok(g) -> g
+        Err(_) -> panic("the geometry was refused")
+
+private inodes(n: u32) -> Options = Options(n, RESERVED_DEFAULT, 0, 0)
+private percent(n: u32) -> Options = Options(0, n, 0, 0)
+private group_size(n: u32) -> Options = Options(0, RESERVED_DEFAULT, n, 0)
+private journal_of(n: u32) -> Options = Options(0, RESERVED_DEFAULT, 0, n)
+
+@test("-i: 4096 is the least accepted and 4095 refused; the largest u32 is accepted and gives the 16-inode minimum")
+geometry_bytes_per_inode_bounds()
+    assert_eq(shape(8192, inodes(4096)).inodes_per_group, 2048)
+    assert_eq(why(geometry(8192, inodes(4095))), 4)
+    assert_eq(why(geometry(8192, inodes(1))), 4)
+    assert_eq(shape(8192, inodes(0xFFFF_FFFF)).inodes_per_group, 16)
+    // 0 is "choose": the default 8192.
+    assert_eq(shape(8192, inodes(0)).inodes_per_group, 1024)
+
+@test("-m: 0 and 100 are accepted, 101 and the largest value short of 'default' are refused")
+geometry_reserved_percent_bounds()
+    assert_eq(shape(8192, percent(0)).reserved_blocks, 0)
+    val all = shape(8192, percent(100))
+    var data: u64 = 0
+    for g in 0..<all.group_count
+        data += u64(all.data_blocks(g))
+    assert_eq(all.reserved_blocks, data - u64(all.journal_blocks))
+    assert_eq(why(geometry(8192, percent(101))), 5)
+    assert_eq(why(geometry(8192, percent(0xFFFF_FFFE))), 5)
+    // 1% rounds down.
+    assert_eq(shape(8192, percent(1)).reserved_blocks, (data - u64(all.journal_blocks)) / 100)
+
+@test("-g: 2048 and 32768 are accepted; 2047, 1024, 32769, 65536 and a non-power of two in range are refused")
+geometry_blocks_per_group_bounds()
+    assert_eq(shape(8192, group_size(2048)).blocks_per_group, 2048)
+    assert_eq(shape(1 + 2 * 32768, group_size(32768)).blocks_per_group, 32768)
+    val bads: [7]u32 = [2047, 1024, 32769, 65536, 3072, 0x8000_0000, 0xFFFF_FFFF]
+    for bad in bads
+        assert_eq(why(geometry(8192, group_size(bad))), 3)
+
+@test("-j: 1024 and 16384 are accepted where they fit; 1023 and 16385 are refused")
+geometry_journal_bounds()
+    assert_eq(shape(8192, journal_of(1024)).journal_blocks, 1024)
+    assert_eq(why(geometry(8192, journal_of(1023))), 6)
+    val big = shape(1 + 2 * 32768, Options(0, RESERVED_DEFAULT, 32768, 16384))
+    assert_eq(big.journal_blocks, 16384)
+    assert_eq(big.journal_start, big.data_start(1))
+    assert_eq(why(geometry(1 + 2 * 32768, Options(0, RESERVED_DEFAULT, 32768, 16385))), 6)
+
+@test("the default journal is blocks / 64 clamped to 1024 ... 16384, at each clamp and one past")
+geometry_default_journal_clamps()
+    assert_eq(default_journal_blocks(0), 1024)
+    assert_eq(default_journal_blocks(64 * 1024), 1024)
+    assert_eq(default_journal_blocks(64 * 1024 + 63), 1024)
+    assert_eq(default_journal_blocks(64 * 1025), 1025)
+    assert_eq(default_journal_blocks(64 * 16383), 16383)
+    assert_eq(default_journal_blocks(64 * 16384), 16384)
+    assert_eq(default_journal_blocks(64 * 16385), 16384)
+    assert_eq(default_journal_blocks(0xFFFF_FFFF_FFFF_FFFF), 16384)
+
+@test("inodes per group round down to a multiple of 16: 8192 bytes each gives 1024, 8193 gives 1008")
+geometry_inode_rounding()
+    assert_eq(shape(8192, inodes(8192)).inodes_per_group, 1024)
+    assert_eq(shape(8192, inodes(8193)).inodes_per_group, 1008)
+    // 2048 * 4096 / 524288 = 16 exactly; one byte more gives 15, which is raised to the 16 minimum.
+    assert_eq(shape(8192, inodes(524288)).inodes_per_group, 16)
+    assert_eq(shape(8192, inodes(524289)).inodes_per_group, 16)
+    // 2048 * 4096 / 262144 = 32; one more byte gives 31, rounded down to 16.
+    assert_eq(shape(8192, inodes(262144)).inodes_per_group, 32)
+    assert_eq(shape(8192, inodes(262145)).inodes_per_group, 16)
+    // Groups of 32768 at 4096 bytes an inode reach the 32768 maximum exactly.
+    assert_eq(shape(1 + 4 * 32768, Options(4096, RESERVED_DEFAULT, 32768, 0)).inodes_per_group, 32768)
+
+@test("the journal's group is G / 2: group 1 of 2 and of 3, group 2 of 4 and of 5")
+geometry_journal_group()
+    assert_eq(shape(3205, default_options()).journal_group(), 1)
+    val three = shape(1 + 3 * 2048, default_options())
+    assert_eq(three.group_count, 3)
+    assert_eq(three.journal_group(), 1)
+    assert_eq(three.journal_start, 1 + 2048 + 68)
+    val five = shape(1 + 5 * 2048, default_options())
+    assert_eq(five.group_count, 5)
+    assert_eq(five.journal_group(), 2)
+    assert_eq(five.journal_start, 1 + 2 * 2048 + 66)
+
+@test("the 65th group's metadata is a table block larger: kept at 70 blocks, dropped at 69")
+geometry_last_group_at_the_table_boundary()
+    val o = Options(1_073_741_824, RESERVED_DEFAULT, 2048, 1024)
+    val kept = shape(1 + 64 * 2048 + 70, o)
+    assert_eq(kept.group_count, 65)
+    assert_eq(kept.gdt_blocks, 2)
+    assert_eq(kept.meta_blocks(64), 6)
+    assert_eq(kept.meta_blocks(0), 6)
+    assert_eq(kept.meta_blocks(2), 3)
+    assert_eq(kept.data_blocks(64), 64)
+    val dropped = shape(1 + 64 * 2048 + 69, o)
+    assert_eq(dropped.group_count, 64)
+    assert_eq(dropped.gdt_blocks, 1)
+    assert_eq(dropped.blocks, 1 + 64 * 2048)
+
+@test("a last group of exactly 63 and 64 data blocks with groups of 4096")
+geometry_last_group_rule_4096()
+    val o = Options(0, RESERVED_DEFAULT, 4096, 0)
+    assert_eq(shape(1 + 3 * 4096 + 132 + 64, o).group_count, 4)
+    assert_eq(shape(1 + 3 * 4096 + 132 + 63, o).group_count, 3)
+    assert_eq(shape(1 + 3 * 4096 + 132 + 63, o).blocks, 1 + 3 * 4096)
+
+@test("a size whose descriptor table would crowd out a copy group's data area is refused as too large")
+geometry_too_large()
+    // Groups of 32768 with 16384 inodes: a copy group is 1 + table + 2 + 1024 metadata blocks, and keeps
+    // 64 data blocks while the table is at most 31,677 blocks, which is 2,027,328 groups.
+    val most: u64 = 2_027_328
+    val g = shape(1 + most * 32768, default_options())
+    assert_eq(g.group_count, u32(most))
+    assert_eq(g.gdt_blocks, 31677)
+    assert_eq(g.data_blocks(0), 64)
+    assert_eq(why(geometry(1 + (most + 1) * 32768, default_options())), 7)
+    // Far past it, and past 2^32 groups of any size, the count is refused, never wrapped.
+    assert_eq(why(geometry(1 + 0x1_0000_0001 * 32768, default_options())), 7)
+    assert_eq(why(geometry(0xFFFF_FFFF_FFFF_FFFF, default_options())), 7)
+    assert_eq(why(geometry(0xFFFF_FFFF_FFFF_FFFF, group_size(2048))), 7)
+
+@test("every refusal is checked before the size: a bad option on a too-small device names the option")
+geometry_option_refusals_come_first()
+    assert_eq(why(geometry(10, inodes(100))), 4)
+    assert_eq(why(geometry(10, percent(200))), 5)
+    assert_eq(why(geometry(10, journal_of(5))), 6)
+    assert_eq(why(geometry(10, group_size(5))), 3)
+    assert_eq(why(geometry(10, default_options())), 1)

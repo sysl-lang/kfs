@@ -1,0 +1,327 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+// `open` refusing one corruption at a time, each written into an otherwise good image and resealed so that
+// only the check under test can catch it; and `find_backup` over every allowed group size, with group 1's
+// copy lost, with every copy lost, and with a sealed superblock where no copy belongs.
+
+private failure(r: Result[Mounted, OpenError]) -> i64
+    r match
+        Ok(_) -> 0
+        Err(OpenError.Device(_)) -> 9
+        Err(OpenError.BadChecksum) -> 1
+        Err(OpenError.BadMagic) -> 2
+        Err(OpenError.BadVersion) -> 3
+        Err(OpenError.BadGeometry) -> 4
+        Err(OpenError.BadDescriptor(g)) -> 100 + i64(g)
+        Err(OpenError.MisplacedGroup(g)) -> 200 + i64(g)
+
+// The 32 MiB worked example: four groups of 2048, 1024 inodes each.
+private example() -> Sparse = sparse_formatted(8192, default_options())
+
+// Open `dev` after `change` has rewritten its primary superblock and resealed it; then put the good one back.
+private with_superblock(dev: *Sparse, change: &Fn(*Superblock) -> unit) -> i64
+    val good = block_of(dev, 1)
+    var bad = copy_of(good.view())
+    change(at[Superblock](bad.view(), 0))
+    seal_superblock(bad.view())
+    assert(dev.write(1, bad.view()).is_ok())
+    val answer = failure(open(dev))
+    assert(dev.write(1, good.view()).is_ok())
+    answer
+
+@test("the untouched example opens; a flipped bit anywhere in the first 512 bytes, the crc included, fails the checksum")
+open_checksum_refusals()
+    var dev = example()
+    assert_eq(failure(open(&dev)), 0)
+    val good = block_of(&dev, 1)
+    for i in [0, 100, 507, 508, 511]
+        var bad = copy_of(good.view())
+        bad.view()[usize(i)] ^= 0x10
+        assert(dev.write(1, bad.view()).is_ok())
+        assert_eq(failure(open(&dev)), 1)
+    // Past the sector, nothing is checked.
+    var tail = copy_of(good.view())
+    tail.view()[512] ^= 0x10
+    tail.view()[4095] ^= 0x10
+    assert(dev.write(1, tail.view()).is_ok())
+    assert_eq(failure(open(&dev)), 0)
+
+@test("a sealed superblock with the wrong magic is BadMagic; wrong version, block size, inode size or algorithm is BadVersion")
+open_identity_refusals()
+    var dev = example()
+    assert_eq(with_superblock(&dev, (sb) -> sb.magic = JOURNAL_MAGIC), 2)
+    assert_eq(with_superblock(&dev, (sb) -> sb.magic = 0), 2)
+    assert_eq(with_superblock(&dev, (sb) -> sb.version = 0), 3)
+    assert_eq(with_superblock(&dev, (sb) -> sb.version = 2), 3)
+    assert_eq(with_superblock(&dev, (sb) -> sb.block_size = 8192), 3)
+    assert_eq(with_superblock(&dev, (sb) -> sb.block_size = 512), 3)
+    assert_eq(with_superblock(&dev, (sb) -> sb.inode_size = 128), 3)
+    assert_eq(with_superblock(&dev, (sb) -> sb.hash_algorithm = 2), 3)
+    assert_eq(with_superblock(&dev, (sb) -> sb.hash_algorithm = 0), 3)
+    assert_eq(with_superblock(&dev, (sb) -> sb.csum_algorithm = 0), 3)
+    assert_eq(with_superblock(&dev, (sb) -> sb.csum_algorithm = 2), 3)
+    assert_eq(failure(open(&dev)), 0)
+
+@test("a sealed superblock whose group size or inode count per group is out of range or misshapen is BadGeometry")
+open_group_shape_refusals()
+    var dev = example()
+    for bad in [0, 1024, 2047, 3072, 4095, 65536]
+        assert_eq(with_superblock(&dev, (sb) -> sb.blocks_per_group = u32(bad)), 4)
+    for bad in [0, 8, 1000, 1025, 32784]
+        assert_eq(with_superblock(&dev, (sb) -> sb.inodes_per_group = u32(bad)), 4)
+
+@test("a sealed superblock whose counts disagree is BadGeometry: groups, table size, inode count, root, first inode")
+open_count_refusals()
+    var dev = example()
+    assert_eq(with_superblock(&dev, (sb) -> sb.group_count = 0), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.group_count = 1), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.group_count = 3), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.gdt_blocks = 0), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.gdt_blocks = 2), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.inode_count = 4095), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.inode_count = 4097), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.root_ino = 1), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.root_ino = 11), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.first_ino = 10), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.first_ino = 12), 4)
+
+@test("blocks past the last group's end, short of reaching the last group, or past the device are BadGeometry")
+open_extent_refusals()
+    var dev = example()
+    // Four groups of 2048 end at most at 8193, and the fourth group begins at 6145.
+    assert_eq(with_superblock(&dev, (sb) -> sb.blocks = 1 + 3 * 2048), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.blocks = 8193), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.blocks = 0), 4)
+    // The last group: 68 metadata blocks and 64 data blocks are the least it may be.
+    assert_eq(with_superblock(&dev, (sb) -> sb.blocks = 1 + 3 * 2048 + 68 + 63), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.blocks = 1 + 3 * 2048 + 1), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.blocks = 1 + 3 * 2048 + 68 + 64), 0)
+    // A filesystem larger than its device.
+    var small = sparse(8191)
+    assert(small.write(1, block_of(&dev, 1).view()).is_ok())
+    assert_eq(failure(open(&small)), 4)
+
+@test("an inode table larger than its group is BadGeometry, not a data area that wraps around")
+open_oversized_inode_table()
+    var dev = example()
+    // 32768 inodes is a 2048-block table: more than a group of 2048 holds. The journal is put where the
+    // arithmetic would put it, 2050 blocks into group 2, so only the shape check is left to refuse it.
+    assert_eq(with_superblock(&dev, (sb) ->
+        sb.inodes_per_group = 32768
+        sb.inode_count = 4 * 32768
+        sb.journal_start = 1 + 2 * 2048 + 2050), 4)
+    // 30720 inodes is 1920 blocks: a copy group's metadata of 1924 leaves 124 blocks, but the journal's
+    // group (a full one, with 1922) cannot hold the 1024-block journal.
+    assert_eq(with_superblock(&dev, (sb) ->
+        sb.inodes_per_group = 30720
+        sb.inode_count = 4 * 30720), 4)
+
+@test("two groups whose last is too short for the journal and 64 more blocks is BadGeometry")
+open_short_journal_group()
+    var dev = sparse_formatted(3205, default_options())
+    assert_eq(failure(open(&dev)), 0)
+    assert_eq(with_superblock(&dev, (sb) -> sb.blocks = 3204), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.blocks = 2049 + 100), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.blocks = 2050), 4)
+
+@test("a journal out of place, too large for its group, too small, or with the wrong transaction limit is BadGeometry")
+open_journal_refusals()
+    var dev = example()
+    assert_eq(with_superblock(&dev, (sb) -> sb.journal_start = sb.journal_start - 1), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.journal_start = 1 + 2048 + 68), 4)
+    assert_eq(with_superblock(&dev, (sb) ->
+        sb.journal_blocks = 2048 - 66 + 1
+        sb.max_transaction = (2048 - 66 + 1) / 4), 4)
+    assert_eq(with_superblock(&dev, (sb) ->
+        sb.journal_blocks = 2048 - 66
+        sb.max_transaction = (2048 - 66) / 4), 0)
+    assert_eq(with_superblock(&dev, (sb) ->
+        sb.journal_blocks = 1
+        sb.max_transaction = 0), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.max_transaction = 255), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.max_transaction = 257), 4)
+
+@test("a csum_seed that is not C(all ones, uuid) is BadGeometry, and so is a uuid changed under it")
+open_seed_refusals()
+    var dev = example()
+    assert_eq(with_superblock(&dev, (sb) -> sb.csum_seed = sb.csum_seed ^ 1), 4)
+    assert_eq(with_superblock(&dev, (sb) -> sb.uuid[15] = sb.uuid[15] ^ 1), 4)
+
+// Rewrite descriptor `g` of a sparse image through `change` and reseal it under its own group number.
+private with_descriptor(dev: *Sparse, g: u32, change: &Fn(*GroupDesc) -> unit) -> i64
+    val seed = le32(block_of(dev, 1).view(), 224)
+    val tb = 2 + u64(g / 64)
+    val good = block_of(dev, tb)
+    var bad = copy_of(good.view())
+    val off = usize(g % 64) * 64
+    change(at[GroupDesc](bad.view(), off))
+    seal_group_desc(seed, g, bad.view()[off..<off + 64])
+    assert(dev.write(tb, bad.view()).is_ok())
+    val answer = failure(open(dev))
+    assert(dev.write(tb, good.view()).is_ok())
+    answer
+
+@test("a descriptor that fails its checksum is BadDescriptor of its group, for the first, a middle and the last group")
+open_descriptor_checksums()
+    var dev = example()
+    val good = block_of(&dev, 2)
+    for g in [0, 2, 3]
+        for at_byte in [0, 59, 60, 63]
+            var bad = copy_of(good.view())
+            bad.view()[usize(g) * 64 + usize(at_byte)] ^= 4
+            assert(dev.write(2, bad.view()).is_ok())
+            assert_eq(failure(open(&dev)), 100 + i64(g))
+    // A descriptor moved to another group's slot fails, its group number being part of its checksum.
+    var swapped = copy_of(good.view())
+    for i in 0..<64
+        swapped.view()[64 + i] = good.view()[128 + i]
+        swapped.view()[128 + i] = good.view()[64 + i]
+    assert(dev.write(2, swapped.view()).is_ok())
+    assert_eq(failure(open(&dev)), 101)
+    assert(dev.write(2, good.view()).is_ok())
+    assert_eq(failure(open(&dev)), 0)
+
+@test("a sealed descriptor whose block bitmap, inode bitmap or inode table is elsewhere is MisplacedGroup")
+open_descriptor_locations()
+    var dev = example()
+    for g in [0, 1, 2, 3]
+        assert_eq(with_descriptor(&dev, u32(g), (d) -> d.block_bitmap += 1), 200 + i64(g))
+        assert_eq(with_descriptor(&dev, u32(g), (d) -> d.inode_bitmap -= 1), 200 + i64(g))
+        assert_eq(with_descriptor(&dev, u32(g), (d) -> d.inode_table += 2048), 200 + i64(g))
+    // The free counts and flags are not locations: a sealed change to them opens.
+    assert_eq(with_descriptor(&dev, 2, (d) -> d.free_blocks = 0), 0)
+    assert_eq(with_descriptor(&dev, 2, (d) -> d.flags = GROUP_COPY), 0)
+
+@test("with 65 groups, group 64's descriptor is read from the second table block and refused there too")
+open_second_table_block()
+    val end: u64 = 1 + 64 * 2048 + 70
+    var dev = sparse_formatted(end, Options(1_073_741_824, RESERVED_DEFAULT, 2048, 1024))
+    assert_eq(failure(open(&dev)), 0)
+    assert_eq(with_descriptor(&dev, 64, (d) -> d.inode_table += 1), 264)
+    assert_eq(with_descriptor(&dev, 63, (d) -> d.inode_bitmap += 1), 263)
+    val second = block_of(&dev, 3)
+    var bad = copy_of(second.view())
+    bad.view()[5] ^= 1
+    assert(dev.write(3, bad.view()).is_ok())
+    assert_eq(failure(open(&dev)), 164)
+    assert(dev.write(3, second.view()).is_ok())
+    // An entry past the last group in that block is not checked.
+    var tail = copy_of(second.view())
+    tail.view()[64 + 7] ^= 1
+    assert(dev.write(3, tail.view()).is_ok())
+    assert_eq(failure(open(&dev)), 0)
+
+@test("a device that fails a read answers the device's error, for the superblock and for a table block")
+open_device_failures()
+    var dev = example()
+    dev.failing = 1
+    assert_eq(failure(open(&dev)), 9)
+    dev.failing = 2
+    assert_eq(failure(open(&dev)), 9)
+    dev.failing = 0
+    assert_eq(failure(open(&dev)), 0)
+
+// -- the backup search -------------------------------------------------------------------------------------
+
+private junk_at(dev: *Sparse, b: u64)
+    val j = filled_block(u32(b))
+    assert(dev.write(b, j.view()).is_ok())
+
+private backup_block(dev: *Sparse) -> u64
+    find_backup(dev) match
+        Some(b) -> b.block
+        None -> 0
+
+@test("with the primary lost, the search finds group 1's copy for every allowed group size, 2048 to 32768")
+backup_every_group_size()
+    var bpg: u32 = 2048
+    while bpg <= 32768
+        val end = 1 + u64(bpg) + 5 + 1024 + 64
+        var dev = sparse_formatted(end, Options(1_073_741_824, RESERVED_DEFAULT, bpg, 1024))
+        val primary = block_of(&dev, 1)
+        junk_at(&dev, 1)
+        val found = find_backup(&dev) match
+            Some(b) -> b
+            None -> panic("no backup")
+        assert_eq(found.block, 1 + u64(bpg))
+        assert_eq(found.sb.blocks_per_group, bpg)
+        assert_eq(found.sb.group_count, 2)
+        // The copy is the primary, field for field.
+        val p = at[Superblock](primary.view(), 0)
+        assert_eq(found.sb.blocks, p.blocks)
+        assert_eq(found.sb.csum_seed, p.csum_seed)
+        assert_eq(found.sb.journal_start, p.journal_start)
+        bpg = bpg * 2
+
+@test("with the primary and group 1's copy lost, a G - 1 copy where the search looks is found: 3, 5 and 9 groups")
+backup_last_group_copy()
+    for groups in [3, 5, 9]
+        val end = 1 + u64(groups) * 2048
+        var dev = sparse_formatted(end, Options(1_073_741_824, RESERVED_DEFAULT, 2048, 1024))
+        junk_at(&dev, 1)
+        assert_eq(backup_block(&dev), 1 + 2048)
+        junk_at(&dev, 1 + 2048)
+        val last = 1 + u64(groups - 1) * 2048
+        assert_eq(backup_block(&dev), last)
+        val found = find_backup(&dev) match
+            Some(b) -> b
+            None -> panic("no backup")
+        assert_eq(found.sb.group_count, u32(groups))
+        // And with that one lost as well, there is nothing left to find.
+        junk_at(&dev, last)
+        assert_eq(backup_block(&dev), 0)
+
+@test("a G - 1 copy the search never visits is not found: four groups, group 3 at 1 + 3 x 2048")
+backup_last_copy_out_of_reach()
+    var dev = example()
+    junk_at(&dev, 1)
+    junk_at(&dev, 1 + 2048)
+    assert_eq(backup_block(&dev), 0)
+    // The copy is intact all the same; it is simply not where the search looks.
+    assert(verify_superblock(block_of(&dev, 1 + 3 * 2048).view()))
+
+@test("the search takes the lowest candidate first: group 1's copy is preferred over a valid G - 1 copy")
+backup_search_order()
+    var dev = sparse_formatted(1 + 3 * 2048, Options(1_073_741_824, RESERVED_DEFAULT, 2048, 1024))
+    junk_at(&dev, 1)
+    assert_eq(backup_block(&dev), 1 + 2048)
+    // Groups of 4096: the candidate at 2049 is inside group 0's data area and is skipped for 4097.
+    var big = sparse_formatted(1 + 4096 + 1093, Options(1_073_741_824, RESERVED_DEFAULT, 4096, 1024))
+    junk_at(&big, 1)
+    assert_eq(backup_block(&big), 1 + 4096)
+
+@test("a sealed superblock where its own geometry puts no copy is not taken for a backup")
+backup_refuses_misplaced_copy()
+    var dev = sparse_formatted(1 + 4096 + 1093, Options(1_073_741_824, RESERVED_DEFAULT, 4096, 1024))
+    val copy = block_of(&dev, 1)
+    junk_at(&dev, 1)
+    junk_at(&dev, 1 + 4096)
+    // A valid superblock of groups of 4096 at 1 + 2048: half a group in, so not a copy.
+    assert(dev.write(1 + 2048, copy.view()).is_ok())
+    assert_eq(backup_block(&dev), 0)
+    // At 1 + 8192 it would be group 2's copy, but this filesystem has two groups.
+    var wide = sparse(1 + 8192 + 1)
+    assert(wide.write(1 + 8192, copy.view()).is_ok())
+    assert_eq(backup_block(&wide), 0)
+
+@test("a candidate whose read fails, or that verifies but has the wrong magic, is passed over for the next")
+backup_skips_unreadable_and_foreign()
+    var dev = sparse_formatted(1 + 3 * 2048, Options(1_073_741_824, RESERVED_DEFAULT, 2048, 1024))
+    junk_at(&dev, 1)
+    dev.failing = 1 + 2048
+    assert_eq(backup_block(&dev), 1 + 2 * 2048)
+    dev.failing = 0
+    var foreign = block_of(&dev, 1 + 2048)
+    put_le32(foreign.view(), 0, JOURNAL_MAGIC)
+    seal_superblock(foreign.view())
+    assert(dev.write(1 + 2048, foreign.view()).is_ok())
+    assert_eq(backup_block(&dev), 1 + 2 * 2048)
+
+@test("a device too small to hold any candidate has no backup, and the candidate one past the end is not read")
+backup_small_devices()
+    var dev = sparse(2049)
+    assert_eq(backup_block(&dev), 0)
+    var tiny = sparse(0)
+    assert_eq(backup_block(&tiny), 0)

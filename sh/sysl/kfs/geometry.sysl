@@ -36,6 +36,9 @@ enum GeometryError
     BadReservedPercent
     // `journal_blocks` is outside 1024 ... 16384.
     BadJournalBlocks
+    // So many groups that the descriptor table, which every copy group carries, would leave a full copy
+    // group fewer than 64 data blocks (about 250 TiB with the defaults).
+    TooLarge
 
 struct Geometry
     // One past the filesystem's last block (block 0 counted).
@@ -90,6 +93,14 @@ private ceil_div(a: u64, b: u64) -> u64 = (a + b - 1) / b
 // The blocks of a descriptor table for `groups` groups: 64 descriptors to a block.
 gdt_blocks_for(groups: u32) -> u32 = u32(ceil_div(u64(groups), 64))
 
+// The metadata blocks of a copy group of a filesystem of `groups` groups of `ipg` inodes: the superblock,
+// the descriptor table, both bitmaps and the inode table. Wide, so that no group count can wrap it.
+copy_meta_blocks(groups: u64, ipg: u32) -> u64 = 1 + ceil_div(groups, 64) + 2 + u64(ipg / 16)
+
+// Whether a full copy group of `bpg` blocks still has the 64-block data area a group is kept for.
+copy_group_fits(groups: u64, bpg: u32, ipg: u32) -> bool
+    copy_meta_blocks(groups, ipg) + u64(LAST_GROUP_MIN_DATA) <= u64(bpg)
+
 // `clamp(blocks / 64, 1024, 16384)`.
 default_journal_blocks(blocks: u64) -> u32
     val j = blocks / 64
@@ -109,14 +120,15 @@ private inodes_for(bpg: u32, bytes_per_inode: u32) -> u32
 
 // How many groups a filesystem of `blocks` blocks has with groups of `bpg` blocks and `ipg` inodes: whole
 // groups, then the last, shorter one if it is worth keeping. Its data area (after its metadata, and after
-// the journal when it is the group that holds it) has to reach 64 blocks.
-private groups_for(blocks: u64, bpg: u32, ipg: u32, journal: u32) -> u32
+// the journal when it is the group that holds it) has to reach 64 blocks. The count is 64-bit: a size
+// past 2^32 groups is refused by the caller, not wrapped here.
+private groups_for(blocks: u64, bpg: u32, ipg: u32, journal: u32) -> u64
     val usable = blocks - 1
-    val full = u32(usable / u64(bpg))
+    val full = usable / u64(bpg)
     val rest = i64(usable % u64(bpg))
     if rest == 0 then return full
     val with_last = full + 1
-    val meta = i64(1 + gdt_blocks_for(with_last) + 2 + ipg / 16)
+    val meta = i64(copy_meta_blocks(with_last, ipg))
     val holds_journal = with_last / 2 == with_last - 1
     val data = rest - meta - (if holds_journal then i64(journal) else 0)
     if data >= LAST_GROUP_MIN_DATA then with_last else full
@@ -145,11 +157,13 @@ geometry(blocks: u64, o: Options) -> Result[Geometry, GeometryError]
     val bytes_per_inode = if o.bytes_per_inode != 0 then o.bytes_per_inode else DEFAULT_BYTES_PER_INODE
     val bpg = if o.blocks_per_group != 0 then o.blocks_per_group else choose_blocks_per_group(blocks, journal, bytes_per_inode)
     val ipg = inodes_for(bpg, bytes_per_inode)
-    val full = u32((blocks - 1) / u64(bpg))
-    val groups = groups_for(blocks, bpg, ipg, journal)
-    if groups < 2 then return Err(GeometryError.TooSmall)
+    val full = (blocks - 1) / u64(bpg)
+    val wide = groups_for(blocks, bpg, ipg, journal)
+    if wide < 2 then return Err(GeometryError.TooSmall)
+    if !copy_group_fits(wide, bpg, ipg) then return Err(GeometryError.TooLarge)
+    val groups = u32(wide)
 
-    val end = if groups > full then blocks else 1 + u64(groups) * u64(bpg)
+    val end = if wide > full then blocks else 1 + u64(groups) * u64(bpg)
     var g = Geometry(end, groups, bpg, ipg, gdt_blocks_for(groups), journal, 0, 0)
 
     // The journal sits at the start of the data area of group G / 2, and has to fit there.
