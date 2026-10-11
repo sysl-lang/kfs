@@ -1,0 +1,107 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// Helpers the tests of files, the orphan list and the inode layer share.
+
+// A regular file of mode `0o644` (or `mode`), owned by `uid`, one link, no name: the directory's half
+// of a create is stage 7's, and nothing here needs a name.
+new_file[D: BlockDevice](fs: *Fs[D, HostPlatform], uid: u32) -> u64 = new_inode(fs, S_IFREG | 0o644, uid)
+
+new_inode[D: BlockDevice](fs: *Fs[D, HostPlatform], mode: u16, uid: u32) -> u64
+    var h = fs.start("create", C_GROUP + 2 * C_INODE)
+    val r = alloc_inode(fs, &h, NewInode(mode, uid, uid, 1, ROOT_INO))
+    fs.stop(&h)
+    r match
+        Ok(ino) -> ino
+        Err(_) -> panic("an inode allocation failed")
+
+// How a call failed, as a number: 0 for success; NoSpace 1, Bug 2, Invalid 3, ReadOnly 4, Device 5,
+// Corrupt 6, TooBig 7.
+code[T](r: Result[T, FsError]) -> i64
+    r match
+        Ok(_) -> 0
+        Err(FsError.NoSpace) -> 1
+        Err(FsError.Bug) -> 2
+        Err(FsError.Invalid) -> 3
+        Err(FsError.ReadOnly) -> 4
+        Err(FsError.Device(_)) -> 5
+        Err(FsError.Corrupt(_)) -> 6
+        Err(FsError.TooBig) -> 7
+        Err(_) -> 9
+
+must_n(r: Result[usize, FsError]) -> usize
+    r match
+        Ok(n) -> n
+        Err(_) -> panic(s"a file operation failed: ${code(r)}")
+
+must_inode(r: Result[Inode, FsError]) -> Inode
+    r match
+        Ok(n) -> n
+        Err(_) -> panic(s"an inode could not be read: ${code(r)}")
+
+// `n` bytes that are never zero and differ with `salt`, so a block of them is told from a block of zeros
+// and from another write's.
+pattern(n: usize, salt: u32) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n
+        out.push(u8((u32(i) * 31 + salt * 7) % 251 + 1))
+    out
+
+zeros(n: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for _ in 0..<n
+        out.push(0)
+    out
+
+// Write `n` bytes of `pattern(n, salt)` at `offset`, all of them.
+put_pattern[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64, offset: u64, n: usize, salt: u32)
+    val data = pattern(n, salt)
+    assert(must_n(write(fs, ino, offset, data.view(), 0)) == n)
+
+// Read `n` bytes at `offset`: the bytes read, as many as the file gave.
+got[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64, offset: u64, n: usize) -> Buf[u8]
+    var out = zeros(n)
+    val k = must_n(read(fs, ino, offset, out.view()))
+    out.truncate(k)
+    out
+
+size_of[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64) -> u64 = must_inode(stat(fs, ino)).size
+
+blocks_of[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64) -> u64 = must_inode(stat(fs, ino)).blocks
+
+// Logical block `l` of `ino`: 0 for a hole, the physical block otherwise (unwritten or not).
+phys_at[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64, l: u64) -> u64
+    lookup(fs, ino, l) match
+        Ok(Mapping.Mapped(b, _, _)) -> b
+        Ok(Mapping.Hole) -> 0
+        Err(_) -> panic("a lookup failed")
+
+unwritten_at[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64, l: u64) -> bool
+    lookup(fs, ino, l) match
+        Ok(Mapping.Mapped(_, _, u)) -> u
+        _ -> false
+
+// Commit and checkpoint everything, then run the checker over the device: it must be clean.
+settled_clean[D: BlockDevice](fs: *Fs[D, HostPlatform]) -> Report
+    must(fs.checkpoint_all())
+    checked_clean(fs.dev)
+
+// Whether the checker reported `want`.
+has_problem(rep: Report, want: Problem) -> bool
+    for p in rep.problems.view()
+        if describe(p) == describe(want) then return true
+    false
+
+// The free block total in the superblock's sense: what the allocator may hand out.
+free_total[D: BlockDevice](fs: *Fs[D, HostPlatform]) -> u64 = fs.free_blocks_total.load()
+
+// Bytes equal to `want`.
+bytes_equal(a: Buf[u8], want: Buf[u8]) -> bool = same(a.view(), want.view())
+
+zeroed(a: []const u8) -> bool
+    for x in a
+        if x != 0 then return false
+    true

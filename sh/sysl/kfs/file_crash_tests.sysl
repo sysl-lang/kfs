@@ -1,0 +1,442 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The every-write loop of kfs/SPEC.md section 27 over the file operations: appending a chunk, writing
+// into an unwritten range, a growing truncate, a shrinking truncate of a 20,000-extent file, deleting an
+// open orphaned inode, mount's processing of the orphan list, and punching a hole. For every write W of
+// a clean run and every crash mode — drop after N, the Nth torn three ways, two seeded reorders — the
+// image is recovered and mounted (which finishes the orphan list), the checker must find nothing, and
+// the visible state must be one the operation allows: before, after, or the intermediate section 18
+// documents for it.
+//
+// The visible state is crash_tests.sysl's: the superblock but for what every mount writes directly, the
+// descriptors, the bitmaps and inode tables, and every block an inode claims — but a block under an
+// unwritten extent, which reads as zeros whatever it holds (section 8), and, where a test names one,
+// the block whose bytes the operation may leave old or torn (`skip`), which the test judges itself.
+
+private struct Tally
+    writes: u64
+    points: u64
+    before: u64
+    after: u64
+    middle: u64
+    // Crash points where recovery left members on the orphan list for the mount to finish.
+    orphaned: u64
+
+private holds_block(xs: Buf[u64], x: u64) -> bool
+    for y in xs.view()
+        if y == x then return true
+    false
+
+// The visible state of the image on `cd`, after mounting it (which recovers it and finishes the orphan
+// list) and checking it clean.
+private state_of(cd: *CrashDevice[RamDevice], skip: u64) -> Buf[u64]
+    var fs = mounted(cd)
+    assert(!fs.read_only())
+    must(fs.checkpoint_all())
+    val rep = checked_clean(cd)
+    var out: Buf[u64] = buf()
+    var sb = raw(cd, 1)
+    mask_mount_fields(sb.view())
+    out.push(digest(sb.view()))
+    val g = fs.geo
+    for t in 0..<u64(g.gdt_blocks)
+        out.push(digest(raw(cd, 2 + t).view()))
+    for grp in 0..<g.group_count
+        out.push(digest(raw(cd, g.block_bitmap(grp)).view()))
+        out.push(digest(raw(cd, g.inode_bitmap(grp)).view()))
+        for t in 0..<u64(g.itable_blocks())
+            out.push(digest(raw(cd, g.inode_table(grp) + t).view()))
+    for b in rep.claimed.view()
+        out.push(b)
+        if b != skip && !holds_block(rep.unwritten, b) then out.push(digest(raw(cd, b).view()))
+    out
+
+// The orphan list's head as recovery leaves it, before any mount processes it.
+private recovered_head(cd: *CrashDevice[RamDevice]) -> u64
+    val m = open(cd) match
+        Ok(m) -> m
+        Err(_) -> panic("the image did not open")
+    assert(recover(cd, m.sb).is_ok())
+    super_of(cd).orphan_head
+
+private rewind_all(cd: *CrashDevice[RamDevice], base: *RamDevice)
+    assert(cd.rewind().is_ok())
+    base.reset_counters()
+
+private crash_plan(n: u64, mode: u32, total: u64) -> Option[CrashMode]
+    mode match
+        0 -> if n < total then Some(CrashMode.DropAfter(n)) else None
+        1 -> Some(CrashMode.Tear(n, 0x01))
+        2 -> Some(CrashMode.Tear(n, 0xFE))
+        3 -> Some(CrashMode.Tear(n, u8((n * 0x9E37 + 0x5B) & 0xFF)))
+        4 -> Some(CrashMode.Reorder(n, n * 7919 + 1))
+        _ -> Some(CrashMode.Reorder(n, n * 104729 + 3))
+
+// Run `op` (it mounts, prepares, calls `cd.arm()`, and does the operation) under `plan`, and answer
+// what `look` makes of the image it leaves; the device is rewound after.
+private outcome[T](base: *RamDevice, cd: *CrashDevice[RamDevice], op: &Fn(*CrashDevice[RamDevice]) -> unit, plan: CrashMode, look: &Fn(*CrashDevice[RamDevice]) -> T) -> T
+    cd.plan = plan
+    op(cd)
+    cd.disarm()
+    val r = look(cd)
+    rewind_all(cd, base)
+    r
+
+// The loop: a clean run counts the writes; then every crash point is judged by `judge`, which answers
+// 0 for the state before, 1 for the state after, 2 for an allowed intermediate (and fails the test for
+// anything else).
+private every_crash(name: string, base: *RamDevice, op: &Fn(*CrashDevice[RamDevice]) -> unit, judge: &Fn(*CrashDevice[RamDevice]) -> u32) -> Tally
+    var cd = crash_device(base)
+    cd.mark()
+    cd.plan = CrashMode.Off
+    op(&cd)
+    val total = cd.counted
+    assert(!cd.crashed && total > 0)
+    cd.disarm()
+    rewind_all(&cd, base)
+    var t = Tally(total, 0, 0, 0, 0, 0)
+    for n in 1..<(total + 1)
+        for mode in 0u32..<6
+            crash_plan(n, mode, total) match
+                None -> ()
+                Some(p) ->
+                    cd.plan = p
+                    op(&cd)
+                    cd.disarm()
+                    if recovered_head(&cd) != 0 then t.orphaned += 1
+                    val k = judge(&cd)
+                    if k == 0 then t.before += 1 else if k == 1 then t.after += 1 else t.middle += 1
+                    t.points += 1
+                    rewind_all(&cd, base)
+    print(s"$name: $total writes, ${t.points} crash points: ${t.before} before, ${t.after} after, ${t.middle} between, ${t.orphaned} with an orphan list to finish")
+    t
+
+// Judge against exact states: before, after, and an optional intermediate.
+private exact(states: Buf[Buf[u64]], cd: *CrashDevice[RamDevice]) -> u32
+    val s = state_of(cd, 0)
+    for i in 0..<states.len()
+        if s == states[i] then return u32(i)
+    panic("a crash left a state that is neither before nor after")
+
+// A formatted device with what `setup` makes on it, unmounted: answers the inode `setup` answers.
+private prepared(dev: *RamDevice, setup: &Fn(*RamFs) -> u64) -> u64
+    var fs = mounted(dev)
+    val ino = setup(&fs)
+    must(fs.unmount())
+    ino
+
+private bs() -> u64 = u64(BLOCK_SIZE)
+
+@test("the visible state's digest tells apart two inode-table blocks whose CRC32C is the same")
+digest_sees_inodes()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val ino = new_file(&fs, 0)
+    must(fs.checkpoint_all())
+    val loc = fs.inode_location(ino)
+    val a = raw(&dev, loc.block)
+    var b = raw(&dev, loc.block)
+    val node: *Inode = at(b.view(), loc.offset)
+    node.size = 12345
+    seal_inode(fs.seed, ino, b.view()[loc.offset..<loc.offset + INODE_SIZE])
+    // A sealed slot's content drops out of a CRC32C over the block: the old digest was blind to it.
+    assert(!same(a.view(), b.view()))
+    assert(crc32c(0xFFFF_FFFF, a.view()) == crc32c(0xFFFF_FFFF, b.view()))
+    assert(digest(a.view()) != digest(b.view()))
+
+// -- The operations -----------------------------------------------------------------------------------
+
+@test("every write of an append of one chunk: the old last block after the commit, the new blocks before")
+crash_append_chunk()
+    var base = small_device()
+    val ino = prepared(&base, (fs) ->
+        val f = new_file(fs, 0)
+        put_pattern(fs, f, 0, 5000, 1)
+        f)
+    val data = pattern(3 * BLOCK_SIZE + 100, 2)
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        cd.arm()
+        val _ = append(&fs, ino, data.view(), 0)
+        val _ = fs.commit()
+    // The old last block is block 1: its bytes land after the commit, so a crash may leave the new
+    // size over its old bytes — zeros past 5000, the tail section 8 keeps — or a torn mixture.
+    var cd = crash_device(&base)
+    cd.mark()
+    val b1 = outcome(&base, &cd, op, CrashMode.Off, (c) -> phys_of(c, ino, 1))
+    val old = raw(&base, b1)
+    val after = outcome(&base, &cd, op, CrashMode.Off, (c) -> state_of(c, b1))
+    val new_bytes = outcome(&base, &cd, op, CrashMode.Off, (c) -> raw(c, b1))
+    val before = outcome(&base, &cd, op, CrashMode.DropAfter(0), (c) -> state_of(c, b1))
+    assert(before != after && !same(old.view(), new_bytes.view()))
+    val t = every_crash("append", &base, op, (c) ->
+        val s = state_of(c, b1)
+        val now = raw(c, b1)
+        if s == before
+            assert(same(now.view(), old.view()))
+            return 0
+        if s != after then panic("an append left a state that is neither before nor after")
+        if same(now.view(), new_bytes.view()) then return 1
+        // Each sector old or new: what a crash between the commit and the late write may leave.
+        for k in 0..<SECTORS_PER_BLOCK
+            val lo = k * SECTOR_SIZE
+            val hi = lo + SECTOR_SIZE
+            assert(same(now.view()[lo..<hi], old.view()[lo..<hi]) || same(now.view()[lo..<hi], new_bytes.view()[lo..<hi]))
+        2)
+    assert(t.before > 0 && t.after > 0 && t.middle > 0)
+
+// Logical block `l`'s physical block on the image, mounted afresh.
+private phys_of(cd: *CrashDevice[RamDevice], ino: u64, l: u64) -> u64
+    var fs = mounted(cd)
+    phys_at(&fs, ino, l)
+
+@test("every write of a write into an unwritten range: data before the commit that converts it")
+crash_write_unwritten()
+    var base = small_device()
+    val ino = prepared(&base, (fs) ->
+        val f = new_file(fs, 0)
+        must(fallocate(fs, f, Falloc.Allocate, 0, 8 * u64(BLOCK_SIZE), 0))
+        f)
+    val data = pattern(2 * BLOCK_SIZE + 2048, 3)
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        cd.arm()
+        val _ = write(&fs, ino, bs() + 2048, data.view(), 0)
+        val _ = fs.commit()
+    var cd = crash_device(&base)
+    cd.mark()
+    var states: Buf[Buf[u64]] = buf()
+    states.push(outcome(&base, &cd, op, CrashMode.DropAfter(0), (c) -> state_of(c, 0)))
+    states.push(outcome(&base, &cd, op, CrashMode.Off, (c) -> state_of(c, 0)))
+    assert(states[0] != states[1])
+    val t = every_crash("write into unwritten", &base, op, (c) -> exact(states, c))
+    assert(t.before > 0 && t.after > 0 && t.middle == 0)
+
+@test("every write of a growing truncate: one transaction, the new range a hole")
+crash_grow()
+    var base = small_device()
+    val ino = prepared(&base, (fs) ->
+        val f = new_file(fs, 0)
+        put_pattern(fs, f, 0, 5000, 1)
+        f)
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        cd.arm()
+        val _ = truncate(&fs, ino, 50000, 0)
+        val _ = fs.commit()
+    var cd = crash_device(&base)
+    cd.mark()
+    var states: Buf[Buf[u64]] = buf()
+    states.push(outcome(&base, &cd, op, CrashMode.DropAfter(0), (c) -> state_of(c, 0)))
+    states.push(outcome(&base, &cd, op, CrashMode.Off, (c) -> state_of(c, 0)))
+    val t = every_crash("growing truncate", &base, op, (c) -> exact(states, c))
+    assert(t.before > 0 && t.after > 0)
+
+@test("every write of a shrink inside the last block: the zeroed tail is ordered before the first commit")
+crash_shrink_tail()
+    var base = small_device()
+    val ino = prepared(&base, (fs) ->
+        val f = sparse_file(fs, 30)
+        put_pattern(fs, f, 0, 3 * BLOCK_SIZE, 4)
+        f)
+    // To 2 blocks and 100 bytes: block 2's tail is zeroed and every extent past it freed in steps, which
+    // commit apart (the clock passes the commit interval every second handle).
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var p = host_platform()
+        p.ms_step = 2500
+        var fs = mount(cd, p).unwrap()
+        cd.arm()
+        val _ = truncate(&fs, ino, 2 * bs() + 100, 0)
+        val _ = fs.commit()
+    var cd = crash_device(&base)
+    cd.mark()
+    val b2 = outcome(&base, &cd, op, CrashMode.Off, (c) -> phys_of(c, ino, 2))
+    val old = raw(&base, b2)
+    var zeroed_tail = raw(&base, b2)
+    for i in 100..<BLOCK_SIZE
+        zeroed_tail[i] = 0
+    val before_state = outcome(&base, &cd, op, CrashMode.DropAfter(0), (c) -> state_of(c, b2))
+    val after_state = outcome(&base, &cd, op, CrashMode.Off, (c) -> state_of(c, b2))
+    assert(before_state != after_state)
+    // Block 2's zeroed tail is ordered data of the first transaction: under the new size it is always
+    // there; under the old size — the documented intermediate — it may be there, or torn, or not yet.
+    val t = every_crash("shrinking truncate, unaligned", &base, op, (c) ->
+        val s = state_of(c, b2)
+        val now = raw(c, b2)
+        if s == after_state
+            assert(same(now.view(), zeroed_tail.view()))
+            return 1
+        if s != before_state then panic("a shrink left a state that is neither before nor after")
+        if same(now.view(), old.view()) then return 0
+        for k in 0..<SECTORS_PER_BLOCK
+            val lo = k * SECTOR_SIZE
+            val hi = lo + SECTOR_SIZE
+            assert(same(now.view()[lo..<hi], old.view()[lo..<hi]) || same(now.view()[lo..<hi], zeroed_tail.view()[lo..<hi]))
+        2)
+    assert(t.before > 0 && t.after > 0 && t.middle > 0 && t.orphaned > 0)
+
+// 96 MiB: three groups of 8192 blocks and the smallest journal, room for a 20,000-extent file.
+private big_device() -> RamDevice = formatted(24577, Options(65536, RESERVED_DEFAULT, 8192, 1024))
+
+// A file of `n` one-block extents at logical blocks 0, 2, 4, ...: mapped straight into the tree, its
+// size covering them all.
+private extents_file(fs: *RamFs, n: u64) -> u64
+    val ino = new_file(fs, 0)
+    var h = fs.start("size", C_INODE)
+    cover_all(fs, &h, ino)
+    fs.stop(&h)
+    must(truncate(fs, ino, 2 * n * bs(), 0))
+    var k: u64 = 0
+    while k < n
+        var w = fs.start("map", C_ALLOC)
+        val run = alloc_blocks(fs, &w, goal_for(fs, ino, 0) + k, 1, 0).unwrap()
+        must(insert(fs, &w, extent_tree(ino, 0), Extent(2 * k, 1, run.first, false)))
+        fs.stop(&w)
+        k += 1
+        if k % 500 == 0 then must(fs.commit())
+    must(fs.checkpoint_all())
+    ino
+
+@test("every write of a shrinking truncate of a 20,000-extent file: the new size at once, the rest by the next mount")
+crash_shrink_huge()
+    var base = big_device()
+    val ino = prepared(&base, (fs) -> extents_file(fs, 20_000))
+    // Commits fall between the steps: the monotonic clock passes the commit interval every 200 steps.
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var p = host_platform()
+        p.ms_step = 25
+        var fs = mount(cd, p).unwrap()
+        cd.arm()
+        val _ = truncate(&fs, ino, 10 * bs(), 0)
+        val _ = fs.commit()
+    var cd = crash_device(&base)
+    cd.mark()
+    var states: Buf[Buf[u64]] = buf()
+    states.push(outcome(&base, &cd, op, CrashMode.DropAfter(0), (c) -> state_of(c, 0)))
+    states.push(outcome(&base, &cd, op, CrashMode.Off, (c) -> state_of(c, 0)))
+    val t = every_crash("shrinking truncate of 20,000 extents", &base, op, (c) -> exact(states, c))
+    assert(t.before > 0 && t.after > 0 && t.orphaned > 0)
+
+@test("every write of the delete of an open orphaned inode: the last release frees it, or the next mount does")
+crash_delete_orphan()
+    var base = small_device()
+    val ino = prepared(&base, (fs) -> sparse_file(fs, 40))
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        var fs = mounted(cd)
+        must(hold(&fs, ino))
+        must(drop_link(&fs, ino))
+        must(fs.commit())
+        cd.arm()
+        val _ = release(&fs, ino)
+        val _ = fs.commit()
+    var cd = crash_device(&base)
+    cd.mark()
+    var states: Buf[Buf[u64]] = buf()
+    // Before and after are one state here: a crash before the delete leaves the orphan, which the
+    // next mount deletes.
+    states.push(outcome(&base, &cd, op, CrashMode.Off, (c) -> state_of(c, 0)))
+    assert(outcome(&base, &cd, op, CrashMode.DropAfter(0), (c) -> state_of(c, 0)) == states[0])
+    val t = every_crash("delete of an open orphan", &base, op, (c) -> exact(states, c))
+    assert(t.before == t.points && t.orphaned > 0 && t.orphaned < t.points)
+
+@test("every write of mount's processing of the orphan list: a delete and a truncation, resumed by the next mount")
+crash_mount_processing()
+    var base = small_device()
+    // On the disk: a zero-link file with a tree, a file part-way through a shrink (its size already
+    // new), both on the list, as a crash right after their first transactions leaves them.
+    val ino = prepared(&base, (fs) ->
+        val gone = sparse_file(fs, 30)
+        val cut = sparse_file(fs, 30)
+        var h = fs.start("setup", 4)
+        must(change_inode(fs, &h, gone, (n) -> n.links = 0))
+        must(orphan_add(fs, &h, gone))
+        must(change_inode(fs, &h, cut, (n) -> n.size = 3 * u64(BLOCK_SIZE)))
+        must(orphan_add(fs, &h, cut))
+        fs.stop(&h)
+        cut)
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd) ->
+        cd.arm()
+        val m = mount(cd, host_platform())
+        m match
+            Ok(fs) ->
+                var f = fs
+                val _ = f.commit()
+            Err(_) -> ()
+    var cd = crash_device(&base)
+    cd.mark()
+    var states: Buf[Buf[u64]] = buf()
+    states.push(outcome(&base, &cd, op, CrashMode.Off, (c) -> state_of(c, 0)))
+    val t = every_crash("mount's orphan processing", &base, op, (c) -> exact(states, c))
+    assert(t.before == t.points && t.orphaned > 0)
+    assert(ino != 0)
+
+@test("every write of a punch over many extents: each block in the range old or zero, the unmapped ones a suffix")
+crash_punch()
+    var base = small_device()
+    val ino = prepared(&base, (fs) ->
+        val f = new_file(fs, 0)
+        for k in 0..<40u64
+            put_pattern(fs, f, 2 * k * u64(BLOCK_SIZE), BLOCK_SIZE, u32(k) + 1)
+        f)
+    // From the middle of block 4 to the middle of block 70: block 4's and 70's edges zeroed, the 32
+    // extents between unmapped in steps of sixteen.
+    val from = 4 * bs() + 1000
+    val to = 70 * bs() + 3000
+    val size = 79 * bs()
+    var cd = crash_device(&base)
+    cd.mark()
+    val old = outcome(&base, &cd, (c) -> (), CrashMode.Off, (c) -> contents(c, ino, size))
+    val op: &Fn(*CrashDevice[RamDevice]) -> unit = (cd2) ->
+        var fs = mounted(cd2)
+        cd2.arm()
+        val _ = fallocate(&fs, ino, Falloc.PunchHole, from, to - from, 0)
+        val _ = fs.commit()
+    val t = every_crash("punch", &base, op, (c) -> judge_punch(c, ino, old, from, to, size))
+    assert(t.before > 0 && t.after > 0 && t.middle > 0)
+
+// The whole file as read through a fresh mount (which also checks the image clean afterwards).
+private contents(cd: *CrashDevice[RamDevice], ino: u64, size: u64) -> Buf[u8]
+    var fs = mounted(cd)
+    assert(!fs.read_only())
+    assert(size_of(&fs, ino) == size)
+    val all = got(&fs, ino, 0, usize(size))
+    must(fs.checkpoint_all())
+    checked_clean(cd)
+    all
+
+// A punch's crash: the size kept; outside [from, to) every byte as it was; inside, every byte as it was
+// or zero, and of the whole blocks the ones still mapped all below the ones unmapped (steps remove from
+// the end down). Before: nothing zeroed; after: everything zeroed and unmapped.
+private judge_punch(cd: *CrashDevice[RamDevice], ino: u64, old: Buf[u8], from: u64, to: u64, size: u64) -> u32
+    val now = contents(cd, ino, size)
+    var zeroed_any = false
+    var all_zero = true
+    for i in 0..<usize(size)
+        val inside = u64(i) >= from && u64(i) < to
+        if !inside
+            assert(now[i] == old[i])
+        else
+            assert(now[i] == old[i] || now[i] == 0)
+            if now[i] != old[i] then zeroed_any = true
+            if now[i] != 0 then all_zero = false
+    // The whole blocks still mapped (the file's even blocks) form a prefix of the range: walking up,
+    // once one is unmapped every higher one is.
+    var fs = mounted(cd)
+    var mapped: u64 = 0
+    var ended = false
+    var l = blocks_for(from)
+    while l < to / u64(BLOCK_SIZE)
+        if l % 2 == 0
+            val m = phys_at(&fs, ino, l) != 0
+            assert(!(m && ended))
+            if m then mapped += 1 else ended = true
+        l += 1
+    if !zeroed_any
+        assert(mapped == 32)
+        return 0
+    if all_zero && mapped == 0 then return 1
+    2

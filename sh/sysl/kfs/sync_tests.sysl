@@ -1,0 +1,87 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// `fsync` and `fdatasync` (kfs/SPEC.md section 18): a commit is forced when the inode's change has not
+// committed — any change for fsync, a change of size or mapping for fdatasync — and otherwise the
+// inode's pending data is written home and the device flushed.
+
+private bs() -> u64 = u64(BLOCK_SIZE)
+
+@test("fsync after a write forces the commit: the mapping and the bytes are on the disk")
+fsync_commits()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val ino = new_file(&fs, 0)
+    must(fs.checkpoint_all())
+    val seq = fs.running()
+    put_pattern(&fs, ino, 0, 100, 1)
+    must(fsync(&fs, ino))
+    assert(fs.running() == seq + 1 && fs.logged_count() == 1)
+    assert(same(raw(&dev, phys_at(&fs, ino, 0)).view()[0..<100], pattern(100, 1).view()))
+    // Nothing new since: a second fsync forces nothing and only flushes.
+    val flushes = dev.flushes()
+    must(fsync(&fs, ino))
+    assert(fs.running() == seq + 1 && dev.flushes() == flushes + 1)
+
+@test("fdatasync forces no commit for a times-only change, yet the overwritten bytes reach the disk")
+fdatasync_times_only()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val ino = new_file(&fs, 0)
+    put_pattern(&fs, ino, 0, BLOCK_SIZE, 1)
+    must(fs.checkpoint_all())
+    val b = phys_at(&fs, ino, 0)
+    // An overwrite inside the file: mtime and ctime change, the size and the mapping do not.
+    put_pattern(&fs, ino, 10, 20, 2)
+    val seq = fs.running()
+    val flushes = dev.flushes()
+    must(fdatasync(&fs, ino))
+    assert(fs.running() == seq && fs.logged_count() == 0)
+    assert(dev.flushes() == flushes + 1)
+    val home = raw(&dev, b)
+    assert(home[10] == pattern(20, 2)[0] && home[29] == pattern(20, 2)[19] && home[9] == pattern(BLOCK_SIZE, 1)[9])
+    // fsync of the same inode does force it: its times are in the running transaction.
+    must(fsync(&fs, ino))
+    assert(fs.running() == seq + 1)
+
+@test("fdatasync forces the commit for a change of size, and for a change of mapping alone")
+fdatasync_size_and_mapping()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val ino = new_file(&fs, 0)
+    put_pattern(&fs, ino, 0, 100, 1)
+    must(fs.checkpoint_all())
+    val s0 = fs.running()
+    // Size: an append inside the same block.
+    put_pattern(&fs, ino, 100, 10, 2)
+    must(fdatasync(&fs, ino))
+    assert(fs.running() == s0 + 1)
+    // Mapping alone: a preallocation past the end keeps the size.
+    must(fallocate(&fs, ino, Falloc.KeepSize, bs(), bs(), 0))
+    must(fdatasync(&fs, ino))
+    assert(fs.running() == s0 + 2)
+    // Size alone: a growing truncate.
+    must(truncate(&fs, ino, 10 * bs(), 0))
+    must(fdatasync(&fs, ino))
+    assert(fs.running() == s0 + 3)
+    settled_clean(&fs)
+
+@test("fsync of an inode never changed forces nothing; of a free inode it is Invalid")
+fsync_unchanged()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    must(fs.checkpoint_all())
+    val other = new_file(&fs, 0)
+    must(fs.checkpoint_all())
+    val seq = fs.running()
+    val ino = new_file(&fs, 0)
+    // `ino`'s creation is in the running transaction, but fsync of `other` does not need it.
+    must(fsync(&fs, other))
+    assert(fs.running() == seq)
+    must(fsync(&fs, ino))
+    assert(fs.running() == seq + 1)
+    assert(code(fsync(&fs, FIRST_INO + 70)) == 3)
+    assert(code(fdatasync(&fs, FIRST_INO + 70)) == 3)

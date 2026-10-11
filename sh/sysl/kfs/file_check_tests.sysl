@@ -1,0 +1,128 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The checker's pass-1 checks of section 8's file invariants (kfs/SPEC.md sections 8 and 23): for each,
+// an image that breaks exactly it, written straight onto the device, and the legal images beside it
+// that must stay clean. The orphan list's pass-5 checks are orphan_tests.sysl's.
+
+private bs() -> u64 = u64(BLOCK_SIZE)
+
+// Change inode `ino`'s slot on the device with `edit`, resealed.
+private edit_disk_inode(dev: *RamDevice, ino: u64, edit: &Fn(*Inode) -> unit)
+    val m = open(dev) match
+        Ok(m) -> m
+        Err(_) -> panic("the image did not open")
+    val loc = m.inode_location(ino).unwrap()
+    var b = raw(dev, loc.block)
+    edit(at(b.view(), loc.offset))
+    seal_inode(m.seed, ino, b.view()[loc.offset..<loc.offset + INODE_SIZE])
+    raw_put(dev, loc.block, b.view())
+
+// A file of `n` bytes of pattern on `dev`, unmounted: answers it and its first data block.
+private file_on(dev: *RamDevice, n: usize) -> (u64, u64)
+    var fs = mounted(dev)
+    val ino = new_file(&fs, 0)
+    put_pattern(&fs, ino, 0, n, 1)
+    val b = phys_at(&fs, ino, 0)
+    must(fs.unmount())
+    (ino, b)
+
+@test("a written extent at or past ceil(size / 4096) is a problem; at exactly the last block it is not")
+written_past_end()
+    var dev = small_device()
+    val (ino, _) = file_on(&dev, 2 * BLOCK_SIZE)
+    checked_clean(&dev)
+    edit_disk_inode(&dev, ino, (n) -> n.size = u64(BLOCK_SIZE))
+    val rep = check(&dev)
+    assert(has_problem(rep, Problem.ExtentPastEnd(ino, 0)) && rep.problems.len() == 1)
+    // The same inode on the orphan list is a truncation in progress: legal.
+    edit_disk_inode(&dev, ino, (n) -> n.flags = n.flags | INODE_ORPHAN)
+    var b = raw(&dev, 1)
+    val sb: *Superblock = at(b.view(), 0)
+    sb.orphan_head = ino
+    seal_superblock(b.view())
+    raw_put(&dev, 1, b.view())
+    checked_clean(&dev)
+
+@test("an unwritten extent past the end is legal in a regular file and a problem in a directory")
+unwritten_past_end()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val ino = new_file(&fs, 0)
+    must(fallocate(&fs, ino, Falloc.KeepSize, 0, 4 * bs(), 0))
+    var h = fs.start("dir", C_ALLOC)
+    val run = alloc_blocks(&fs, &h, 0, 1, 0).unwrap()
+    // The root directory holds one block, so a block mapped at 5 is past its end.
+    must(insert(&fs, &h, extent_tree(ROOT_INO, 0), Extent(5, 1, run.first, true)))
+    fs.stop(&h)
+    must(fs.unmount())
+    val rep = check(&dev)
+    assert(has_problem(rep, Problem.ExtentPastEnd(ROOT_INO, 5)) && rep.problems.len() == 1)
+
+@test("the last block's bytes past the size must be zero on the disk")
+tail_not_zero()
+    var dev = small_device()
+    val (ino, b) = file_on(&dev, 100)
+    checked_clean(&dev)
+    var blk = raw(&dev, b)
+    blk[BLOCK_SIZE - 1] = 1
+    raw_put(&dev, b, blk.view())
+    val rep = check(&dev)
+    assert(has_problem(rep, Problem.TailNotZero(ino)) && rep.problems.len() == 1)
+    // A byte inside the size is data, not tail.
+    blk[BLOCK_SIZE - 1] = 0
+    blk[99] = 0
+    raw_put(&dev, b, blk.view())
+    checked_clean(&dev)
+    // A block-aligned size has no tail to check.
+    edit_disk_inode(&dev, ino, (n) -> n.size = u64(BLOCK_SIZE))
+    blk[BLOCK_SIZE - 1] = 7
+    raw_put(&dev, b, blk.view())
+    checked_clean(&dev)
+
+@test("a tail in an unwritten block or a hole is not checked: it reads as zeros whatever the disk holds")
+tail_in_unwritten()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val ino = new_file(&fs, 0)
+    must(fallocate(&fs, ino, Falloc.Allocate, 0, 100, 0))
+    val b = phys_at(&fs, ino, 0)
+    val hole = new_file(&fs, 0)
+    must(truncate(&fs, hole, 100, 0))
+    must(fs.unmount())
+    raw_put(&dev, b, pattern(BLOCK_SIZE, 3).view())
+    checked_clean(&dev)
+
+@test("no links without ORPHAN is a problem; with ORPHAN and on the list it is a pending delete")
+unlinked_inode()
+    var dev = small_device()
+    val (ino, _) = file_on(&dev, 10)
+    edit_disk_inode(&dev, ino, (n) -> n.links = 0)
+    val rep = check(&dev)
+    assert(has_problem(rep, Problem.Unlinked(ino)) && rep.problems.len() == 1)
+    edit_disk_inode(&dev, ino, (n) -> n.flags = n.flags | INODE_ORPHAN)
+    var b = raw(&dev, 1)
+    val sb: *Superblock = at(b.view(), 0)
+    sb.orphan_head = ino
+    seal_superblock(b.view())
+    raw_put(&dev, 1, b.view())
+    checked_clean(&dev)
+    // And mount finishes it.
+    var fs = mounted(&dev)
+    assert(code(stat(&fs, ino)) == 3)
+    settled_clean(&fs)
+
+@test("the checker records which claimed blocks unwritten extents map")
+unwritten_blocks_reported()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val ino = new_file(&fs, 0)
+    put_pattern(&fs, ino, 0, BLOCK_SIZE, 1)
+    must(fallocate(&fs, ino, Falloc.KeepSize, bs(), 2 * bs(), 0))
+    val b1 = phys_at(&fs, ino, 1)
+    val b2 = phys_at(&fs, ino, 2)
+    val rep = settled_clean(&fs)
+    assert(rep.unwritten.len() == 2 && rep.unwritten[0] == b1 && rep.unwritten[1] == b2)

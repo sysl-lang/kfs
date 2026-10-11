@@ -107,9 +107,10 @@ private faulty_block[T](r: Result[T, FsError]) -> u64
 
 private file_inode(fs: *HostFs) -> u64
     var h = fs.start("create", 3)
-    val r = alloc_inode(fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO))
+    val ino = ok_u64(alloc_inode(fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)))
+    cover_all(fs, &h, ino)
     fs.stop(&h)
-    ok_u64(r)
+    ino
 
 // `want` blocks for data, from `goal`, as uid 0.
 private data(fs: *HostFs, goal: u64, want: u32) -> Run

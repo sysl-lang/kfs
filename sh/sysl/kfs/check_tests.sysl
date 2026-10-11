@@ -70,6 +70,7 @@ clean_images()
     val ino = alloc_inode(&fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)) match
         Ok(i) -> i
         Err(_) -> panic("no inode")
+    cover_all(&fs, &h, ino)
     val run = alloc_blocks(&fs, &h, 0, 5, 0) match
         Ok(r) -> r
         Err(_) -> panic("no blocks")
@@ -180,6 +181,7 @@ pass1_node_blocks()
         val ino = alloc_inode(&fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)) match
             Ok(i) -> i
             Err(_) -> panic("no inode")
+        cover_all(&fs, &h, ino)
         fs.stop(&h)
         // Nine one-block extents overflow the root's seven: the tree grows a node block.
         for k in 0..<9u64

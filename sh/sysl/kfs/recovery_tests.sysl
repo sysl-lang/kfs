@@ -219,14 +219,14 @@ revokes_only_from_replayed()
     assert(again.read_only())
     assert(holds(&dev, m, 1))
 
-// The device's every block, as checksums, with the superblock's mount fields masked.
-private image(dev: *RamDevice) -> Buf[u32]
-    var out: Buf[u32] = buf()
+// The device's every block, as digests, with the superblock's mount fields masked.
+private image(dev: *RamDevice) -> Buf[u64]
+    var out: Buf[u64] = buf()
     var blk = new_block()
     for b in 0..<dev.blocks()
         assert(dev.read(b, blk.view()).is_ok())
         if b == 1 then mask_mount_fields(blk.view())
-        out.push(crc32c(0xFFFF_FFFF, blk.view()))
+        out.push(digest(blk.view()))
     out
 
 // Zero the superblock's fields that every mount writes directly: state, the free totals, the mount

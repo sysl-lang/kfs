@@ -1,0 +1,261 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The orphan list (kfs/SPEC.md section 16): adding at the head, removing from the head, the middle and
+// the tail, the disk's singly linked list against memory's doubly linked one, mount's processing of
+// both kinds of member, and a list that breaks its rules.
+
+private bs() -> u64 = u64(BLOCK_SIZE)
+
+// The list as the disk has it, from the superblock's head (checkpointed first).
+private disk_list(fs: *RamFs, dev: *RamDevice) -> Buf[u64]
+    must(fs.checkpoint_all())
+    var out: Buf[u64] = buf()
+    var ino = super_of(dev).orphan_head
+    while ino != 0
+        out.push(ino)
+        assert(out.len() < 100)
+        val loc = fs.inode_location(ino)
+        val blk = raw(dev, loc.block)
+        val node: *Inode = at(blk.view(), loc.offset)
+        assert(node.flags & INODE_ORPHAN != 0)
+        ino = node.orphan_next
+    out
+
+private list_is(xs: Buf[u64], want: []const u64) -> bool
+    if xs.len() != want.len then return false
+    for i in 0..<want.len
+        if xs[i] != want[i] then return false
+    true
+
+// Put `ino` on the list, or take it off, in a handle of its own.
+private add(fs: *RamFs, ino: u64)
+    var h = fs.start("orphan", C_INODE + C_SB)
+    must(orphan_add(fs, &h, ino))
+    fs.stop(&h)
+
+private take(fs: *RamFs, ino: u64)
+    var h = fs.start("orphan", C_INODE + C_SB)
+    must(orphan_remove(fs, &h, ino))
+    fs.stop(&h)
+
+@test("an empty list: head 0, nothing in memory, the checker clean, mount has nothing to do")
+empty_list()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    assert(orphans(&fs).len() == 0 && super_of(&dev).orphan_head == 0)
+    assert(disk_list(&fs, &dev).len() == 0)
+    settled_clean(&fs)
+
+@test("one member: head names it, its next is 0, ORPHAN set; removed, all of it is cleared")
+one_member()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val a = new_file(&fs, 0)
+    add(&fs, a)
+    assert(list_is(orphans(&fs), [a]) && list_is(disk_list(&fs, &dev), [a]))
+    val n = must_inode(stat(&fs, a))
+    assert(n.orphan_next == 0 && n.flags & INODE_ORPHAN != 0)
+    settled_clean(&fs)
+    take(&fs, a)
+    assert(orphans(&fs).len() == 0 && disk_list(&fs, &dev).len() == 0)
+    val m = must_inode(stat(&fs, a))
+    assert(m.orphan_next == 0 && m.flags & INODE_ORPHAN == 0)
+    settled_clean(&fs)
+
+@test("many members: each added at the head; removal from the middle, the tail and the head relinks the rest")
+many_members()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    var ids: Buf[u64] = buf()
+    for _ in 0..<5
+        ids.push(new_file(&fs, 0))
+    for x in ids.view()
+        add(&fs, x)
+    val a = ids[0]
+    val b = ids[1]
+    val c = ids[2]
+    val d = ids[3]
+    val e = ids[4]
+    assert(list_is(orphans(&fs), [e, d, c, b, a]) && list_is(disk_list(&fs, &dev), [e, d, c, b, a]))
+    settled_clean(&fs)
+    take(&fs, c)
+    assert(list_is(orphans(&fs), [e, d, b, a]) && list_is(disk_list(&fs, &dev), [e, d, b, a]))
+    take(&fs, a)
+    assert(list_is(orphans(&fs), [e, d, b]) && list_is(disk_list(&fs, &dev), [e, d, b]))
+    take(&fs, e)
+    assert(list_is(orphans(&fs), [d, b]) && list_is(disk_list(&fs, &dev), [d, b]))
+    add(&fs, c)
+    assert(list_is(orphans(&fs), [c, d, b]) && list_is(disk_list(&fs, &dev), [c, d, b]))
+    take(&fs, b)
+    take(&fs, c)
+    take(&fs, d)
+    assert(orphans(&fs).len() == 0 && disk_list(&fs, &dev).len() == 0)
+    settled_clean(&fs)
+
+@test("adding a member twice, and removing one that is not on the list, are Invalid")
+list_misuse()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val a = new_file(&fs, 0)
+    val b = new_file(&fs, 0)
+    add(&fs, a)
+    var h = fs.start("orphan", C_INODE + C_SB)
+    assert(code(orphan_add(&fs, &h, a)) == 3)
+    assert(code(orphan_remove(&fs, &h, b)) == 3)
+    fs.stop(&h)
+    assert(list_is(orphans(&fs), [a]))
+
+@test("a remove costs the inode and its predecessor; an add the inode and the superblock")
+list_credits()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    // Two inodes in different inode-table blocks, so the predecessor is a buffer of its own.
+    val a = new_file(&fs, 0)
+    for _ in 0..<16
+        new_file(&fs, 0)
+    val b = new_file(&fs, 0)
+    assert(fs.inode_location(a).block != fs.inode_location(b).block)
+    add(&fs, a)
+    add(&fs, b)
+    var h = fs.start("orphan", C_INODE + C_SB)
+    must(orphan_remove(&fs, &h, a))
+    assert(h.spent() == 2)
+    fs.stop(&h)
+    var h2 = fs.start("orphan", C_INODE + C_SB)
+    must(orphan_remove(&fs, &h2, b))
+    assert(h2.spent() == 2)
+    fs.stop(&h2)
+    settled_clean(&fs)
+
+@test("mount builds the list in memory from the disk and finishes every member: deletes and truncations")
+mount_processes_list()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    // Three orphans: a zero-link file with data, a truncation in progress, and a zero-link empty file.
+    val gone = new_file(&fs, 0)
+    put_pattern(&fs, gone, 0, 3 * BLOCK_SIZE, 1)
+    val cut = sparse_file(&fs, 30)
+    val empty = new_file(&fs, 0)
+    must(fs.checkpoint_all())
+    val free0 = free_total(&fs)
+    val inodes0 = fs.free_inodes_total.load()
+    val cut_blocks = blocks_of(&fs, cut)
+    var h = fs.start("setup", 8)
+    must(change_inode(&fs, &h, gone, (n) -> n.links = 0))
+    must(orphan_add(&fs, &h, gone))
+    must(change_inode(&fs, &h, cut, (n) -> n.size = 5 * u64(BLOCK_SIZE)))
+    must(orphan_add(&fs, &h, cut))
+    must(change_inode(&fs, &h, empty, (n) -> n.links = 0))
+    must(orphan_add(&fs, &h, empty))
+    fs.stop(&h)
+    must(fs.checkpoint_all())
+    checked_clean(&dev)
+    var again = mounted(&dev)
+    assert(orphans(&again).len() == 0 && again.sb.orphan_head == 0)
+    assert(code(stat(&again, gone)) == 3 && code(stat(&again, empty)) == 3)
+    // Blocks 0, 2 and 4 stay of `cut`'s.
+    val n = must_inode(stat(&again, cut))
+    assert(n.size == 5 * u64(BLOCK_SIZE) && n.blocks == 3 && n.links == 1 && n.flags & INODE_ORPHAN == 0)
+    must(again.checkpoint_all())
+    assert(free_total(&again) == free0 + 3 + cut_blocks - 3)
+    assert(again.free_inodes_total.load() == inodes0 + 2)
+    settled_clean(&again)
+
+@test("a read-only mount leaves the list for later; the next read-write mount finishes it")
+read_only_mount_waits()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val ino = new_file(&fs, 0)
+    put_pattern(&fs, ino, 0, BLOCK_SIZE, 1)
+    must(hold(&fs, ino))
+    must(drop_link(&fs, ino))
+    must(fs.checkpoint_all())
+    var nf = NoFlushDevice(&dev)
+    var ro = mounted(&nf)
+    assert(ro.read_only() && super_of(&dev).orphan_head == ino)
+    assert(must_inode(stat(&ro, ino)).links == 0)
+    var rw = mounted(&dev)
+    assert(rw.sb.orphan_head == 0 && code(stat(&rw, ino)) == 3)
+    settled_clean(&rw)
+
+// Write the orphan head (and an inode's `orphan_next`/flags) straight onto the disk, sealed.
+private set_disk_head(dev: *RamDevice, ino: u64)
+    var b = raw(dev, 1)
+    val sb: *Superblock = at(b.view(), 0)
+    sb.orphan_head = ino
+    seal_superblock(b.view())
+    raw_put(dev, 1, b.view())
+
+private set_disk_link(dev: *RamDevice, ino: u64, next: u64, flag: bool)
+    val m = open(dev) match
+        Ok(m) -> m
+        Err(_) -> panic("the image did not open")
+    val loc = m.inode_location(ino).unwrap()
+    var b = raw(dev, loc.block)
+    val node: *Inode = at(b.view(), loc.offset)
+    node.orphan_next = next
+    node.flags = if flag then node.flags | INODE_ORPHAN else node.flags & ~INODE_ORPHAN
+    seal_inode(m.seed, ino, b.view()[loc.offset..<loc.offset + INODE_SIZE])
+    raw_put(dev, loc.block, b.view())
+
+// Two new files on `dev`, unmounted: answers the first; the second is the next number.
+private two_files(dev: *RamDevice) -> u64
+    var fs = mounted(dev)
+    val a = new_file(&fs, 0)
+    val b = new_file(&fs, 0)
+    assert(b == a + 1)
+    must(fs.unmount())
+    a
+
+@test("a list that loops back on itself is corruption: mount aborts the journal and the checker reports a cycle")
+corrupt_cycle()
+    var dev = small_device()
+    val a = two_files(&dev)
+    set_disk_link(&dev, a, a + 1, true)
+    set_disk_link(&dev, a + 1, a, true)
+    set_disk_head(&dev, a)
+    val rep = check(&dev)
+    assert(has_problem(rep, Problem.OrphanCycle(a)) && rep.problems.len() == 1)
+    var m = mounted(&dev)
+    assert(m.aborted() && m.read_only())
+    assert(m.journal_error() == ERROR_EIO)
+    assert(m.plat.held() == 0)
+
+// The head set to `ino_of(first file, inode count)` on a fresh image with two files: the checker
+// reports it, and mount aborts.
+private bad_head(ino_of: &Fn(u64, u64) -> u64)
+    var dev = small_device()
+    val a = two_files(&dev)
+    val ino = ino_of(a, super_of(&dev).inode_count)
+    set_disk_head(&dev, ino)
+    assert(has_problem(check(&dev), Problem.OrphanMember(ino)))
+    var m = mounted(&dev)
+    assert(m.aborted() && m.read_only() && m.plat.held() == 0)
+
+@test("a member that is free, without ORPHAN, reserved, or past the last inode is corruption")
+corrupt_members()
+    bad_head((a, _) -> a + 60)
+    bad_head((a, _) -> a)
+    bad_head((_, _) -> 5)
+    bad_head((_, count) -> count + 1)
+
+@test("a member whose next link reaches a free inode is corruption at that link")
+corrupt_next_link()
+    var dev = small_device()
+    val a = two_files(&dev)
+    set_disk_link(&dev, a, a + 50, true)
+    set_disk_head(&dev, a)
+    assert(has_problem(check(&dev), Problem.OrphanMember(a + 50)))
+    assert(mounted(&dev).aborted())
+
+@test("ORPHAN on an inode the list does not reach is a problem for the checker")
+corrupt_stray_flag()
+    var dev = small_device()
+    val a = two_files(&dev)
+    set_disk_link(&dev, a, 0, true)
+    val rep = check(&dev)
+    assert(has_problem(rep, Problem.OrphanFlag(a)) && rep.problems.len() == 1)

@@ -21,25 +21,25 @@ private struct Loop
     before: u64
     after: u64
 
-private visible(cd: *CrashDevice[RamDevice]) -> Buf[u32]
+private visible(cd: *CrashDevice[RamDevice]) -> Buf[u64]
     var fs = mounted(cd)
     assert(!fs.read_only())
     val rep = checked_clean(cd)
-    var out: Buf[u32] = buf()
+    var out: Buf[u64] = buf()
     var sb = raw(cd, 1)
     mask_mount_fields(sb.view())
-    out.push(crc32c(0xFFFF_FFFF, sb.view()))
+    out.push(digest(sb.view()))
     val g = fs.geo
     for t in 0..<u64(g.gdt_blocks)
-        out.push(crc32c(0xFFFF_FFFF, raw(cd, 2 + t).view()))
+        out.push(digest(raw(cd, 2 + t).view()))
     for grp in 0..<g.group_count
-        out.push(crc32c(0xFFFF_FFFF, raw(cd, g.block_bitmap(grp)).view()))
-        out.push(crc32c(0xFFFF_FFFF, raw(cd, g.inode_bitmap(grp)).view()))
+        out.push(digest(raw(cd, g.block_bitmap(grp)).view()))
+        out.push(digest(raw(cd, g.inode_bitmap(grp)).view()))
         for t in 0..<u64(g.itable_blocks())
-            out.push(crc32c(0xFFFF_FFFF, raw(cd, g.inode_table(grp) + t).view()))
+            out.push(digest(raw(cd, g.inode_table(grp) + t).view()))
     for b in rep.claimed.view()
-        out.push(u32(b))
-        out.push(crc32c(0xFFFF_FFFF, raw(cd, b).view()))
+        out.push(b)
+        out.push(digest(raw(cd, b).view()))
     out
 
 private rewound(cd: *CrashDevice[RamDevice], base: *RamDevice)
@@ -136,6 +136,7 @@ private make_file(fs: *CrashFs, len: u32) -> Result[u64, FsError]
 
 private make_file_in(fs: *CrashFs, h: *Handle, len: u32) -> Result[u64, FsError]
     val ino = alloc_inode(fs, h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO))?
+    change_inode(fs, h, ino, (n) -> n.size = u64(len) * u64(BLOCK_SIZE))?
     val run = alloc_blocks(fs, h, 0, len, 0)?
     insert(fs, h, extent_tree(ino, 0), Extent(0, run.len, run.first, false))?
     Ok(ino)
@@ -183,6 +184,7 @@ private narrow_file(fs: *CrashFs, count: u64) -> u64
     val ino = alloc_inode(fs, &h, NewInode(S_IFREG | 0o644, 0, 0, 1, ROOT_INO)) match
         Ok(i) -> i
         Err(_) -> panic("no inode")
+    cover_all(fs, &h, ino)
     fs.stop(&h)
     narrow_root(fs, ino)
     for k in 0..<count

@@ -108,6 +108,17 @@ stamp_all[D: BlockDevice](fs: *Fs[D, HostPlatform], blocks: Buf[u64], salt: u32)
     fs.stop(&h)
     must(fs.commit())
 
+// Give inode `ino` (declared in `h` already) the largest size, so whatever blocks a test of the tree or
+// the journal maps lie inside it (section 8: no written extent past the end) and no tail is checked.
+cover_all[D: BlockDevice](fs: *Fs[D, HostPlatform], h: *Handle, ino: u64)
+    must(change_inode(fs, h, ino, (n) -> n.size = MAX_FILE_SIZE))
+
+// A digest of `bytes` for comparing images. Not CRC32C: a block whose structures carry their own
+// CRC32C — every inode slot, every sealed metadata block — has the same CRC32C whatever those
+// structures hold (a CRC over a message followed by its own CRC is a constant of the seeds), so a
+// CRC-based digest cannot see an inode change. SipHash has no such linearity.
+digest(bytes: []const u8) -> u64 = siphash(1, 3, 0x6B66_7364_6967_6573, 0x0123_4567_89AB_CDEF, bytes)
+
 raw[D: BlockDevice](dev: *D, b: u64) -> Buf[u8]
     var out = new_block()
     assert(dev.read(b, out.view()).is_ok())
