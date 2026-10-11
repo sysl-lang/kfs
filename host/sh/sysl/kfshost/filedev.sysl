@@ -1,0 +1,76 @@
+module keel.kfshost
+@requires(os)
+
+import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
+import sysl.buf.{Buf, buf}
+import sysl.fs
+import sysl.io.Reader
+import sysl.time
+
+// A block device over an image file: block `b` is bytes `b * 4096 ..< (b + 1) * 4096` of the file. Every
+// write is handed to the operating system before it returns, so a flush has nothing left to wait for
+// beyond what the host's own cache decides.
+struct FileDevice
+    private file: fs.File
+    private count: u64
+
+    // Hand back the file descriptor; further use of the device fails.
+    close(*self) -> bool = self.file.close().is_ok()
+
+impl BlockDevice for FileDevice
+    blocks(self) -> u64 = self.count
+
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
+        if out.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        if b >= self.count then return Err(DeviceError.OutOfRange)
+        if self.file.seek(long(b) * long(BLOCK_SIZE)).is_err() then return Err(DeviceError.Io)
+        val got = self.file.read(out)
+        if got.len != BLOCK_SIZE then return Err(DeviceError.Io)
+        Ok(())
+
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+        if data.len != BLOCK_SIZE then return Err(DeviceError.BadLength)
+        if b >= self.count then return Err(DeviceError.OutOfRange)
+        if self.file.seek(long(b) * long(BLOCK_SIZE)).is_err() then return Err(DeviceError.Io)
+        self.file.write(data)
+        if self.file.flush().is_err() then return Err(DeviceError.Io)
+        Ok(())
+
+    flush(*self) -> Result[unit, DeviceError]
+        if self.file.flush().is_err() then return Err(DeviceError.Io)
+        Ok(())
+
+// Open an existing image. It has to be a whole number of blocks.
+open_image(path: string) -> Result[FileDevice, DeviceError]
+    var f = fs.open_update(path) match
+        Ok(f) -> f
+        Err(_) -> return Err(DeviceError.Io)
+    val size = f.size() match
+        Ok(n) -> n
+        Err(_) -> return Err(DeviceError.Io)
+    if size % long(BLOCK_SIZE) != 0 then return Err(DeviceError.BadLength)
+    Ok(FileDevice(f, u64(size) / u64(BLOCK_SIZE)))
+
+// Make a new, zero-filled image of `blocks` blocks, replacing any file there.
+create_image(path: string, blocks: u64) -> Result[FileDevice, DeviceError]
+    var f = fs.create_update(path) match
+        Ok(f) -> f
+        Err(_) -> return Err(DeviceError.Io)
+    if f.truncate(long(blocks) * long(BLOCK_SIZE)).is_err() then return Err(DeviceError.Io)
+    Ok(FileDevice(f, blocks))
+
+// The formatter's randomness: 32 bytes from the host's entropy source, or None if it cannot be read.
+host_entropy() -> Option[Buf[u8]]
+    var f = fs.open("/dev/urandom") match
+        Ok(f) -> f
+        Err(_) -> return None
+    var bytes: Buf[u8] = buf()
+    for _ in 0..<32
+        bytes.push(0)
+    val got = f.read(bytes.view())
+    f.close()
+    if got.len != 32 then return None
+    Some(bytes)
+
+// The host's clock, in seconds since the epoch.
+host_now() -> i64 = time.now().us / 1_000_000

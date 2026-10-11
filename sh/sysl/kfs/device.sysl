@@ -1,0 +1,27 @@
+module keel.kfs
+
+// The block device every part of KFS is written against: whole 4 KiB blocks, read and written by number,
+// and a flush that makes everything written before it durable (kfs/SPEC.md section 2, "The device model").
+//
+// It is a trait, and the algorithms are generic over it (`format[D: BlockDevice](dev: *D, ...)`), so a
+// wrapper is just another implementation holding the device it wraps: the crash-injection device of the
+// test harness is `CrashDevice[D: BlockDevice]`, and the kernel's virtio-blk driver is one more. Nothing
+// here allocates or needs an operating system.
+
+enum DeviceError
+    OutOfRange
+    BadLength
+    Io
+
+trait BlockDevice
+    // How many blocks the device has.
+    blocks(self) -> u64
+
+    // Copy block `b` into `out`, which is exactly one block.
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
+
+    // Write block `b` from `data`, which is exactly one block.
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+
+    // Everything written before this is durable once it returns.
+    flush(*self) -> Result[unit, DeviceError]

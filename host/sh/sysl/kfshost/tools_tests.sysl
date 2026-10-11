@@ -1,0 +1,156 @@
+module keel.kfshost
+@tests
+@requires(os)
+
+import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, SUPER_MAGIC}
+import sysl.buf.{Buf, buf}
+import sysl.fs
+import sysl.fmt.hex
+import sysl.text.Search
+
+private entropy() -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i) + 1)
+    e
+
+private made(path: string, args: []string) -> string
+    val e = entropy()
+    run_mkfs(args, e.view(), 1_700_000_000) match
+        Ok(text) -> text
+        Err(why) -> panic(s"mkfs.kfs failed: ${why}")
+
+private mkfs_failure(args: []string) -> string
+    val e = entropy()
+    run_mkfs(args, e.view(), 1_700_000_000) match
+        Ok(_) -> panic("mkfs.kfs succeeded")
+        Err(why) -> why
+
+private dumped(args: []string) -> string
+    run_dump(args) match
+        Ok(text) -> text
+        Err(why) -> panic(s"kfsdump failed: ${why}")
+
+private dump_failure(args: []string) -> string
+    run_dump(args) match
+        Ok(_) -> panic("kfsdump succeeded")
+        Err(why) -> why
+
+@test("mkfs.kfs makes an image of the size asked, formats it with the defaults, and says so")
+mkfs_makes_an_image()
+    val path = "/tmp/keel-kfshost-mkfs.img"
+    val text = made(path, [path, "8192"])
+    assert(text.contains("8192 blocks, 4 groups of 2048 blocks, 1024 inodes each, journal 1024 blocks"))
+    var d = open_image(path) match
+        Ok(x) -> x
+        Err(_) -> panic("no image")
+    assert_eq(d.blocks(), 8192)
+    assert(d.close())
+    assert(fs.remove_file(path).is_ok())
+
+@test("the options set the inode density, the reserve, the group size and the journal")
+mkfs_options()
+    val path = "/tmp/keel-kfshost-mkfs-opts.img"
+    val text = made(path, [path, "6145", "-g", "4096", "-i", "16384", "-m", "0", "-j", "1100"])
+    assert(text.contains("2 groups of 4096 blocks, 1024 inodes each, journal 1100 blocks"))
+    val sb = dumped([path, "super"])
+    assert(sb.contains("reserved_blocks   0\n"))
+    assert(sb.contains("journal_blocks    1100\n"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("mkfs.kfs refuses what the geometry refuses, bad options and missing arguments, each with its reason")
+mkfs_refusals()
+    val path = "/tmp/keel-kfshost-mkfs-bad.img"
+    assert(mkfs_failure([path, "3204"]).contains("fewer than two groups"))
+    assert(mkfs_failure([path, "8192", "-j", "4096"]).contains("journal does not fit"))
+    assert(mkfs_failure([path, "8192", "-g", "3000"]).contains("power of two"))
+    assert(mkfs_failure([path, "8192", "-i", "100"]).contains("at least 4096"))
+    assert(mkfs_failure([path, "8192", "-m", "101"]).contains("at most 100"))
+    assert(mkfs_failure([path, "8192", "-j", "10"]).contains("1024 to 16384"))
+    assert(mkfs_failure([path, "8192", "-x", "1"]).contains("unknown option '-x'"))
+    assert(mkfs_failure([path, "8192", "-i"]).contains("-i needs a number"))
+    assert(mkfs_failure([path, "8192", "-i", "many"]).contains("'many' is not a number"))
+    assert(mkfs_failure([path, "lots"]).contains("'lots' is not a number of blocks"))
+    assert(mkfs_failure([path]).contains("usage: mkfs.kfs"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("kfsdump prints the superblock and the descriptors, and each on its own")
+dump_superblock_and_groups()
+    val path = "/tmp/keel-kfshost-dump.img"
+    made(path, [path, "8192"])
+    val all = dumped([path])
+    assert(all.contains("superblock\n"))
+    assert(all.contains("magic             0x5353464b\n"))
+    assert(all.contains("group_count       4\n"))
+    assert(all.contains("blocks_per_group  2048\n"))
+    assert(all.contains("journal_blocks    1024\n"))
+    assert(all.contains("state             CLEAN \n"))
+    assert(all.contains("group descriptors (4)\n"))
+    assert(all.contains("group 0: blocks 1..2048"))
+    assert(all.contains("group 3: blocks 6145..8191"))
+    assert(all.contains("block_bitmap 3  inode_bitmap 4  inode_table 5"))
+    // The uuid and hash seed are the entropy given, in hex.
+    val e = entropy()
+    var uuid = ""
+    for i in 0..<16
+        uuid = uuid + hex(e.view()[i], 2)
+    assert(all.contains(s"uuid              ${uuid}\n"))
+    assert(dumped([path, "super"]).contains("csum_seed"))
+    assert(!dumped([path, "super"]).contains("group descriptors"))
+    assert(dumped([path, "groups"]).contains("group descriptors (4)"))
+    assert(!dumped([path, "groups"]).contains("csum_seed"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("kfsdump prints the root with its raw extent root and leaf, and lost+found with none")
+dump_inodes()
+    val path = "/tmp/keel-kfshost-dump-inodes.img"
+    made(path, [path, "8192"])
+    val root = dumped([path, "inode", "2"])
+    assert(root.contains("inode 2: block 5 offset 256  checksum ok\n"))
+    assert(root.contains("mode        0o40755 (directory)"))
+    assert(root.contains("links       3\n"))
+    assert(root.contains("size        4096\n"))
+    assert(root.contains("parent      2\n"))
+    assert(root.contains("extent root: magic 0x5853464b ok count 1 max 7 depth 0"))
+    assert(root.contains("[0] logical 0 len 1 flags 0 physical 69\n"))
+    assert(root.contains("checksum and owner ok"))
+    assert(root.contains("directory leaf: magic 0x4453464b count 1"))
+    assert(root.contains("ino 11 rec_len 4072 type dir name 'lost+found'"))
+    val lf = dumped([path, "inode", "11"])
+    assert(lf.contains("mode        0o40700 (directory)"))
+    assert(lf.contains("links       2\n"))
+    assert(lf.contains("blocks      0\n"))
+    assert(lf.contains("extent root: magic 0x5853464b ok count 0 max 7 depth 0"))
+    assert(!lf.contains("directory leaf"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("kfsdump refuses a missing image, a bad inode number, and a bad request, each with its reason")
+dump_refusals()
+    val path = "/tmp/keel-kfshost-dump-bad.img"
+    made(path, [path, "8192"])
+    assert(dump_failure(["/tmp/keel-kfshost-nothing-here.img"]).contains("cannot open"))
+    assert(dump_failure([path, "inode", "0"]).contains("inode 0 does not exist"))
+    assert(dump_failure([path, "inode", "4097"]).contains("inode 4097 does not exist"))
+    assert(dump_failure([path, "inode", "x"]).contains("'x' is not an inode number"))
+    assert(dump_failure([path, "inode"]).contains("usage: kfsdump"))
+    assert(dump_failure([path, "nonsense"]).contains("usage: kfsdump"))
+    assert(dump_failure([]).contains("usage: kfsdump"))
+    assert(fs.remove_file(path).is_ok())
+
+@test("kfsdump of an image whose primary superblock is damaged reports it and the backup the search finds")
+dump_finds_the_backup()
+    val path = "/tmp/keel-kfshost-dump-backup.img"
+    made(path, [path, "8192"])
+    var d = open_image(path) match
+        Ok(x) -> x
+        Err(_) -> panic("no image")
+    var junk: Buf[u8] = buf()
+    for i in 0..<BLOCK_SIZE
+        junk.push(u8(i))
+    assert(d.write(1, junk.view()).is_ok())
+    assert(d.close())
+    val why = dump_failure([path])
+    assert(why.contains("primary superblock fails its checksum"))
+    assert(why.contains("backup superblock was found at block 2049"))
+    assert(why.contains("group_count       4\n"))
+    assert(fs.remove_file(path).is_ok())

@@ -1,0 +1,194 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// `mkfs.kfs`'s engine: write an empty KFS filesystem onto a block device (kfs/SPEC.md sections 4-8, 10, 14).
+//
+// What it writes: every group's bitmaps (metadata, journal and past-the-end bits set) and a zeroed inode
+// table, the descriptor table and the superblock in group 0 and their backups in groups 1 and G - 1, the
+// reserved inodes 1 and 3-10, the root directory (inode 2) and `/lost+found` (inode 11), and an empty
+// journal. The randomness (`uuid`, `hash_seed`) and the clock are parameters, so a test formats the same
+// bytes every time.
+//
+// The root holds one entry, `lost+found`, so it has one directory leaf: the first data block of group 0.
+// `lost+found` itself is empty, which is a directory with no blocks. Everything else about directories is
+// the directory code's.
+
+enum FormatError
+    Geometry(why: GeometryError)
+    Device(why: DeviceError)
+    // Fewer than 32 bytes of randomness.
+    BadEntropy
+
+impl From[GeometryError] for FormatError
+    from(e: GeometryError) -> FormatError = FormatError.Geometry(e)
+
+impl From[DeviceError] for FormatError
+    from(e: DeviceError) -> FormatError = FormatError.Device(e)
+
+// The bytes of randomness a format consumes: the uuid, then the directory hash seed.
+const ENTROPY_BYTES: usize = 32
+
+const LOST_FOUND_NAME: string = "lost+found"
+const LOST_FOUND_INO: u64 = 11
+
+// Mode bits: a directory, and the permissions of the root (755) and of lost+found (700).
+const MODE_DIR: u16 = 0o040000
+const MODE_ROOT: u16 = 0o040755
+const MODE_LOST_FOUND: u16 = 0o040700
+
+// A zeroed block on the heap, so it is aligned for any structure in it.
+block_buf() -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for _ in 0..<BLOCK_SIZE
+        b.push(0)
+    b
+
+// Fill in the inode of a directory whose parent is the root, at `at_offset` in `block`: empty when
+// `extent_block` is 0, else one block mapped by one extent at logical block 0.
+private dir_inode(block: []u8, at_offset: usize, seed: u32, ino: u64, mode: u16, links: u32, size: u64, extent_block: u64, now: i64)
+    val node: *Inode = at(block, at_offset)
+    node.mode = mode
+    node.links = links
+    node.generation = 1
+    node.size = size
+    node.blocks = if extent_block != 0 then 1 else 0
+    node.atime_sec = now
+    node.mtime_sec = now
+    node.ctime_sec = now
+    node.crtime_sec = now
+    node.parent = ROOT_INO
+    val head: *NodeHeader = at(block, at_offset + 112)
+    head.magic = EXTENT_MAGIC
+    head.max = u16(EXTENT_ROOT_SLOTS)
+    if extent_block != 0
+        head.count = 1
+        val leaf: *ExtentLeaf = at(block, at_offset + 112 + 16)
+        leaf.logical = 0
+        leaf.len = 1
+        leaf.physical = extent_block
+    seal_inode(seed, ino, block[at_offset..<at_offset + INODE_SIZE])
+
+// Format `dev`: choose the geometry for its size under `o`, write the filesystem, flush, and answer the
+// geometry used. `entropy` is at least `ENTROPY_BYTES` of random bytes and `now` the time in seconds.
+format[D: BlockDevice](dev: *D, o: Options, entropy: []const u8, now: i64) -> Result[Geometry, FormatError]
+    if entropy.len < ENTROPY_BYTES then return Err(FormatError.BadEntropy)
+    val g = geometry(dev.blocks(), o)?
+    val uuid = entropy[0..<16]
+    val hash_seed = entropy[16..<32]
+    val seed = csum_seed_of(uuid)
+
+    var table: Buf[u8] = buf()
+    for _ in 0..<(usize(g.gdt_blocks) * BLOCK_SIZE)
+        table.push(0)
+    val zero = block_buf()
+
+    var free_blocks: u64 = 0
+    var free_inodes: u64 = 0
+    val bits = BLOCK_SIZE * 8
+
+    for i in 0..<g.group_count
+        val first = g.group_first(i)
+        val len = usize(g.group_len(i))
+        val meta = usize(g.meta_blocks(i))
+        var bb = block_buf()
+        var ib = block_buf()
+
+        bit_set_range(bb.view(), 0, meta)
+        if i == g.journal_group()
+            val at_journal = usize(g.journal_start - first)
+            bit_set_range(bb.view(), at_journal, at_journal + usize(g.journal_blocks))
+        if i == 0 then bit_set(bb.view(), usize(g.data_start(0) - first))
+        bit_set_range(bb.view(), len, bits)
+
+        val ipg = usize(g.inodes_per_group)
+        if i == 0 then bit_set_range(ib.view(), 0, usize(FIRST_INO))
+        bit_set_range(ib.view(), ipg, bits)
+
+        val desc: *GroupDesc = at(table.view(), (usize(i) % 64) * 64 + (usize(i) / 64) * BLOCK_SIZE)
+        desc.block_bitmap = g.block_bitmap(i)
+        desc.inode_bitmap = g.inode_bitmap(i)
+        desc.inode_table = g.inode_table(i)
+        desc.free_blocks = count_clear(bb.view(), len)
+        desc.free_inodes = count_clear(ib.view(), ipg)
+        desc.directories = if i == 0 then 2 else 0
+        desc.flags = if g.is_copy(i) then GROUP_COPY else 0
+        desc.block_bitmap_crc = bitmap_crc(seed, i, bb.view())
+        desc.inode_bitmap_crc = bitmap_crc(seed, i, ib.view())
+        free_blocks += u64(desc.free_blocks)
+        free_inodes += u64(desc.free_inodes)
+        val off = (usize(i) % 64) * 64 + (usize(i) / 64) * BLOCK_SIZE
+        seal_group_desc(seed, i, table.view()[off..<off + 64])
+
+        dev.write(g.block_bitmap(i), bb.view())?
+        dev.write(g.inode_bitmap(i), ib.view())?
+        for t in 0..<g.itable_blocks()
+            dev.write(g.inode_table(i) + u64(t), zero.view())?
+
+    // The inodes: 1 and 3-10 are reserved and stay zero, which is mode 0, allocated.
+    var inodes = block_buf()
+    val root_block = g.data_start(0)
+    dir_inode(inodes.view(), usize(ROOT_INO - 1) * INODE_SIZE, seed, ROOT_INO, MODE_ROOT, 3, u64(BLOCK_SIZE), root_block, now)
+    dir_inode(inodes.view(), usize(LOST_FOUND_INO - 1) * INODE_SIZE, seed, LOST_FOUND_INO, MODE_LOST_FOUND, 2, 0, 0, now)
+    dev.write(g.inode_table(0), inodes.view())?
+
+    // The root's one leaf, holding lost+found.
+    var leaf = block_buf()
+    single_entry_leaf(leaf.view(), seed, ROOT_INO, 1, LOST_FOUND_INO, DT_DIR, LOST_FOUND_NAME.bytes)
+    dev.write(root_block, leaf.view())?
+
+    // The journal: a superblock and an empty log, the first sequence to use being 1.
+    var jb = block_buf()
+    val js: *JournalSuper = at(jb.view(), 0)
+    js.header.magic = JOURNAL_MAGIC
+    js.header.kind = JOURNAL_SUPER
+    js.journal_blocks = g.journal_blocks
+    js.first = 1
+    js.start_seq = 1
+    for k in 0..<16
+        js.uuid[k] = uuid[k]
+    js.max_transaction = g.journal_blocks / 4
+    seal_sector(seed, jb.view())
+    dev.write(g.journal_start, jb.view())?
+
+    // The superblock, and its copies and the descriptor table's in every copy group.
+    var sbb = block_buf()
+    val sb: *Superblock = at(sbb.view(), 0)
+    sb.magic = SUPER_MAGIC
+    sb.version = FORMAT_VERSION
+    sb.block_size = u32(BLOCK_SIZE)
+    sb.state = STATE_CLEAN
+    sb.blocks = g.blocks
+    sb.group_count = g.group_count
+    sb.blocks_per_group = g.blocks_per_group
+    sb.inodes_per_group = g.inodes_per_group
+    sb.inode_size = u16(INODE_SIZE)
+    sb.first_ino = u16(FIRST_INO)
+    sb.inode_count = u64(g.group_count) * u64(g.inodes_per_group)
+    sb.free_blocks = free_blocks
+    sb.free_inodes = free_inodes
+    sb.reserved_blocks = g.reserved_blocks
+    sb.root_ino = ROOT_INO
+    sb.journal_start = g.journal_start
+    sb.journal_blocks = g.journal_blocks
+    sb.max_transaction = g.journal_blocks / 4
+    sb.gdt_blocks = g.gdt_blocks
+    sb.hash_algorithm = HASH_SIPHASH13
+    sb.csum_algorithm = CSUM_CRC32C
+    for k in 0..<16
+        sb.hash_seed[k] = hash_seed[k]
+        sb.uuid[k] = uuid[k]
+    sb.format_time = now
+    sb.write_time = now
+    sb.csum_seed = seed
+    seal_superblock(sbb.view())
+
+    for i in 0..<g.group_count
+        if g.is_copy(i)
+            val first = g.group_first(i)
+            dev.write(first, sbb.view())?
+            for t in 0..<usize(g.gdt_blocks)
+                dev.write(first + 1 + u64(t), table.view()[t * BLOCK_SIZE..<(t + 1) * BLOCK_SIZE])?
+
+    dev.flush()?
+    Ok(g)

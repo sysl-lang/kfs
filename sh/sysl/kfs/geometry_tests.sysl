@@ -1,0 +1,159 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+private refused(r: Result[Geometry, GeometryError], e: GeometryError) -> bool
+    r match
+        Err(x) -> x == e
+        Ok(_) -> false
+
+private chosen(blocks: u64, o: Options) -> Geometry
+    geometry(blocks, o) match
+        Ok(g) -> g
+        Err(_) -> panic("the geometry was refused")
+
+private with_bytes_per_inode(n: u32) -> Options = Options(n, RESERVED_DEFAULT, 0, 0)
+private with_blocks_per_group(n: u32) -> Options = Options(0, RESERVED_DEFAULT, n, 0)
+private with_journal(n: u32) -> Options = Options(0, RESERVED_DEFAULT, 0, n)
+private with_percent(n: u32) -> Options = Options(0, n, 0, 0)
+
+@test("a 32 MiB image is the spec's worked example")
+geometry_worked_example()
+    val g = chosen(8192, default_options())
+    assert_eq(g.blocks, 8192)
+    assert_eq(g.group_count, 4)
+    assert_eq(g.blocks_per_group, 2048)
+    assert_eq(g.group_len(0), 2048)
+    assert_eq(g.group_len(2), 2048)
+    assert_eq(g.group_len(3), 2047)
+    assert_eq(g.inodes_per_group, 1024)
+    assert_eq(g.gdt_blocks, 1)
+    assert_eq(g.journal_blocks, 1024)
+    assert_eq(g.journal_group(), 2)
+    assert_eq(g.journal_start, g.data_start(2))
+    assert_eq(g.journal_start, 1 + 2 * 2048 + 66)
+
+@test("the metadata of a copy group is a superblock, the descriptor table, two bitmaps and the inode table")
+geometry_metadata_locations()
+    val g = chosen(8192, default_options())
+    assert_eq(g.meta_blocks(0), 68)
+    assert_eq(g.meta_blocks(1), 68)
+    assert_eq(g.meta_blocks(2), 66)
+    assert_eq(g.meta_blocks(3), 68)
+    assert(g.is_copy(0) && g.is_copy(1) && g.is_copy(3))
+    assert(!g.is_copy(2))
+    assert_eq(g.block_bitmap(0), 3)
+    assert_eq(g.inode_bitmap(0), 4)
+    assert_eq(g.inode_table(0), 5)
+    assert_eq(g.data_start(0), 69)
+    assert_eq(g.block_bitmap(2), 1 + 2 * 2048)
+    assert_eq(g.data_start(2), 1 + 2 * 2048 + 66)
+
+@test("the smallest filesystem with the defaults is 3,205 blocks, and one block fewer is refused")
+geometry_smallest()
+    val g = chosen(3205, default_options())
+    assert_eq(g.group_count, 2)
+    assert_eq(g.blocks, 3205)
+    assert_eq(g.data_blocks(1), 1024 + 64)
+    assert_eq(g.journal_start, g.data_start(1))
+    assert(refused(geometry(3204, default_options()), GeometryError.TooSmall))
+    assert(refused(geometry(1, default_options()), GeometryError.TooSmall))
+    assert(refused(geometry(0, default_options()), GeometryError.TooSmall))
+
+@test("just under and over 2 x 2048 blocks")
+geometry_two_groups_edges()
+    assert_eq(chosen(4096, default_options()).group_count, 2)
+    assert_eq(chosen(4096, default_options()).group_len(1), 2047)
+    assert_eq(chosen(4097, default_options()).group_count, 2)
+    assert_eq(chosen(4097, default_options()).group_len(1), 2048)
+    // One block more is a third group of one block: not worth keeping, so the filesystem still ends
+    // where group 1 does and the block after it is unused.
+    val over = chosen(4098, default_options())
+    assert_eq(over.group_count, 2)
+    assert_eq(over.blocks, 4097)
+
+@test("a last group is kept when its data area holds 64 blocks, and dropped at 63")
+geometry_last_group_rule()
+    // Group 3 would hold 68 metadata blocks and 63 data blocks.
+    val dropped = chosen(1 + 3 * 2048 + 68 + 63, default_options())
+    assert_eq(dropped.group_count, 3)
+    assert_eq(dropped.blocks, 1 + 3 * 2048)
+    val kept = chosen(1 + 3 * 2048 + 68 + 64, default_options())
+    assert_eq(kept.group_count, 4)
+    assert_eq(kept.blocks, 1 + 3 * 2048 + 68 + 64)
+    assert_eq(kept.data_blocks(3), 64)
+
+@test("a last group that holds the journal needs 64 data blocks besides it")
+geometry_last_group_with_journal()
+    assert_eq(chosen(1 + 2048 + 68 + 1024 + 64, default_options()).group_count, 2)
+    assert(refused(geometry(1 + 2048 + 68 + 1024 + 63, default_options()), GeometryError.TooSmall))
+
+@test("the largest blocks_per_group is chosen for a large filesystem")
+geometry_largest_group()
+    val g = chosen(1 + 4 * 32768, default_options())
+    assert_eq(g.blocks_per_group, 32768)
+    assert_eq(g.group_count, 4)
+    assert_eq(g.inodes_per_group, 16384)
+    assert_eq(g.journal_blocks, 2048)
+    assert_eq(g.gdt_blocks, 1)
+    // Explicitly too.
+    val e = chosen(1 + 4 * 32768, with_blocks_per_group(32768))
+    assert_eq(e.blocks_per_group, 32768)
+    // The journal grows with the filesystem to its cap, and a group holds it twice over.
+    val big = chosen(1 + 8 * 32768, default_options())
+    assert_eq(big.journal_blocks, 4096)
+    assert_eq(big.blocks_per_group, 32768)
+    val huge = chosen(1 + 64 * 32768, default_options())
+    assert_eq(huge.journal_blocks, 16384)
+    assert_eq(huge.blocks_per_group, 32768)
+
+@test("the group size is the largest power of two that still gives four groups")
+geometry_chooses_group_size()
+    assert_eq(chosen(1 + 4 * 4096, default_options()).blocks_per_group, 4096)
+    assert_eq(chosen(1 + 4 * 4096 - 1, default_options()).blocks_per_group, 4096)
+    assert_eq(chosen(1 + 4 * 8192, default_options()).blocks_per_group, 8192)
+    // A fourth group that would be dropped does not count: three groups of 4096 are worse than more
+    // groups of 2048.
+    assert_eq(chosen(1 + 3 * 4096 + 100, default_options()).blocks_per_group, 2048)
+    assert_eq(chosen(1 + 3 * 4096 + 200, default_options()).blocks_per_group, 4096)
+
+@test("a journal that does not fit is refused, whoever asked for the size")
+geometry_journal_does_not_fit()
+    assert(refused(geometry(8192, with_journal(4096)), GeometryError.JournalDoesNotFit))
+    assert(refused(geometry(8192, Options(0, RESERVED_DEFAULT, 2048, 2048)), GeometryError.JournalDoesNotFit))
+    // A journal of exactly the data area fits.
+    val g = chosen(1 + 4 * 2048, with_journal(1980))
+    assert_eq(g.journal_blocks, 1980)
+    assert(refused(geometry(8192, with_journal(1983)), GeometryError.JournalDoesNotFit))
+
+@test("an explicit group size must be a power of two in range, and the other options are range checked")
+geometry_refuses_bad_options()
+    assert(refused(geometry(8192, with_blocks_per_group(3000)), GeometryError.BadBlocksPerGroup))
+    assert(refused(geometry(8192, with_blocks_per_group(1024)), GeometryError.BadBlocksPerGroup))
+    assert(refused(geometry(8192, with_blocks_per_group(65536)), GeometryError.BadBlocksPerGroup))
+    assert(refused(geometry(8192, with_bytes_per_inode(4095)), GeometryError.BadBytesPerInode))
+    assert(refused(geometry(8192, with_percent(101)), GeometryError.BadReservedPercent))
+    assert(refused(geometry(8192, with_journal(1023)), GeometryError.BadJournalBlocks))
+    assert(refused(geometry(8192, with_journal(16385)), GeometryError.BadJournalBlocks))
+    assert_eq(chosen(1 + 4 * 4096, with_blocks_per_group(4096)).blocks_per_group, 4096)
+
+@test("bytes-per-inode sets the inode count, rounded to 16 and kept in range")
+geometry_inode_counts()
+    assert_eq(chosen(8192, default_options()).inodes_per_group, 1024)
+    assert_eq(chosen(8192, with_bytes_per_inode(4096)).inodes_per_group, 2048)
+    assert_eq(chosen(8192, with_bytes_per_inode(65536)).inodes_per_group, 128)
+    assert_eq(chosen(8192, with_bytes_per_inode(5000)).inodes_per_group, 1664)
+    assert_eq(chosen(8192, with_bytes_per_inode(1073741824)).inodes_per_group, 16)
+    assert_eq(chosen(1 + 4 * 32768, with_bytes_per_inode(4096)).inodes_per_group, 32768)
+
+@test("reserved blocks are 2% of the data blocks unless told, the journal not counted")
+geometry_reserved_blocks()
+    val g = chosen(8192, default_options())
+    var data: u64 = 0
+    for i in 0..<g.group_count
+        data += u64(g.data_blocks(i))
+    data -= 1024
+    assert_eq(g.reserved_blocks, data * 2 / 100)
+    assert_eq(chosen(8192, with_percent(0)).reserved_blocks, 0)
+    assert_eq(chosen(8192, with_percent(100)).reserved_blocks, data)
+    assert_eq(chosen(8192, with_percent(10)).reserved_blocks, data / 10)

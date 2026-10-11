@@ -1,0 +1,24 @@
+module keel.kfs
+
+// A linear directory's leaf block (kfs/SPEC.md section 10), the smallest writer there can be: a leaf
+// holding one entry. The formatter needs exactly this to put `lost+found` in the root.
+
+// The bytes a record with a `name_len`-byte name really uses: its 12-byte header and the name, rounded up
+// to 8.
+record_live_bytes(name_len: usize) -> usize = (12 + name_len + 7) / 8 * 8
+
+// Make `block`, which is all zeros, a leaf of directory `owner` (at `generation`) holding one entry. The
+// record's `rec_len` spans the whole record area, so the records tile it exactly.
+single_entry_leaf(block: []u8, seed: u32, owner: u64, generation: u32, ino: u64, file_type: u8, name: []const u8)
+    val head: *DirLeafHeader = at(block, 0)
+    head.magic = DIR_LEAF_MAGIC
+    head.count = 1
+    val rec: *DirRecordHeader = at(block, 8)
+    rec.ino = ino
+    rec.rec_len = u16(TAIL_OFFSET - 8)
+    rec.name_len = u8(name.len)
+    rec.file_type = file_type
+    for i in 0..<name.len
+        block[8 + 12 + i] = name[i]
+    set_tail(block, owner, generation)
+    seal_block(seed, block)

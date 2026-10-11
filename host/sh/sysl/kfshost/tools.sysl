@@ -1,0 +1,116 @@
+module keel.kfshost
+@requires(os)
+
+import kfs.keel.kfs.{BlockDevice, FormatError, GeometryError, Mounted, OpenError, Options, RESERVED_DEFAULT, default_options}
+import kfs.keel.kfs.{find_backup, format, open}
+import sysl.buf.{Buf, buf}
+
+// The programs `mkfs.kfs` and `kfsdump` as functions of their arguments, so the tests run exactly what the
+// command line runs. Each takes the arguments after the program's name and answers the text to print, or
+// the message to print on failure.
+
+const MKFS_USAGE: string = "usage: mkfs.kfs <image> <blocks> [-i bytes-per-inode] [-m reserved-percent] [-g blocks-per-group] [-j journal-blocks]"
+const DUMP_USAGE: string = "usage: kfsdump <image> [super | groups | inode <number>]"
+
+private number(text: string) -> Option[u64]
+    if text.bytes.len == 0 || text.bytes.len > 18 then return None
+    var v: u64 = 0
+    for c in text.bytes
+        if c < u8('0') || c > u8('9') then return None
+        v = v * 10 + u64(c - u8('0'))
+    Some(v)
+
+private option_value(args: []string, at: usize, flag: string) -> Result[u32, string]
+    if at >= args.len then return Err(s"mkfs.kfs: ${flag} needs a number")
+    val v = number(args[at]) match
+        Some(n) -> n
+        None -> return Err(s"mkfs.kfs: '${args[at]}' is not a number")
+    if v > 0xFFFF_FFFE then return Err(s"mkfs.kfs: ${args[at]} is too large for ${flag}")
+    Ok(u32(v))
+
+geometry_message(e: GeometryError) -> string
+    e match
+        TooSmall -> "the filesystem would have fewer than two groups (the smallest is 3205 blocks with the defaults)"
+        JournalDoesNotFit -> "the journal does not fit in the data area of the middle group"
+        BadBlocksPerGroup -> "blocks per group must be a power of two from 2048 to 32768"
+        BadBytesPerInode -> "bytes per inode must be at least 4096"
+        BadReservedPercent -> "the reserved percentage must be at most 100"
+        BadJournalBlocks -> "the journal must be 1024 to 16384 blocks"
+
+format_message(e: FormatError) -> string
+    e match
+        Geometry(why) -> geometry_message(why)
+        Device(_) -> "the device failed"
+        BadEntropy -> "not enough randomness"
+
+open_message(e: OpenError) -> string
+    e match
+        Device(_) -> "the device failed"
+        BadChecksum -> "the primary superblock fails its checksum"
+        BadMagic -> "not a KFS filesystem (bad magic)"
+        BadVersion -> "a version, block size or algorithm this tool does not know"
+        BadGeometry -> "the superblock's numbers are inconsistent or do not fit the device"
+        BadDescriptor(g) -> s"group ${g}'s descriptor fails its checksum"
+        MisplacedGroup(g) -> s"group ${g}'s descriptor puts its metadata somewhere else than the layout does"
+
+// `mkfs.kfs <image> <blocks> [options]`: make a zeroed image file of that many blocks and format it.
+run_mkfs(args: []string, entropy: []const u8, now: i64) -> Result[string, string]
+    if args.len < 2 then return Err(MKFS_USAGE)
+    val path = args[0]
+    val blocks = number(args[1]) match
+        Some(n) -> n
+        None -> return Err(s"mkfs.kfs: '${args[1]}' is not a number of blocks")
+    var o = default_options()
+    var i: usize = 2
+    while i < args.len
+        val flag = args[i]
+        if flag == "-i" then o.bytes_per_inode = option_value(args, i + 1, flag)?
+        elif flag == "-m" then o.reserved_percent = option_value(args, i + 1, flag)?
+        elif flag == "-g" then o.blocks_per_group = option_value(args, i + 1, flag)?
+        elif flag == "-j" then o.journal_blocks = option_value(args, i + 1, flag)?
+        else return Err(s"mkfs.kfs: unknown option '${flag}'\n${MKFS_USAGE}")
+        i += 2
+
+    var dev = create_image(path, blocks) match
+        Ok(d) -> d
+        Err(_) -> return Err(s"mkfs.kfs: cannot create ${path}")
+    val made = format(&dev, o, entropy, now)
+    dev.close()
+    made match
+        Ok(g) -> Ok(s"mkfs.kfs: ${path}: ${g.blocks} blocks, ${g.group_count} groups of ${g.blocks_per_group} blocks, ${g.inodes_per_group} inodes each, journal ${g.journal_blocks} blocks at ${g.journal_start}")
+        Err(e) -> Err(s"mkfs.kfs: ${format_message(e)}")
+
+// `kfsdump <image> [super | groups | inode <number>]`: print what is asked about an image. With nothing
+// asked, the superblock and the descriptors. A primary superblock that fails its check is reported with
+// the backup the search finds.
+run_dump(args: []string) -> Result[string, string]
+    if args.len < 1 then return Err(DUMP_USAGE)
+    var dev = open_image(args[0]) match
+        Ok(d) -> d
+        Err(_) -> return Err(s"kfsdump: cannot open ${args[0]}")
+    val result = dump_opened(&dev, args)
+    dev.close()
+    result
+
+private dump_opened[D: BlockDevice](dev: *D, args: []string) -> Result[string, string]
+    var m = open(dev) match
+        Ok(m) -> m
+        Err(e) ->
+            var why = s"kfsdump: ${open_message(e)}"
+            find_backup(dev) match
+                Some(b) -> why = why + s"\na backup superblock was found at block ${b.block}:\n" + dump_superblock(b.sb)
+                None -> why = why + "\nno backup superblock was found"
+            return Err(why)
+    val what = if args.len >= 2 then args[1] else ""
+    if what == "super" then return Ok(dump_superblock(m.sb))
+    if what == "groups" then return Ok(dump_groups(&m))
+    if what == "inode"
+        if args.len < 3 then return Err(DUMP_USAGE)
+        val ino = number(args[2]) match
+            Some(n) -> n
+            None -> return Err(s"kfsdump: '${args[2]}' is not an inode number")
+        return dump_inode(dev, &m, ino) match
+            Ok(text) -> Ok(text)
+            Err(why) -> Err(s"kfsdump: ${why}")
+    if what == "" then return Ok(dump_superblock(m.sb) + dump_groups(&m))
+    Err(DUMP_USAGE)

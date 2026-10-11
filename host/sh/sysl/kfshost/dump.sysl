@@ -1,0 +1,181 @@
+module keel.kfshost
+@requires(os)
+
+import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, DirLeafHeader, DirRecordHeader, ExtentIndex, ExtentLeaf, GroupDesc, Inode}
+import kfs.keel.kfs.{Mounted, NodeHeader, Superblock, TAIL_OFFSET, at, block_buf, verify_inode, verify_owned_block}
+import kfs.keel.kfs.{DIR_LEAF_MAGIC, EXTENT_MAGIC, INODE_INDEXED, INODE_INLINE, INODE_ORPHAN, STATE_CLEAN, STATE_ERROR}
+import sysl.fmt.hex
+
+// What `kfsdump` prints, as text: the superblock, the group descriptors, and any inode with its raw extent
+// root and, for a directory, its raw leaf. Nothing here changes the image.
+
+private octal(v: u32) -> string
+    if v == 0 then return "0"
+    var digits = ""
+    var n = v
+    while n > 0
+        digits = s"${n % 8}" + digits
+        n = n / 8
+    digits
+
+private hex_bytes(bytes: []const u8) -> string
+    var out = ""
+    for x in bytes
+        out = out + hex(x, 2)
+    out
+
+private trimmed(bytes: []const u8) -> string
+    var n = bytes.len
+    while n > 0 && bytes[n - 1] == 0
+        n -= 1
+    str_cast(bytes[0..<n])
+
+private verdict(good: bool) -> string = if good then "ok" else "BAD"
+
+private state_text(state: u16) -> string
+    var out = ""
+    if state & STATE_CLEAN != 0 then out = out + "CLEAN "
+    if state & STATE_ERROR != 0 then out = out + "ERROR "
+    if out == "" then "none" else out
+
+private type_text(mode: u16) -> string
+    val kind = mode & 0o170000
+    if kind == 0o100000 then return "regular file"
+    if kind == 0o040000 then return "directory"
+    if kind == 0o120000 then return "symlink"
+    if kind == 0o020000 then return "character device"
+    if kind == 0o060000 then return "block device"
+    if kind == 0o010000 then return "fifo"
+    if kind == 0o140000 then return "socket"
+    if mode == 0 then return "free"
+    "invalid"
+
+private dt_text(t: u8) -> string
+    if t == 1 then return "fifo"
+    if t == 2 then return "chr"
+    if t == 4 then return "dir"
+    if t == 6 then return "blk"
+    if t == 8 then return "reg"
+    if t == 10 then return "lnk"
+    if t == 12 then return "sock"
+    "unknown"
+
+dump_superblock(sb: Superblock) -> string
+    var s = "superblock\n"
+    s = s + s"  magic             0x${hex(sb.magic)}\n"
+    s = s + s"  version           ${sb.version}\n"
+    s = s + s"  block_size        ${sb.block_size}\n"
+    s = s + s"  state             ${state_text(sb.state)}\n"
+    s = s + s"  blocks            ${sb.blocks}\n"
+    s = s + s"  group_count       ${sb.group_count}\n"
+    s = s + s"  blocks_per_group  ${sb.blocks_per_group}\n"
+    s = s + s"  inodes_per_group  ${sb.inodes_per_group}\n"
+    s = s + s"  inode_size        ${sb.inode_size}\n"
+    s = s + s"  first_ino         ${sb.first_ino}\n"
+    s = s + s"  inode_count       ${sb.inode_count}\n"
+    s = s + s"  free_blocks       ${sb.free_blocks}\n"
+    s = s + s"  free_inodes       ${sb.free_inodes}\n"
+    s = s + s"  reserved_blocks   ${sb.reserved_blocks}\n"
+    s = s + s"  root_ino          ${sb.root_ino}\n"
+    s = s + s"  journal_start     ${sb.journal_start}\n"
+    s = s + s"  journal_blocks    ${sb.journal_blocks}\n"
+    s = s + s"  max_transaction   ${sb.max_transaction}\n"
+    s = s + s"  orphan_head       ${sb.orphan_head}\n"
+    s = s + s"  gdt_blocks        ${sb.gdt_blocks}\n"
+    s = s + s"  hash_algorithm    ${sb.hash_algorithm}\n"
+    s = s + s"  csum_algorithm    ${sb.csum_algorithm}\n"
+    s = s + s"  hash_seed         ${hex_bytes(sb.hash_seed[0..<16])}\n"
+    s = s + s"  uuid              ${hex_bytes(sb.uuid[0..<16])}\n"
+    s = s + s"  label             ${trimmed(sb.label[0..<32])}\n"
+    s = s + s"  features          compat ${sb.feature_compat} ro_compat ${sb.feature_ro_compat} incompat ${sb.feature_incompat}\n"
+    s = s + s"  mount_count       ${sb.mount_count}\n"
+    s = s + s"  format_time       ${sb.format_time}\n"
+    s = s + s"  mount_time        ${sb.mount_time}\n"
+    s = s + s"  write_time        ${sb.write_time}\n"
+    s = s + s"  check_time        ${sb.check_time}\n"
+    s = s + s"  csum_seed         0x${hex(sb.csum_seed, 8)}\n"
+    s = s + s"  crc               0x${hex(sb.crc, 8)}\n"
+    s
+
+dump_groups(m: *Mounted) -> string
+    var s = s"group descriptors (${m.sb.group_count})\n"
+    for g in 0..<m.sb.group_count
+        val d = m.desc(g)
+        s = s + s"  group ${g}: blocks ${m.geo.group_first(g)}..${m.geo.group_end(g) - 1}"
+        s = s + s"  block_bitmap ${d.block_bitmap}  inode_bitmap ${d.inode_bitmap}  inode_table ${d.inode_table}\n"
+        s = s + s"           free_blocks ${d.free_blocks}  free_inodes ${d.free_inodes}  directories ${d.directories}"
+        s = s + s"  flags ${d.flags}  data_start ${m.geo.data_start(g)}\n"
+    s
+
+// A directory leaf's records, raw: every record with its offset, including free ones.
+private dump_leaf(leaf: []u8) -> string
+    var s = ""
+    val head: *DirLeafHeader = at(leaf, 0)
+    s = s + s"  directory leaf: magic 0x${hex(head.magic)} count ${head.count}\n"
+    var at_off: usize = 8
+    while at_off + 12 <= TAIL_OFFSET
+        val rec: *DirRecordHeader = at(leaf, at_off)
+        val len = usize(rec.rec_len)
+        if len < 16 || at_off + len > TAIL_OFFSET
+            s = s + s"    [offset ${at_off}] corrupt record length ${len}\n"
+            break
+        val name = str_cast(leaf[at_off + 12..<at_off + 12 + usize(rec.name_len)])
+        val free = if rec.ino == 0 then " (free)" else ""
+        s = s + s"    [offset ${at_off}] ino ${rec.ino} rec_len ${len} type ${dt_text(rec.file_type)} name '${name}'${free}\n"
+        at_off += len
+    s
+
+// Inode `ino`: its fields, its extent root as stored, and for a directory with a block its leaf. An Err
+// is the reason there is nothing to print.
+dump_inode[D: BlockDevice](dev: *D, m: *Mounted, ino: u64) -> Result[string, string]
+    val loc = m.inode_location(ino) match
+        Some(l) -> l
+        None -> return Err(s"inode ${ino} does not exist (1 ..= ${m.sb.inode_count})")
+    var blk = block_buf()
+    if dev.read(loc.block, blk.view()).is_err() then return Err(s"cannot read block ${loc.block}")
+    val node: *Inode = at(blk.view(), loc.offset)
+    val sealed = verify_inode(m.seed, ino, blk.view()[loc.offset..<loc.offset + 256])
+    var s = s"inode ${ino}: block ${loc.block} offset ${loc.offset}  checksum ${verdict(sealed)}\n"
+    s = s + s"  mode        0o${octal(u32(node.mode))} (${type_text(node.mode)})\n"
+    s = s + s"  links       ${node.links}\n"
+    s = s + s"  uid gid     ${node.uid} ${node.gid}\n"
+    var flags = ""
+    if node.flags & INODE_INLINE != 0 then flags = flags + "INLINE "
+    if node.flags & INODE_INDEXED != 0 then flags = flags + "INDEXED "
+    if node.flags & INODE_ORPHAN != 0 then flags = flags + "ORPHAN "
+    s = s + s"  flags       ${node.flags} ${flags}\n"
+    s = s + s"  generation  ${node.generation}\n"
+    s = s + s"  size        ${node.size}\n"
+    s = s + s"  blocks      ${node.blocks}\n"
+    s = s + s"  atime       ${node.atime_sec}.${node.atime_nsec}\n"
+    s = s + s"  mtime       ${node.mtime_sec}.${node.mtime_nsec}\n"
+    s = s + s"  ctime       ${node.ctime_sec}.${node.ctime_nsec}\n"
+    s = s + s"  crtime      ${node.crtime_sec}.${node.crtime_nsec}\n"
+    s = s + s"  orphan_next ${node.orphan_next}\n"
+    s = s + s"  xattr_block ${node.xattr_block}\n"
+    s = s + s"  parent      ${node.parent}\n"
+
+    val kind = node.mode & 0o170000
+    val has_extents = kind == 0o100000 || kind == 0o040000 || (kind == 0o120000 && node.flags & INODE_INLINE == 0)
+    if !has_extents then return Ok(s)
+
+    val head: *NodeHeader = at(blk.view(), loc.offset + 112)
+    s = s + s"  extent root: magic 0x${hex(head.magic)} ${verdict(head.magic == EXTENT_MAGIC)} count ${head.count} max ${head.max} depth ${head.depth}\n"
+    var first_block: u64 = 0
+    for k in 0..<usize(if head.count > 7 then 7 else head.count)
+        if head.depth == 0
+            val e: *ExtentLeaf = at(blk.view(), loc.offset + 112 + 16 + k * 16)
+            s = s + s"    [${k}] logical ${e.logical} len ${e.len} flags ${e.flags} physical ${e.physical}\n"
+            if k == 0 && e.logical == 0 then first_block = e.physical
+        else
+            val e: *ExtentIndex = at(blk.view(), loc.offset + 112 + 16 + k * 16)
+            s = s + s"    [${k}] logical ${e.logical} child ${e.child}\n"
+
+    if kind == 0o040000 && head.depth == 0 && first_block != 0
+        if node.flags & INODE_INDEXED != 0 then return Ok(s + "  directory is indexed (the index is not dumped)\n")
+        var leaf = block_buf()
+        if dev.read(first_block, leaf.view()).is_err() then return Err(s"cannot read block ${first_block}")
+        val owned = verify_owned_block(m.seed, leaf.view(), ino, node.generation)
+        s = s + s"  block ${first_block}: checksum and owner ${verdict(owned)}\n"
+        s = s + dump_leaf(leaf.view())
+    Ok(s)

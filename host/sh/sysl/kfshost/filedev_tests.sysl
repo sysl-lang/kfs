@@ -1,0 +1,111 @@
+module keel.kfshost
+@tests
+@requires(os)
+
+import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, DeviceError, default_options, format, open, ram_device}
+import sysl.buf.{Buf, buf}
+import sysl.fs
+
+private blk(fill: u8) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for _ in 0..<BLOCK_SIZE
+        b.push(fill)
+    b
+
+private entropy() -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i))
+    e
+
+private made(path: string, blocks: u64) -> FileDevice
+    create_image(path, blocks) match
+        Ok(d) -> d
+        Err(_) -> panic("could not create the image")
+
+@test("a new image is zero, blocks round-trip, and what was written survives closing and reopening")
+filedev_round_trip()
+    val path = "/tmp/keel-kfshost-roundtrip.img"
+    var d = made(path, 8)
+    assert_eq(d.blocks(), 8)
+    var out = blk(1)
+    assert(d.read(5, out.view()).is_ok())
+    for x in out.view()
+        assert_eq(x, 0)
+    val data = blk(0xAB)
+    assert(d.write(5, data.view()).is_ok())
+    val other = blk(0x11)
+    assert(d.write(0, other.view()).is_ok())
+    assert(d.flush().is_ok())
+    assert(d.read(5, out.view()).is_ok())
+    assert_eq(out.view()[0], 0xAB)
+    assert_eq(out.view()[BLOCK_SIZE - 1], 0xAB)
+    assert(d.close())
+
+    var again = open_image(path) match
+        Ok(x) -> x
+        Err(_) -> panic("could not reopen")
+    assert_eq(again.blocks(), 8)
+    assert(again.read(5, out.view()).is_ok())
+    assert_eq(out.view()[100], 0xAB)
+    assert(again.read(0, out.view()).is_ok())
+    assert_eq(out.view()[100], 0x11)
+    assert(again.read(1, out.view()).is_ok())
+    assert_eq(out.view()[100], 0)
+    assert(again.close())
+    assert(fs.remove_file(path).is_ok())
+
+@test("an out-of-range or wrongly sized transfer is refused")
+filedev_refuses_bad_requests()
+    val path = "/tmp/keel-kfshost-refuse.img"
+    var d = made(path, 2)
+    var out = blk(0)
+    val data = blk(1)
+    assert(d.read(2, out.view()).is_err())
+    assert(d.write(2, data.view()).is_err())
+    assert(d.write(0, data.view()[0..<512]).is_err())
+    assert(d.read(0, out.view()[0..<512]).is_err())
+    assert(d.close())
+    assert(fs.remove_file(path).is_ok())
+
+@test("an image that is not a whole number of blocks, or is missing, does not open")
+filedev_open_refusals()
+    val path = "/tmp/keel-kfshost-odd.img"
+    assert(fs.write_bytes(path, [1, 2, 3]).is_ok())
+    assert(open_image(path).is_err())
+    assert(fs.remove_file(path).is_ok())
+    assert(open_image("/tmp/keel-kfshost-does-not-exist.img").is_err())
+
+@test("a filesystem formatted on a file is byte for byte the one formatted in memory, and opens")
+filedev_formats_like_a_ram_device()
+    val path = "/tmp/keel-kfshost-format.img"
+    var d = made(path, 3205)
+    val e = entropy()
+    assert(format(&d, default_options(), e.view(), 1_700_000_000).is_ok())
+    var ram = ram_device(3205)
+    assert(format(&ram, default_options(), e.view(), 1_700_000_000).is_ok())
+    var a = blk(0)
+    var b = blk(0)
+    for n in 0..<3205
+        assert(d.read(u64(n), a.view()).is_ok())
+        assert(ram.read(u64(n), b.view()).is_ok())
+        for i in 0..<BLOCK_SIZE
+            if a.view()[i] != b.view()[i] then panic("a block differs between the file and the memory image")
+    assert(open(&d).is_ok())
+    assert(d.close())
+    assert(fs.remove_file(path).is_ok())
+
+@test("the host's entropy is 32 bytes and differs from call to call; the clock is after 2020")
+host_sources()
+    val a = host_entropy() match
+        Some(x) -> x
+        None -> panic("no entropy")
+    val b = host_entropy() match
+        Some(x) -> x
+        None -> panic("no entropy")
+    assert_eq(a.len(), 32)
+    var same = true
+    for i in 0..<32
+        if a.view()[i] != b.view()[i] then same = false
+    assert(!same)
+    assert(host_now() > 1_577_836_800)

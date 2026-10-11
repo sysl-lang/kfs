@@ -1,0 +1,17 @@
+// kfsdump — print what a KFS image holds.
+//
+//   kfsdump <image>                  the superblock and every group descriptor
+//   kfsdump <image> super            the superblock
+//   kfsdump <image> groups           the group descriptors
+//   kfsdump <image> inode <number>   an inode, its raw extent root and, for a directory, its raw leaf
+//
+// Nothing is written to the image.
+
+import kfshost.keel.kfshost.run_dump
+
+main(args: []string)
+    run_dump(args[1..]) match
+        Ok(text) -> print(text)
+        Err(why) ->
+            print(why)
+            exit(1)

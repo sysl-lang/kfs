@@ -1,0 +1,562 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+struct Formatted
+    dev: RamDevice
+    geo: Geometry
+
+private fixed_entropy(salt: u8) -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i) + salt)
+    e
+
+private formatted_with(blocks: u64, o: Options, salt: u8) -> Formatted
+    var dev = ram_device(blocks)
+    val e = fixed_entropy(salt)
+    format(&dev, o, e.view(), 1_700_000_000) match
+        Ok(g) -> Formatted(dev, g)
+        Err(_) -> panic("the format was refused")
+
+private formatted(blocks: u64) -> Formatted = formatted_with(blocks, default_options(), 0)
+
+private read_block(dev: *RamDevice, b: u64) -> Buf[u8]
+    var out = new_block()
+    assert(dev.read(b, out.view()).is_ok())
+    out
+
+private mounted(dev: *RamDevice) -> Mounted
+    open(dev) match
+        Ok(m) -> m
+        Err(_) -> panic("the filesystem did not open")
+
+private is_zero(bytes: []const u8) -> bool
+    for x in bytes
+        if x != 0 then return false
+    true
+
+private same_bytes(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// How an open or a format failed, as a number a test can compare: -1 for success or another kind.
+private open_failure(r: Result[Mounted, OpenError]) -> i64
+    r match
+        Err(OpenError.BadChecksum) -> 1
+        Err(OpenError.BadMagic) -> 2
+        Err(OpenError.BadVersion) -> 3
+        Err(OpenError.BadGeometry) -> 4
+        Err(OpenError.BadDescriptor(g)) -> 100 + i64(g)
+        Err(OpenError.MisplacedGroup(g)) -> 200 + i64(g)
+        _ -> -1
+
+@test("a 32 MiB format is the spec's worked example: four groups, 1024 inodes each, the journal in group 2")
+format_worked_example()
+    var f = formatted(8192)
+    val m = mounted(&f.dev)
+    assert_eq(m.sb.magic, SUPER_MAGIC)
+    assert_eq(m.sb.version, 1)
+    assert_eq(m.sb.block_size, 4096)
+    assert_eq(m.sb.state, STATE_CLEAN)
+    assert_eq(m.sb.blocks, 8192)
+    assert_eq(m.sb.group_count, 4)
+    assert_eq(m.sb.blocks_per_group, 2048)
+    assert_eq(m.geo.group_len(3), 2047)
+    assert_eq(m.sb.inodes_per_group, 1024)
+    assert_eq(m.sb.inode_count, 4096)
+    assert_eq(m.sb.gdt_blocks, 1)
+    assert_eq(m.sb.journal_blocks, 1024)
+    assert_eq(m.sb.max_transaction, 256)
+    assert_eq(m.sb.journal_start, f.geo.data_start(2))
+    assert_eq(m.sb.root_ino, 2)
+    assert_eq(m.sb.first_ino, 11)
+    assert_eq(m.sb.orphan_head, 0)
+    assert_eq(m.sb.hash_algorithm, 1)
+    assert_eq(m.sb.csum_algorithm, 1)
+    assert_eq(m.sb.format_time, 1_700_000_000)
+    assert_eq(m.sb.reserved_blocks, f.geo.reserved_blocks)
+    assert_eq(m.sb.feature_incompat, 0)
+    assert_eq(m.sb.mount_count, 0)
+    assert_eq(m.sb.csum_seed, csum_seed_of(m.sb.uuid[0..<16]))
+
+@test("every location the descriptors record equals the one computed from the geometry")
+format_descriptors_match_computed_locations()
+    var f = formatted(8192)
+    val m = mounted(&f.dev)
+    val want = geometry(8192, default_options()) match
+        Ok(g) -> g
+        Err(_) -> panic("refused")
+    for i in 0..<m.sb.group_count
+        val d = m.desc(i)
+        assert_eq(d.block_bitmap, want.block_bitmap(i))
+        assert_eq(d.inode_bitmap, want.inode_bitmap(i))
+        assert_eq(d.inode_table, want.inode_table(i))
+        assert_eq(d.flags, if want.is_copy(i) then GROUP_COPY else 0)
+    // Group 0: the superblock at 1, the table at 2, then 3, 4 and the inode table at 5.
+    assert_eq(m.desc(0).block_bitmap, 3)
+    assert_eq(m.desc(0).inode_bitmap, 4)
+    assert_eq(m.desc(0).inode_table, 5)
+    // Group 2 is not a copy group: its bitmaps are its first blocks.
+    assert_eq(m.desc(2).block_bitmap, 1 + 2 * 2048)
+
+@test("the block bitmaps mark the metadata, the journal and the root's block, and nothing else; free counts match")
+format_block_bitmaps()
+    var f = formatted(8192)
+    val m = mounted(&f.dev)
+    var total: u64 = 0
+    for i in 0..<m.sb.group_count
+        val d = m.desc(i)
+        val bits = read_block(&f.dev, d.block_bitmap)
+        val first = f.geo.group_first(i)
+        val len = usize(f.geo.group_len(i))
+        for k in 0..<len
+            val b = first + u64(k)
+            val meta = k < usize(f.geo.meta_blocks(i))
+            val journal = b >= f.geo.journal_start && b < f.geo.journal_start + u64(f.geo.journal_blocks)
+            val root = b == f.geo.data_start(0)
+            assert_eq(bit_test(bits.view(), k), meta || journal || root)
+        // Every bit past the group's last block is set, to the end of the bitmap block.
+        for k in len..<BLOCK_SIZE * 8
+            assert(bit_test(bits.view(), k))
+        assert_eq(d.free_blocks, count_clear(bits.view(), len))
+        assert_eq(d.block_bitmap_crc, bitmap_crc(m.seed, i, bits.view()))
+        total += u64(d.free_blocks)
+    assert_eq(m.sb.free_blocks, total)
+    // Group 2: 66 metadata blocks and 1024 journal blocks used; group 3 is one block short.
+    assert_eq(m.desc(2).free_blocks, 2048 - 66 - 1024)
+    assert_eq(m.desc(3).free_blocks, 2047 - 68)
+    assert_eq(m.desc(0).free_blocks, 2048 - 68 - 1)
+
+@test("the inode bitmaps mark the reserved inodes and lost+found, and past-the-end bits; free counts match")
+format_inode_bitmaps()
+    var f = formatted(8192)
+    val m = mounted(&f.dev)
+    var total: u64 = 0
+    for i in 0..<m.sb.group_count
+        val d = m.desc(i)
+        val bits = read_block(&f.dev, d.inode_bitmap)
+        val ipg = usize(m.sb.inodes_per_group)
+        for k in 0..<ipg
+            assert_eq(bit_test(bits.view(), k), i == 0 && k < 11)
+        for k in ipg..<BLOCK_SIZE * 8
+            assert(bit_test(bits.view(), k))
+        assert_eq(d.free_inodes, count_clear(bits.view(), ipg))
+        assert_eq(d.inode_bitmap_crc, bitmap_crc(m.seed, i, bits.view()))
+        total += u64(d.free_inodes)
+    assert_eq(m.desc(0).free_inodes, 1024 - 11)
+    assert_eq(m.desc(0).directories, 2)
+    assert_eq(m.desc(1).directories, 0)
+    assert_eq(m.sb.free_inodes, total)
+    assert_eq(total, 4096 - 11)
+
+@test("the last group's bitmap sets every bit past the end of the filesystem")
+format_short_last_group_bitmap()
+    var f = formatted(1 + 3 * 2048 + 68 + 64)
+    val m = mounted(&f.dev)
+    assert_eq(m.sb.group_count, 4)
+    assert_eq(f.geo.group_len(3), 132)
+    val bits = read_block(&f.dev, m.desc(3).block_bitmap)
+    for k in 0..<usize(68)
+        assert(bit_test(bits.view(), k))
+    for k in usize(68)..<132
+        assert(!bit_test(bits.view(), k))
+    for k in usize(132)..<BLOCK_SIZE * 8
+        assert(bit_test(bits.view(), k))
+    assert_eq(m.desc(3).free_blocks, 64)
+    assert_eq(m.desc(3).block_bitmap_crc, bitmap_crc(m.seed, 3, bits.view()))
+
+@test("a trailing fragment too small for a group is left alone: nothing is written past the filesystem's end")
+format_leaves_unused_tail_alone()
+    var f = formatted(4098)
+    assert_eq(f.geo.blocks, 4097)
+    val m = mounted(&f.dev)
+    assert_eq(m.sb.blocks, 4097)
+    for i in 0..<f.dev.log_len()
+        assert(f.dev.log_block(i) < 4097)
+    assert(is_zero(read_block(&f.dev, 4097).view()))
+
+@test("block 0 is never written, and the format ends with a flush")
+format_never_touches_the_boot_block()
+    var f = formatted(3205)
+    assert(f.dev.log_len() > 0)
+    for i in 0..<f.dev.log_len()
+        assert(f.dev.log_block(i) != 0)
+    assert_eq(f.dev.flushes(), 1)
+    // Every write was issued before the flush.
+    for i in 0..<f.dev.log_len()
+        assert_eq(f.dev.log_epoch(i), 0)
+
+@test("the inode table is zeroed whatever the device held, and the reserved inodes stay zero")
+format_zeroes_inode_tables()
+    var dev = ram_device(3205)
+    val junk = filled_block(77)
+    for b in 0..<3205
+        assert(dev.write(u64(b), junk.view()).is_ok())
+    val e = fixed_entropy(0)
+    val g = format(&dev, default_options(), e.view(), 5) match
+        Ok(g) -> g
+        Err(_) -> panic("refused")
+    for i in 0..<g.group_count
+        for t in 0..<g.itable_blocks()
+            val blk = read_block(&dev, g.inode_table(i) + u64(t))
+            if i == 0 && t == 0 then continue
+            assert(is_zero(blk.view()))
+    val itable = read_block(&dev, g.inode_table(0))
+    // Inodes 1 and 3..10 are allocated, mode 0, and zero.
+    assert(is_zero(itable.view()[0..<256]))
+    assert(is_zero(itable.view()[512..<2560]))
+    // Everything after lost+found is zero.
+    assert(is_zero(itable.view()[12 * 256..<BLOCK_SIZE]))
+
+@test("the root is inode 2, an empty directory with parent 2, holding lost+found in one leaf")
+format_root_directory()
+    var f = formatted(8192)
+    val m = mounted(&f.dev)
+    val loc = m.inode_location(2) match
+        Some(l) -> l
+        None -> panic("no inode 2")
+    val blk = read_block(&f.dev, loc.block)
+    assert(verify_inode(m.seed, 2, blk.view()[loc.offset..<loc.offset + 256]))
+    val root: *Inode = at(blk.view(), loc.offset)
+    assert_eq(root.mode, 0o040755)
+    assert_eq(root.links, 3)
+    assert_eq(root.uid, 0)
+    assert_eq(root.gid, 0)
+    assert_eq(root.flags, 0)
+    assert_eq(root.generation, 1)
+    assert_eq(root.size, 4096)
+    assert_eq(root.blocks, 1)
+    assert_eq(root.parent, 2)
+    assert_eq(root.xattr_block, 0)
+    assert_eq(root.orphan_next, 0)
+    assert_eq(root.crtime_sec, 1_700_000_000)
+    assert_eq(root.mtime_sec, 1_700_000_000)
+    val head: *NodeHeader = at(blk.view(), loc.offset + 112)
+    assert_eq(head.magic, EXTENT_MAGIC)
+    assert_eq(head.count, 1)
+    assert_eq(head.max, 7)
+    assert_eq(head.depth, 0)
+    val ext: *ExtentLeaf = at(blk.view(), loc.offset + 112 + 16)
+    assert_eq(ext.logical, 0)
+    assert_eq(ext.len, 1)
+    assert_eq(ext.flags, 0)
+    assert_eq(ext.physical, f.geo.data_start(0))
+
+@test("lost+found is inode 11, an empty directory with no blocks, named by the root's one record")
+format_lost_and_found()
+    var f = formatted(8192)
+    val m = mounted(&f.dev)
+    val loc = m.inode_location(11) match
+        Some(l) -> l
+        None -> panic("no inode 11")
+    val blk = read_block(&f.dev, loc.block)
+    assert(verify_inode(m.seed, 11, blk.view()[loc.offset..<loc.offset + 256]))
+    val lf: *Inode = at(blk.view(), loc.offset)
+    assert_eq(lf.mode, 0o040700)
+    assert_eq(lf.links, 2)
+    assert_eq(lf.size, 0)
+    assert_eq(lf.blocks, 0)
+    assert_eq(lf.parent, 2)
+    assert_eq(lf.generation, 1)
+    assert_eq(lf.flags, 0)
+    val head: *NodeHeader = at(blk.view(), loc.offset + 112)
+    assert_eq(head.magic, EXTENT_MAGIC)
+    assert_eq(head.count, 0)
+    assert_eq(head.max, 7)
+    // The root's leaf.
+    val leaf = read_block(&f.dev, f.geo.data_start(0))
+    assert(verify_owned_block(m.seed, leaf.view(), 2, 1))
+    val lh: *DirLeafHeader = at(leaf.view(), 0)
+    assert_eq(lh.magic, DIR_LEAF_MAGIC)
+    assert_eq(lh.count, 1)
+    val rec: *DirRecordHeader = at(leaf.view(), 8)
+    assert_eq(rec.ino, 11)
+    assert_eq(rec.rec_len, 4072)
+    assert_eq(rec.name_len, 10)
+    assert_eq(rec.file_type, DT_DIR)
+    assert(same_bytes(leaf.view()[20..<30], "lost+found".bytes))
+    // The rest of the record area is zero.
+    assert(is_zero(leaf.view()[30..<TAIL_OFFSET]))
+
+@test("the reserved inode numbers cannot be found anywhere but group 0, and a number past the end has no place")
+format_inode_locations()
+    var f = formatted(8192)
+    val m = mounted(&f.dev)
+    assert(m.inode_location(0).is_none())
+    assert(m.inode_location(4097).is_none())
+    val first = m.inode_location(1) match
+        Some(l) -> l
+        None -> panic("none")
+    assert_eq(first.block, m.desc(0).inode_table)
+    assert_eq(first.offset, 0)
+    val ino17 = m.inode_location(17) match
+        Some(l) -> l
+        None -> panic("none")
+    assert_eq(ino17.block, m.desc(0).inode_table + 1)
+    assert_eq(ino17.offset, 0)
+    val last = m.inode_location(4096) match
+        Some(l) -> l
+        None -> panic("none")
+    assert_eq(last.block, m.desc(3).inode_table + 63)
+    assert_eq(last.offset, 15 * 256)
+
+@test("the journal is empty: its superblock says so, with the next sequence 1, and verifies")
+format_empty_journal()
+    var f = formatted(8192)
+    val m = mounted(&f.dev)
+    val blk = read_block(&f.dev, m.sb.journal_start)
+    assert(verify_sector(m.seed, blk.view()))
+    val js: *JournalSuper = at(blk.view(), 0)
+    assert_eq(js.header.magic, JOURNAL_MAGIC)
+    assert_eq(js.header.kind, JOURNAL_SUPER)
+    assert_eq(js.header.sequence, 0)
+    assert_eq(js.journal_blocks, 1024)
+    assert_eq(js.first, 1)
+    assert_eq(js.start, 0)
+    assert_eq(js.error, 0)
+    assert_eq(js.start_seq, 1)
+    assert_eq(js.max_transaction, m.sb.max_transaction)
+    assert_eq(js.features, 0)
+    for k in 0..<16
+        assert_eq(js.uuid[k], m.sb.uuid[k])
+
+@test("the backup superblocks and descriptor tables in groups 1 and G-1 are copies of the primary's")
+format_backups_are_copies()
+    var f = formatted(8192)
+    val primary = read_block(&f.dev, 1)
+    val table = read_block(&f.dev, 2)
+    for g in [1, 3]
+        val first = 1 + u64(g) * 2048
+        assert(same_bytes(read_block(&f.dev, first).view(), primary.view()))
+        assert(same_bytes(read_block(&f.dev, first + 1).view(), table.view()))
+    // Group 2 is not a copy group: its first block is its block bitmap.
+    assert(le32(read_block(&f.dev, 1 + 2 * 2048).view(), 0) != SUPER_MAGIC)
+    // The superblock's meaningful bytes are its first sector; the rest of the block is zero.
+    assert(is_zero(primary.view()[512..<BLOCK_SIZE]))
+    assert(verify_superblock(primary.view()))
+
+@test("table entries past the last group are zero")
+format_table_tail_is_zero()
+    var f = formatted(8192)
+    val table = read_block(&f.dev, 2)
+    assert(is_zero(table.view()[4 * 64..<BLOCK_SIZE]))
+
+@test("the smallest filesystem, 3,205 blocks, formats and opens")
+format_smallest()
+    var f = formatted(3205)
+    val m = mounted(&f.dev)
+    assert_eq(m.sb.group_count, 2)
+    assert_eq(m.sb.blocks, 3205)
+    assert_eq(m.sb.journal_start, f.geo.data_start(1))
+    assert_eq(m.desc(1).free_blocks, 64)
+    // Both groups are copy groups, and the last group is the journal's.
+    assert_eq(m.desc(0).flags, GROUP_COPY)
+    assert_eq(m.desc(1).flags, GROUP_COPY)
+
+@test("a filesystem with explicit group size, inode density and reserve opens with the options applied")
+format_with_options()
+    var f = formatted_with(1 + 4096 + 2048, Options(16384, 0, 4096, 0), 3)
+    val m = mounted(&f.dev)
+    assert_eq(m.sb.blocks_per_group, 4096)
+    assert_eq(m.sb.inodes_per_group, 1024)
+    assert_eq(m.sb.reserved_blocks, 0)
+    assert_eq(m.sb.group_count, 2)
+
+@test("the randomness and the clock are parameters: the same inputs give the same bytes, other inputs other ids")
+format_is_deterministic()
+    var a = formatted(3205)
+    var b = formatted(3205)
+    assert_eq(a.dev.log_len(), b.dev.log_len())
+    for i in 0..<a.dev.log_len()
+        assert_eq(a.dev.log_block(i), b.dev.log_block(i))
+        assert(same_bytes(a.dev.log_data(i), b.dev.log_data(i)))
+    var c = formatted_with(3205, default_options(), 9)
+    val ma = mounted(&a.dev)
+    val mc = mounted(&c.dev)
+    assert(!same_bytes(ma.sb.uuid[0..<16], mc.sb.uuid[0..<16]))
+    assert(!same_bytes(ma.sb.hash_seed[0..<16], mc.sb.hash_seed[0..<16]))
+    assert(ma.sb.csum_seed != mc.sb.csum_seed)
+    assert(same_bytes(ma.sb.uuid[0..<16], fixed_entropy(0).view()[0..<16]))
+    assert(same_bytes(ma.sb.hash_seed[0..<16], fixed_entropy(0).view()[16..<32]))
+    assert_eq(mc.sb.group_count, ma.sb.group_count)
+    assert_eq(mc.sb.journal_start, ma.sb.journal_start)
+
+@test("a format that is refused writes nothing")
+format_refusals_write_nothing()
+    var small = ram_device(3204)
+    val e = fixed_entropy(0)
+    val r = format(&small, default_options(), e.view(), 0)
+    assert(r.is_err())
+    r match
+        Err(FormatError.Geometry(why)) -> assert(why == GeometryError.TooSmall)
+        _ -> panic("expected a geometry refusal")
+    assert_eq(small.writes(), 0)
+    assert_eq(small.flushes(), 0)
+
+    var dev = ram_device(8192)
+    val short = counting(31)
+    format(&dev, default_options(), short.view(), 0) match
+        Err(FormatError.BadEntropy) -> ()
+        _ -> panic("expected the entropy to be refused")
+    assert_eq(dev.writes(), 0)
+
+    var tight = ram_device(8192)
+    format(&tight, Options(0, RESERVED_DEFAULT, 0, 4096), e.view(), 0) match
+        Err(FormatError.Geometry(why)) -> assert(why == GeometryError.JournalDoesNotFit)
+        _ -> panic("expected the journal not to fit")
+    assert_eq(tight.writes(), 0)
+
+@test("every checksum verifies after a format, over every group")
+format_all_checksums_verify()
+    var f = formatted(1 + 3 * 2048 + 68 + 64)
+    val m = mounted(&f.dev)
+    val sb = read_block(&f.dev, 1)
+    assert(verify_superblock(sb.view()))
+    for i in 0..<m.sb.group_count
+        val table = read_block(&f.dev, 2 + u64(i / 64))
+        let_off(table.view(), m.seed, i)
+        assert(verify_group_desc(m.seed, i, table.view()[usize(i % 64) * 64..<usize(i % 64) * 64 + 64]))
+        assert_eq(m.desc(i).block_bitmap_crc, bitmap_crc(m.seed, i, read_block(&f.dev, m.desc(i).block_bitmap).view()))
+        assert_eq(m.desc(i).inode_bitmap_crc, bitmap_crc(m.seed, i, read_block(&f.dev, m.desc(i).inode_bitmap).view()))
+    assert(verify_sector(m.seed, read_block(&f.dev, m.sb.journal_start).view()))
+
+private let_off(table: []const u8, seed: u32, g: u32)
+    // A descriptor is checked against its own group number: another number must not verify.
+    val off = usize(g % 64) * 64
+    assert(!verify_group_desc(seed, g + 1, table[off..<off + 64]))
+
+@test("corrupting block 1 makes open fail its checksum, and find_backup finds group 1's copy")
+format_backup_search()
+    var f = formatted(8192)
+    val original = mounted(&f.dev)
+    val junk = filled_block(9)
+    assert(f.dev.write(1, junk.view()).is_ok())
+    assert_eq(open_failure(open(&f.dev)), 1)
+    val found = find_backup(&f.dev) match
+        Some(b) -> b
+        None -> panic("no backup found")
+    assert_eq(found.block, 1 + 2048)
+    assert_eq(found.sb.blocks_per_group, 2048)
+    assert_eq(found.sb.group_count, original.sb.group_count)
+    assert_eq(found.sb.csum_seed, original.sb.csum_seed)
+    assert(same_bytes(found.sb.uuid[0..<16], original.sb.uuid[0..<16]))
+    // With that copy gone too, there is none to find.
+    assert(f.dev.write(1 + 2048, junk.view()).is_ok())
+    assert(find_backup(&f.dev).is_none())
+
+@test("the backup search tries every allowed group size")
+format_backup_search_larger_groups()
+    var f = formatted_with(1 + 4096 + 2048, Options(0, RESERVED_DEFAULT, 4096, 0), 1)
+    val junk = filled_block(3)
+    assert(f.dev.write(1, junk.view()).is_ok())
+    val found = find_backup(&f.dev) match
+        Some(b) -> b
+        None -> panic("no backup found")
+    assert_eq(found.block, 1 + 4096)
+    assert_eq(found.sb.blocks_per_group, 4096)
+
+@test("an unformatted device does not open, and has no backup")
+open_unformatted()
+    var dev = ram_device(8192)
+    assert_eq(open_failure(open(&dev)), 1)
+    assert(find_backup(&dev).is_none())
+    var tiny = ram_device(1)
+    assert(open(&tiny).is_err())
+    assert(find_backup(&tiny).is_none())
+
+@test("open refuses a corrupt descriptor, a misplaced group, and a superblock that is sealed but wrong")
+open_refusals()
+    var f = formatted(8192)
+    // A flipped byte in group 2's descriptor.
+    var table = read_block(&f.dev, 2)
+    table.view()[2 * 64 + 5] ^= 1
+    assert(f.dev.write(2, table.view()).is_ok())
+    assert_eq(open_failure(open(&f.dev)), 102)
+    // A descriptor that is sealed correctly but puts group 1's bitmap elsewhere.
+    var moved = read_block(&f.dev, 2)
+    moved.view()[2 * 64 + 5] ^= 1
+    val seed = mounted_seed(&f.dev)
+    val d: *GroupDesc = at(moved.view(), 64)
+    d.block_bitmap += 1
+    seal_group_desc(seed, 1, moved.view()[64..<128])
+    assert(f.dev.write(2, moved.view()).is_ok())
+    assert_eq(open_failure(open(&f.dev)), 201)
+
+@test("open refuses a superblock whose magic, version or geometry is wrong even with a valid checksum")
+open_superblock_refusals()
+    var f = formatted(8192)
+    val good = read_block(&f.dev, 1)
+    var bad = copy_of(good.view())
+    val sb: *Superblock = at(bad.view(), 0)
+    sb.magic = 0
+    seal_superblock(bad.view())
+    assert(f.dev.write(1, bad.view()).is_ok())
+    assert_eq(open_failure(open(&f.dev)), 2)
+
+    bad = copy_of(good.view())
+    val v: *Superblock = at(bad.view(), 0)
+    v.version = 2
+    seal_superblock(bad.view())
+    assert(f.dev.write(1, bad.view()).is_ok())
+    assert_eq(open_failure(open(&f.dev)), 3)
+
+    bad = copy_of(good.view())
+    val g: *Superblock = at(bad.view(), 0)
+    g.group_count = 5
+    seal_superblock(bad.view())
+    assert(f.dev.write(1, bad.view()).is_ok())
+    assert_eq(open_failure(open(&f.dev)), 4)
+
+    bad = copy_of(good.view())
+    val j: *Superblock = at(bad.view(), 0)
+    j.journal_start += 1
+    seal_superblock(bad.view())
+    assert(f.dev.write(1, bad.view()).is_ok())
+    assert_eq(open_failure(open(&f.dev)), 4)
+
+    // A filesystem larger than its device.
+    assert(f.dev.write(1, good.view()).is_ok())
+    var small = ram_device(4000)
+    assert(small.write(1, good.view()).is_ok())
+    assert_eq(open_failure(open(&small)), 4)
+
+private mounted_seed(dev: *RamDevice) -> u32
+    val blk = read_block(dev, 1)
+    val sb: *Superblock = at(blk.view(), 0)
+    sb.csum_seed
+
+// A device that wraps another and counts what passes through: the shape every wrapper (the crash device
+// of the harness, a caching layer) takes.
+struct Counting[D: BlockDevice]
+    inner: *D
+    writes_seen: u64
+    flushes_seen: u64
+
+impl[D: BlockDevice] BlockDevice for Counting[D]
+    blocks(self) -> u64 = self.inner.blocks()
+    read(*self, b: u64, out: []u8) -> Result[unit, DeviceError] = self.inner.read(b, out)
+    write(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
+        self.writes_seen += 1
+        self.inner.write(b, data)
+    flush(*self) -> Result[unit, DeviceError]
+        self.flushes_seen += 1
+        self.inner.flush()
+
+@test("format and open run unchanged through a wrapping device")
+format_through_a_wrapper()
+    var ram = ram_device(3205)
+    var wrapped = Counting(&ram, 0, 0)
+    val e = fixed_entropy(0)
+    val g = format(&wrapped, default_options(), e.view(), 1) match
+        Ok(g) -> g
+        Err(_) -> panic("refused")
+    assert_eq(g.group_count, 2)
+    assert_eq(wrapped.writes_seen, ram.writes())
+    assert_eq(wrapped.flushes_seen, 1)
+    assert(open(&wrapped).is_ok())
+    assert(open(&ram).is_ok())

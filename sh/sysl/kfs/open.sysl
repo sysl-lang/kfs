@@ -1,0 +1,123 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The mount-time read check (kfs/SPEC.md sections 5 and 6): read the primary superblock and every group
+// descriptor, verify each, and answer the filesystem's geometry and descriptors. `find_backup` is the
+// search of section 5 for a backup superblock when the primary fails its check.
+
+enum OpenError
+    Device(why: DeviceError)
+    // The primary superblock's checksum does not agree.
+    BadChecksum
+    BadMagic
+    // A version, block size, inode size or algorithm this code does not know.
+    BadVersion
+    // The superblock's numbers do not describe a filesystem that fits the device.
+    BadGeometry
+    // The group's descriptor fails its checksum.
+    BadDescriptor(group: u32)
+    // The group's descriptor says its bitmaps or inode table are not where the layout puts them.
+    MisplacedGroup(group: u32)
+
+impl From[DeviceError] for OpenError
+    from(e: DeviceError) -> OpenError = OpenError.Device(e)
+
+// A filesystem whose primary superblock and descriptors have been read and verified.
+struct Mounted
+    sb: Superblock
+    geo: Geometry
+    seed: u32
+    descs: Buf[GroupDesc]
+
+    desc(self, g: u32) -> GroupDesc = self.descs[usize(g)]
+
+    // Where inode `ino` lives, or None when the number is 0 or past the last inode.
+    inode_location(self, ino: u64) -> Option[InodeLoc]
+        if ino == 0 || ino > self.sb.inode_count then return None
+        val n = ino - 1
+        val ipg = u64(self.sb.inodes_per_group)
+        val g = u32(n / ipg)
+        val i = n % ipg
+        Some(InodeLoc(self.descs[usize(g)].inode_table + i / 16, usize(i % 16) * INODE_SIZE))
+
+// Where an inode is: block number and byte offset in that block.
+struct InodeLoc
+    block: u64
+    offset: usize
+
+// A superblock found at 1 + `blocks_per_group`, with the block it was found in.
+struct Backup
+    block: u64
+    sb: Superblock
+
+// The geometry a superblock describes.
+geometry_of(sb: *Superblock) -> Geometry
+    val g = Geometry(sb.blocks, sb.group_count, sb.blocks_per_group, sb.inodes_per_group, sb.gdt_blocks,
+        sb.journal_blocks, sb.journal_start, sb.reserved_blocks)
+    g
+
+private power_of_two(n: u32) -> bool = n != 0 && (n & (n - 1)) == 0
+
+// Whether the superblock's numbers are consistent with each other and fit a device of `device_blocks`: the
+// group count against the size, the descriptor table's size, and the journal inside group `G / 2`'s data
+// area. (The checksum is the caller's business.)
+check_superblock(sb: *Superblock, device_blocks: u64) -> Result[unit, OpenError]
+    if sb.magic != SUPER_MAGIC then return Err(OpenError.BadMagic)
+    if sb.version != FORMAT_VERSION || sb.block_size != u32(BLOCK_SIZE) || sb.inode_size != u16(INODE_SIZE)
+        return Err(OpenError.BadVersion)
+    if sb.hash_algorithm != HASH_SIPHASH13 || sb.csum_algorithm != CSUM_CRC32C then return Err(OpenError.BadVersion)
+    val bpg = sb.blocks_per_group
+    val ipg = sb.inodes_per_group
+    val groups = sb.group_count
+    if bpg < BLOCKS_PER_GROUP_MIN || bpg > BLOCKS_PER_GROUP_MAX || !power_of_two(bpg) then return Err(OpenError.BadGeometry)
+    if ipg < INODES_PER_GROUP_MIN || ipg > INODES_PER_GROUP_MAX || ipg % 16 != 0 then return Err(OpenError.BadGeometry)
+    if groups < 2 || sb.gdt_blocks != gdt_blocks_for(groups) then return Err(OpenError.BadGeometry)
+    if sb.blocks > device_blocks then return Err(OpenError.BadGeometry)
+    if sb.blocks > 1 + u64(groups) * u64(bpg) || sb.blocks <= 1 + u64(groups - 1) * u64(bpg) then return Err(OpenError.BadGeometry)
+    if sb.inode_count != u64(groups) * u64(ipg) || sb.root_ino != ROOT_INO || sb.first_ino != u16(FIRST_INO)
+        return Err(OpenError.BadGeometry)
+    if sb.journal_blocks < 2 || sb.max_transaction != sb.journal_blocks / 4 then return Err(OpenError.BadGeometry)
+    val g = geometry_of(sb)
+    val jg = g.journal_group()
+    if sb.journal_start != g.data_start(jg) || g.data_blocks(jg) < sb.journal_blocks then return Err(OpenError.BadGeometry)
+    if sb.csum_seed != csum_seed_of(sb.uuid[0..<16]) then return Err(OpenError.BadGeometry)
+    Ok(())
+
+// Read and verify the primary superblock (block 1) and every group descriptor, and check that each
+// descriptor puts its group's bitmaps and inode table where the layout does.
+open[D: BlockDevice](dev: *D) -> Result[Mounted, OpenError]
+    var blk = block_buf()
+    dev.read(1, blk.view())?
+    if !verify_superblock(blk.view()) then return Err(OpenError.BadChecksum)
+    val sb: *Superblock = at(blk.view(), 0)
+    check_superblock(sb, dev.blocks())?
+    val g = geometry_of(sb)
+    val seed = sb.csum_seed
+
+    var descs: Buf[GroupDesc] = buf()
+    var table = block_buf()
+    for i in 0..<g.group_count
+        if i % 64 == 0 then dev.read(2 + u64(i / 64), table.view())?
+        val off = usize(i % 64) * 64
+        if !verify_group_desc(seed, i, table.view()[off..<off + 64]) then return Err(OpenError.BadDescriptor(i))
+        val d: *GroupDesc = at(table.view(), off)
+        if d.block_bitmap != g.block_bitmap(i) || d.inode_bitmap != g.inode_bitmap(i) || d.inode_table != g.inode_table(i)
+            return Err(OpenError.MisplacedGroup(i))
+        descs.push(*d)
+    Ok(Mounted(*sb, g, seed, descs))
+
+// The backup superblock of section 5: try block `1 + b` for each allowed `blocks_per_group` `b` (2048,
+// 4096, ... 32768) and take the first that passes its checksum, carries the magic and says it is group 1's
+// copy for that `b`.
+find_backup[D: BlockDevice](dev: *D) -> Option[Backup]
+    var blk = block_buf()
+    var b = BLOCKS_PER_GROUP_MIN
+    while b <= BLOCKS_PER_GROUP_MAX
+        val at_block = 1 + u64(b)
+        if at_block < dev.blocks() && dev.read(at_block, blk.view()).is_ok()
+            val sb: *Superblock = at(blk.view(), 0)
+            if verify_superblock(blk.view()) && sb.magic == SUPER_MAGIC && sb.blocks_per_group == b
+                return Some(Backup(at_block, *sb))
+        b = b * 2
+    None

@@ -1,0 +1,23 @@
+module keel.kfs
+
+// Bit access to a bitmap block (kfs/SPEC.md section 7): bit `i` is bit `i % 8` of byte `i / 8`.
+
+bit_test(bits: []const u8, i: usize) -> bool = (bits[i / 8] >> u8(i % 8)) & 1 != 0
+
+bit_set(bits: []u8, i: usize)
+    bits[i / 8] = bits[i / 8] | (u8(1) << u8(i % 8))
+
+bit_clear(bits: []u8, i: usize)
+    bits[i / 8] = bits[i / 8] & ~(u8(1) << u8(i % 8))
+
+// Set bits `from ..< to`.
+bit_set_range(bits: []u8, from: usize, to: usize)
+    for i in from..<to
+        bit_set(bits, i)
+
+// How many of bits `0 ..< n` are clear.
+count_clear(bits: []const u8, n: usize) -> u32
+    var c: u32 = 0
+    for i in 0..<n
+        if !bit_test(bits, i) then c += 1
+    c

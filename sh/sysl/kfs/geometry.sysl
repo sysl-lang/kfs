@@ -1,0 +1,167 @@
+module keel.kfs
+
+// Where everything goes: the group arithmetic of kfs/SPEC.md section 4. `geometry` chooses the shape of a
+// filesystem from its size and the formatter's options (and refuses sizes that cannot hold one);
+// `Geometry` answers every "where is it" question about a chosen shape, both for the formatter and for
+// a mounted filesystem, whose geometry is rebuilt from its superblock with `geometry_of`.
+
+// Format-time overrides. A zero is "choose"; `RESERVED_DEFAULT` in `reserved_percent` is "2%".
+const RESERVED_DEFAULT: u32 = 0xFFFF_FFFF
+
+// The smallest data area a last, shorter group is kept for.
+const LAST_GROUP_MIN_DATA: i64 = 64
+
+// The percentage of data blocks kept for uid 0 unless told otherwise.
+const DEFAULT_RESERVED_PERCENT: u64 = 2
+
+struct Options
+    bytes_per_inode: u32
+    reserved_percent: u32
+    blocks_per_group: u32
+    journal_blocks: u32
+
+// The defaults of section 4: everything chosen.
+default_options() -> Options = Options(0, RESERVED_DEFAULT, 0, 0)
+
+enum GeometryError
+    // Fewer than two groups would result.
+    TooSmall
+    // The journal would not fit in the data area of group `G / 2`.
+    JournalDoesNotFit
+    // `blocks_per_group` is not a power of two in 2048 ... 32768.
+    BadBlocksPerGroup
+    // `bytes_per_inode` is under 4096.
+    BadBytesPerInode
+    // `reserved_percent` is over 100.
+    BadReservedPercent
+    // `journal_blocks` is outside 1024 ... 16384.
+    BadJournalBlocks
+
+struct Geometry
+    // One past the filesystem's last block (block 0 counted).
+    blocks: u64
+    group_count: u32
+    blocks_per_group: u32
+    inodes_per_group: u32
+    gdt_blocks: u32
+    journal_blocks: u32
+    journal_start: u64
+    reserved_blocks: u64
+
+    // Blocks of one group's inode table.
+    itable_blocks(self) -> u32 = self.inodes_per_group / 16
+
+    // The group holding the journal.
+    journal_group(self) -> u32 = self.group_count / 2
+
+    // A copy group holds a superblock and a descriptor table copy: groups 0, 1 and G - 1.
+    is_copy(self, g: u32) -> bool = g == 0 || g == 1 || g == self.group_count - 1
+
+    // The first block of group `g`, and one past its last: the last group may be shorter.
+    group_first(self, g: u32) -> u64 = 1 + u64(g) * u64(self.blocks_per_group)
+
+    group_end(self, g: u32) -> u64
+        val end = self.group_first(g) + u64(self.blocks_per_group)
+        if end > self.blocks then self.blocks else end
+
+    // The blocks before the data area: the copies, both bitmaps and the inode table.
+    meta_blocks(self, g: u32) -> u32
+        val copies: u32 = if self.is_copy(g) then 1 + self.gdt_blocks else 0
+        copies + 2 + self.itable_blocks()
+
+    // Where the metadata sits, by the rule of section 4.
+    block_bitmap(self, g: u32) -> u64
+        val copies: u64 = if self.is_copy(g) then u64(1 + self.gdt_blocks) else 0
+        self.group_first(g) + copies
+
+    inode_bitmap(self, g: u32) -> u64 = self.block_bitmap(g) + 1
+
+    inode_table(self, g: u32) -> u64 = self.block_bitmap(g) + 2
+
+    data_start(self, g: u32) -> u64 = self.group_first(g) + u64(self.meta_blocks(g))
+
+    // The blocks of group `g` that exist, and of them those past the metadata.
+    group_len(self, g: u32) -> u32 = u32(self.group_end(g) - self.group_first(g))
+
+    data_blocks(self, g: u32) -> u32 = self.group_len(g) - self.meta_blocks(g)
+
+private ceil_div(a: u64, b: u64) -> u64 = (a + b - 1) / b
+
+// The blocks of a descriptor table for `groups` groups: 64 descriptors to a block.
+gdt_blocks_for(groups: u32) -> u32 = u32(ceil_div(u64(groups), 64))
+
+// `clamp(blocks / 64, 1024, 16384)`.
+default_journal_blocks(blocks: u64) -> u32
+    val j = blocks / 64
+    if j < u64(JOURNAL_MIN_BLOCKS) then return JOURNAL_MIN_BLOCKS
+    if j > u64(JOURNAL_MAX_BLOCKS) then return JOURNAL_MAX_BLOCKS
+    u32(j)
+
+private is_power_of_two(n: u32) -> bool = n != 0 && (n & (n - 1)) == 0
+
+// `inodes_per_group` for groups of `bpg` blocks: one inode per `bytes_per_inode` bytes of group, rounded
+// down to a multiple of 16 and kept within the limits.
+private inodes_for(bpg: u32, bytes_per_inode: u32) -> u32
+    var ipg = u32(u64(bpg) * 4096 / u64(bytes_per_inode)) / 16 * 16
+    if ipg < INODES_PER_GROUP_MIN then ipg = INODES_PER_GROUP_MIN
+    if ipg > INODES_PER_GROUP_MAX then ipg = INODES_PER_GROUP_MAX
+    ipg
+
+// How many groups a filesystem of `blocks` blocks has with groups of `bpg` blocks and `ipg` inodes: whole
+// groups, then the last, shorter one if it is worth keeping. Its data area (after its metadata, and after
+// the journal when it is the group that holds it) has to reach 64 blocks.
+private groups_for(blocks: u64, bpg: u32, ipg: u32, journal: u32) -> u32
+    val usable = blocks - 1
+    val full = u32(usable / u64(bpg))
+    val rest = i64(usable % u64(bpg))
+    if rest == 0 then return full
+    val with_last = full + 1
+    val meta = i64(1 + gdt_blocks_for(with_last) + 2 + ipg / 16)
+    val holds_journal = with_last / 2 == with_last - 1
+    val data = rest - meta - (if holds_journal then i64(journal) else 0)
+    if data >= LAST_GROUP_MIN_DATA then with_last else full
+
+// The largest power of two in 2048 ... 32768 that yields at least four groups and holds the journal
+// twice over; 2048 where none yields four groups.
+private choose_blocks_per_group(blocks: u64, journal: u32, bytes_per_inode: u32) -> u32
+    var p = BLOCKS_PER_GROUP_MAX
+    while p >= BLOCKS_PER_GROUP_MIN
+        if p >= 2 * journal && groups_for(blocks, p, inodes_for(p, bytes_per_inode), journal) >= 4 then return p
+        p = p / 2
+    BLOCKS_PER_GROUP_MIN
+
+// The shape of a filesystem of `blocks` blocks, or why it cannot be had.
+geometry(blocks: u64, o: Options) -> Result[Geometry, GeometryError]
+    if o.bytes_per_inode != 0 && o.bytes_per_inode < 4096 then return Err(GeometryError.BadBytesPerInode)
+    if o.reserved_percent != RESERVED_DEFAULT && o.reserved_percent > 100 then return Err(GeometryError.BadReservedPercent)
+    if o.journal_blocks != 0 && (o.journal_blocks < JOURNAL_MIN_BLOCKS || o.journal_blocks > JOURNAL_MAX_BLOCKS)
+        return Err(GeometryError.BadJournalBlocks)
+    if o.blocks_per_group != 0
+        if o.blocks_per_group < BLOCKS_PER_GROUP_MIN || o.blocks_per_group > BLOCKS_PER_GROUP_MAX || !is_power_of_two(o.blocks_per_group)
+            return Err(GeometryError.BadBlocksPerGroup)
+    if blocks < 2 then return Err(GeometryError.TooSmall)
+
+    val journal = if o.journal_blocks != 0 then o.journal_blocks else default_journal_blocks(blocks)
+    val bytes_per_inode = if o.bytes_per_inode != 0 then o.bytes_per_inode else DEFAULT_BYTES_PER_INODE
+    val bpg = if o.blocks_per_group != 0 then o.blocks_per_group else choose_blocks_per_group(blocks, journal, bytes_per_inode)
+    val ipg = inodes_for(bpg, bytes_per_inode)
+    val full = u32((blocks - 1) / u64(bpg))
+    val groups = groups_for(blocks, bpg, ipg, journal)
+    if groups < 2 then return Err(GeometryError.TooSmall)
+
+    val end = if groups > full then blocks else 1 + u64(groups) * u64(bpg)
+    var g = Geometry(end, groups, bpg, ipg, gdt_blocks_for(groups), journal, 0, 0)
+
+    // The journal sits at the start of the data area of group G / 2, and has to fit there.
+    val jg = g.journal_group()
+    if g.data_blocks(jg) < journal then return Err(GeometryError.JournalDoesNotFit)
+    g.journal_start = g.data_start(jg)
+
+    // Reserved blocks: a share of the data blocks, the journal not counted.
+    var data_total: u64 = 0
+    for i in 0..<groups
+        data_total += u64(g.data_blocks(i))
+    data_total -= u64(journal)
+    val percent = if o.reserved_percent == RESERVED_DEFAULT then DEFAULT_RESERVED_PERCENT else u64(o.reserved_percent)
+    g.reserved_blocks = data_total * percent / 100
+    Ok(g)

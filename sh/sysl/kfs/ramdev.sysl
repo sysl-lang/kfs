@@ -10,10 +10,6 @@ module keel.kfs
 
 import sysl.buf.{Buf, buf}
 
-enum DeviceError
-    OutOfRange
-    BadLength
-
 struct RamDevice
     private image: Buf[u8]
     private count: u64
@@ -24,12 +20,28 @@ struct RamDevice
     private log_epochs: Buf[u64]
     private log_bytes: Buf[u8]
 
-    // How many blocks the device has.
-    blocks(self) -> u64 = self.count
-
     reads(self) -> u64 = self.reads_n
     writes(self) -> u64 = self.writes_n
     flushes(self) -> u64 = self.flushes_n
+
+    // The write log: how many writes, and for write `i` the block, the flush epoch it was issued in, and
+    // the bytes written.
+    log_len(self) -> usize = self.log_blocks.len()
+    log_block(self, i: usize) -> u64 = self.log_blocks[i]
+    log_epoch(self, i: usize) -> u64 = self.log_epochs[i]
+    log_data(self, i: usize) -> []const u8 = self.log_bytes.view()[i * BLOCK_SIZE ..< (i + 1) * BLOCK_SIZE]
+
+    // Forget the counters and the log, keeping the contents: a test measures one operation at a time.
+    reset_counters(*self)
+        self.reads_n = 0
+        self.writes_n = 0
+        self.flushes_n = 0
+        self.log_blocks.clear()
+        self.log_epochs.clear()
+        self.log_bytes.clear()
+
+impl BlockDevice for RamDevice
+    blocks(self) -> u64 = self.count
 
     // Copy block `b` into `out`, which is exactly one block.
     read(*self, b: u64, out: []u8) -> Result[unit, DeviceError]
@@ -56,24 +68,9 @@ struct RamDevice
 
     // Everything written before this is durable. (A flat buffer is always durable; the count and the
     // epoch are what a crash model reads.)
-    flush(*self)
+    flush(*self) -> Result[unit, DeviceError]
         self.flushes_n += 1
-
-    // The write log: how many writes, and for write `i` the block, the flush epoch it was issued in, and
-    // the bytes written.
-    log_len(self) -> usize = self.log_blocks.len()
-    log_block(self, i: usize) -> u64 = self.log_blocks[i]
-    log_epoch(self, i: usize) -> u64 = self.log_epochs[i]
-    log_data(self, i: usize) -> []const u8 = self.log_bytes.view()[i * BLOCK_SIZE ..< (i + 1) * BLOCK_SIZE]
-
-    // Forget the counters and the log, keeping the contents: a test measures one operation at a time.
-    reset_counters(*self)
-        self.reads_n = 0
-        self.writes_n = 0
-        self.flushes_n = 0
-        self.log_blocks.clear()
-        self.log_epochs.clear()
-        self.log_bytes.clear()
+        Ok(())
 
 // A zeroed device of `blocks` blocks.
 ram_device(blocks: u64) -> RamDevice

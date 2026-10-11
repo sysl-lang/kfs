@@ -1,0 +1,11 @@
+// kfsdump: print a KFS image's superblock, descriptors and inodes (kfs/SPEC.md). Built to scratch/kfsdump.
+
+package {
+  name    = "kfsdump"
+  version = "0.0.1"
+}
+
+dependencies {
+  kfs     { workspace = true }
+  kfshost { workspace = true }
+}

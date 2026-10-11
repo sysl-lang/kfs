@@ -228,6 +228,13 @@ group 1 of 68 metadata blocks, the 1024-block journal and 64 data blocks. For ex
 image (8192 blocks): `blocks_per_group` 2048, four groups (the last 2047 blocks), 1024 inodes per
 group, journal 1024 blocks at the start of group 2's data area.
 
+**Clarifications (stage 2).** "Yields at least four groups" counts groups *after* the last-group rule, so a
+dropped fragment does not count. An explicit `blocks_per_group` or journal size is accepted whenever the
+journal fits in group `G / 2`'s data area (the `2 × journal_blocks` rule only guides the default).
+`reserved_blocks` is the percentage of all groups' data-area blocks, the journal not counted. `mkfs.kfs`
+gives the root exactly one directory leaf, at the first data block of group 0, holding the single entry
+`lost+found` (inode 11, which itself is empty and has no blocks); root has `links` 3 and `lost+found` 2.
+
 **Pedagogical notes.** The layout is ext2's, minus thirty years. Groups exist for three reasons that
 are all visible here: a bitmap block covers exactly one group, so allocation inside a group touches one
 block; an inode's data can be kept near its inode; and each group can be locked on its own. The backup
