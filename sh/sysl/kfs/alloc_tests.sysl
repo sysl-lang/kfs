@@ -1,0 +1,927 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// The allocators of section 17 over the buffer layer, on formatted RamDevices. Every test that changes
+// the filesystem commits and then re-reads the device from scratch (`check_disk`): `open` must accept
+// every descriptor's checksum, each bitmap must match the checksum its descriptor holds, and each
+// descriptor's free counts must be the bitmap's clear bits.
+
+private type HostFs = Fs[RamDevice, HostPlatform]
+
+private entropy() -> Buf[u8]
+    var e: Buf[u8] = buf()
+    for i in 0..<32
+        e.push(u8(i) + 7)
+    e
+
+private formatted_device(blocks: u64, o: Options) -> RamDevice
+    var dev = ram_device(blocks)
+    val e = entropy()
+    format(&dev, o, e.view(), 1_700_000_000) match
+        Ok(_) -> dev
+        Err(_) -> panic("the format was refused")
+
+// 32 MiB with the defaults: four groups of 2048 blocks and 1024 inodes, the journal in group 2.
+private standard_device() -> RamDevice = formatted_device(8192, default_options())
+
+// 16 MiB with one inode per 64 KiB: two groups of 128 inodes, so inodes run out quickly.
+private few_inodes_device() -> RamDevice = formatted_device(4097, Options(65536, RESERVED_DEFAULT, 0, 0))
+
+private mounted_fs(dev: *RamDevice) -> HostFs
+    mount(dev, host_platform()) match
+        Ok(fs) -> fs
+        Err(_) -> panic("the filesystem did not mount")
+
+private ok_inode(r: Result[u64, FsError]) -> u64
+    r match
+        Ok(i) -> i
+        Err(_) -> panic("an inode allocation failed")
+
+private ok_run(r: Result[Run, FsError]) -> Run
+    r match
+        Ok(run) -> run
+        Err(_) -> panic("a block allocation failed")
+
+private ok(r: Result[unit, FsError])
+    r match
+        Ok(_) -> ()
+        Err(_) -> panic("a free or a commit failed")
+
+// How a call failed, as a number a test can compare: 0 for success.
+private failure[T](r: Result[T, FsError]) -> i64
+    r match
+        Ok(_) -> 0
+        Err(FsError.NoSpace) -> 1
+        Err(FsError.Bug) -> 2
+        Err(FsError.Invalid) -> 3
+        Err(FsError.Corrupt(Corruption.FreeingFreeBlock(_))) -> 10
+        Err(FsError.Corrupt(Corruption.FreeingFreeInode(_))) -> 11
+        Err(FsError.Corrupt(Corruption.NotDataBlocks(_))) -> 12
+        Err(FsError.Corrupt(Corruption.BadInodeNumber(_))) -> 13
+        Err(FsError.Corrupt(Corruption.Inode(_))) -> 14
+        Err(FsError.Corrupt(Corruption.GroupCounts(g))) -> 300 + i64(g)
+        Err(FsError.Open(_)) -> 4
+        Err(FsError.Corrupt(Corruption.BlockBitmap(g))) -> 100 + i64(g)
+        Err(FsError.Corrupt(Corruption.InodeBitmap(g))) -> 200 + i64(g)
+        Err(_) -> 99
+
+private dir(parent: u64) -> NewInode = NewInode(S_IFDIR | 0o755, 0, 0, 2, parent)
+private file(parent: u64) -> NewInode = NewInode(S_IFREG | 0o644, 0, 0, 1, parent)
+
+// One operation in a handle of its own: allocate an inode, then stop.
+private make(fs: *HostFs, n: NewInode) -> u64
+    var h = fs.start("create", 3)
+    val ino = ok_inode(alloc_inode(fs, &h, n))
+    fs.stop(&h)
+    ino
+
+private blocks_for(fs: *HostFs, goal: u64, want: u32, uid: u32) -> Result[Run, FsError]
+    var h = fs.start("write", 2)
+    val r = alloc_blocks(fs, &h, goal, want, uid)
+    fs.stop(&h)
+    r
+
+private release(fs: *HostFs, first: u64, len: u32) -> Result[unit, FsError]
+    var h = fs.start("truncate", 2)
+    val r = free_blocks(fs, &h, first, len)
+    fs.stop(&h)
+    r
+
+private read_block(dev: *RamDevice, b: u64) -> Buf[u8]
+    var out = new_block()
+    assert(dev.read(b, out.view()).is_ok())
+    out
+
+// The device as a fresh mount sees it: every checksum verifies and every count is the bitmap's.
+private check_disk(dev: *RamDevice)
+    val m = open(dev) match
+        Ok(m) -> m
+        Err(_) -> panic("the committed filesystem does not open")
+    for g in 0..<m.geo.group_count
+        val d = m.desc(g)
+        val bb = read_block(dev, d.block_bitmap)
+        val ib = read_block(dev, d.inode_bitmap)
+        assert_eq(bitmap_crc(m.seed, g, bb.view()), d.block_bitmap_crc)
+        assert_eq(bitmap_crc(m.seed, g, ib.view()), d.inode_bitmap_crc)
+        assert_eq(count_clear(bb.view(), usize(m.geo.group_len(g))), d.free_blocks)
+        assert_eq(count_clear(ib.view(), usize(m.geo.inodes_per_group)), d.free_inodes)
+
+// The totals against the descriptors in memory: blocks are the descriptors' sum less what is pending.
+private check_totals(fs: *HostFs)
+    var blocks: u64 = 0
+    var inodes: u64 = 0
+    var pending: u64 = 0
+    for g in 0..<fs.geo.group_count
+        val id = ok_id(fs.buffer(fs.desc_block(g)))
+        val d: *GroupDesc = at(fs.bytes(id), fs.desc_offset(g))
+        assert(verify_group_desc(fs.seed, g, fs.bytes(id)[fs.desc_offset(g)..<fs.desc_offset(g) + 64]))
+        blocks += u64(d.free_blocks)
+        inodes += u64(d.free_inodes)
+        pending += u64(fs.pending_in(g))
+    assert_eq(fs.free_blocks_total.load(), blocks - pending)
+    assert_eq(fs.free_inodes_total.load(), inodes)
+
+private ok_id(r: Result[usize, FsError]) -> usize
+    r match
+        Ok(i) -> i
+        Err(_) -> panic("a buffer could not be read")
+
+private directories(fs: *HostFs, g: u32) -> u32
+    val id = ok_id(fs.buffer(fs.desc_block(g)))
+    val d: *GroupDesc = at(fs.bytes(id), fs.desc_offset(g))
+    d.directories
+
+private inode_bytes(fs: *HostFs, ino: u64) -> []u8
+    val loc = fs.inode_location(ino)
+    val id = ok_id(fs.buffer(loc.block))
+    fs.bytes(id)[loc.offset..<loc.offset + INODE_SIZE]
+
+private commit(fs: *HostFs)
+    ok(fs.commit())
+
+// -- The search ---------------------------------------------------------------------------------------
+
+@test("the search takes the first run of the full length from where it starts, then wraps to the low end")
+find_run_first_fit()
+    var b = new_block()
+    bit_set_range(b.view(), 0, 100)
+    bit_set(b.view(), 13)
+    bit_set_range(b.view(), 20, 30)
+    // From 0, bits 0-99 are in use: the first clear run is at 100.
+    val s = find_run(b.view(), 0, 200, 0, 5).unwrap()
+    assert_eq(s.start, 100)
+    assert_eq(s.len, 5)
+    // From 150 with nothing at or after 150 in use, it starts at 150.
+    assert_eq(find_run(b.view(), 0, 200, 150, 50).unwrap().start, 150)
+    // From 190 a run of 20 does not fit before 200; it wraps and finds 100.
+    val w = find_run(b.view(), 0, 200, 190, 20).unwrap()
+    assert_eq(w.start, 100)
+    assert_eq(w.len, 20)
+
+@test("the search falls back to the longest clear run, cut to what was asked, and answers None when full")
+find_run_longest()
+    var b = new_block()
+    bit_set_range(b.view(), 0, 64)
+    bit_clear(b.view(), 3)
+    for i in 10usize..<13
+        bit_clear(b.view(), i)
+    for i in 40usize..<47
+        bit_clear(b.view(), i)
+    val s = find_run(b.view(), 0, 64, 0, 20).unwrap()
+    assert_eq(s.start, 40)
+    assert_eq(s.len, 7)
+    var full = new_block()
+    bit_set_range(full.view(), 0, 64)
+    assert(find_run(full.view(), 0, 64, 5, 1).is_none())
+
+// -- Inode placement ---------------------------------------------------------------------------------
+
+@test("top-level directories spread to the group with the fewest directories among those at or above both averages")
+top_level_directories_spread()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    // Group 0 holds the root and lost+found and has 11 inodes in use, below the average; group 2 holds
+    // the journal, far below the average of free blocks. Groups 1 and 3 qualify, with no directories.
+    val a = make(&fs, dir(ROOT_INO))
+    val b = make(&fs, dir(ROOT_INO))
+    val c = make(&fs, dir(ROOT_INO))
+    assert_eq(fs.inode_group(a), 1)
+    assert_eq(fs.inode_group(b), 3)
+    assert_eq(fs.inode_group(c), 1)
+    assert_eq(directories(&fs, 1), 2)
+    assert_eq(directories(&fs, 3), 1)
+    assert_eq(directories(&fs, 0), 2)
+    // The lowest clear bit of each group: the first inode of group 1, then its second.
+    assert_eq(a, 1025)
+    assert_eq(c, 1026)
+    check_totals(&fs)
+    commit(&fs)
+    check_disk(&dev)
+    assert_eq(fs.plat.most_groups_held, 1)
+    assert_eq(fs.plat.held(), 0)
+
+@test("files go beside their parent; a subdirectory stays in its parent's group while that has the average free inodes")
+files_beside_their_parent()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val top = make(&fs, dir(ROOT_INO))
+    val g = fs.inode_group(top)
+    val f = make(&fs, file(top))
+    val sub = make(&fs, dir(top))
+    val f2 = make(&fs, file(sub))
+    assert_eq(fs.inode_group(f), g)
+    assert_eq(fs.inode_group(sub), g)
+    assert_eq(fs.inode_group(f2), g)
+    // A file under the root goes to the root's group.
+    assert_eq(fs.inode_group(make(&fs, file(ROOT_INO))), 0)
+    assert_eq(directories(&fs, g), 2)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("a subdirectory of a group below the average of free inodes is spread instead")
+subdirectory_of_a_crowded_group_spreads()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    // Free inodes per group: 1013, 1024, 1024, 1024. A top-level directory goes to group 1 (1023 left)
+    // and three files beside it leave 1020 there against an average of 4080 / 4 = 1020: still enough,
+    // so a subdirectory stays (1019 left). Now the average is 1020 and group 1 is below it, so the next
+    // subdirectory is spread: group 0 is below the average too, group 2 (the journal's) is below the
+    // average of free blocks, and group 3 takes it.
+    val top = make(&fs, dir(ROOT_INO))
+    assert_eq(fs.inode_group(top), 1)
+    for _ in 0..<3
+        assert_eq(fs.inode_group(make(&fs, file(top))), 1)
+    val sub = make(&fs, dir(top))
+    assert_eq(fs.inode_group(sub), 1)
+    val spread = make(&fs, dir(top))
+    assert_eq(fs.inode_group(spread), 3)
+    // A file is never spread: it stays beside its parent.
+    assert_eq(fs.inode_group(make(&fs, file(top))), 1)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("when the parent's group has no free inode the next group is used, its lowest clear bit")
+inode_falls_back_to_the_next_group()
+    var dev = few_inodes_device()
+    var fs = mounted_fs(&dev)
+    for _ in 0..<(128 - 11)
+        assert_eq(fs.inode_group(make(&fs, file(ROOT_INO))), 0)
+    val next = make(&fs, file(ROOT_INO))
+    assert_eq(next, 129)
+    commit(&fs)
+    check_disk(&dev)
+    check_totals(&fs)
+
+@test("inodes run out: NoSpace, the total at 0, and the disk still consistent")
+inodes_run_out()
+    var dev = few_inodes_device()
+    var fs = mounted_fs(&dev)
+    val free = fs.free_inodes_total.load()
+    assert_eq(free, 256 - 11)
+    for _ in 0..<free
+        make(&fs, file(ROOT_INO))
+    assert_eq(fs.free_inodes_total.load(), 0)
+    var h = fs.start("create", 3)
+    assert_eq(failure(alloc_inode(&fs, &h, file(ROOT_INO))), 1)
+    assert_eq(failure(alloc_inode(&fs, &h, dir(ROOT_INO))), 1)
+    fs.stop(&h)
+    assert_eq(fs.free_inodes_total.load(), 0)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("a new inode is initialised: generation incremented, mode, owner, links, times, extent root, sealed")
+new_inode_is_initialised()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = make(&fs, NewInode(S_IFREG | 0o600, 1000, 100, 1, ROOT_INO))
+    val bytes = inode_bytes(&fs, ino)
+    assert(verify_inode(fs.seed, ino, bytes))
+    val node: *Inode = at(bytes, 0)
+    assert_eq(node.mode, S_IFREG | 0o600)
+    assert_eq(node.uid, 1000)
+    assert_eq(node.gid, 100)
+    assert_eq(node.links, 1)
+    assert_eq(node.generation, 1)
+    assert_eq(node.size, 0)
+    assert_eq(node.parent, 0)
+    assert_eq(node.crtime_sec, node.mtime_sec)
+    assert_eq(node.atime_sec, node.ctime_sec)
+    assert_eq(node.crtime_nsec, 500)
+    assert(node.crtime_sec > 1_700_000_000)
+    val head: *NodeHeader = at(bytes, 112)
+    assert_eq(head.magic, EXTENT_MAGIC)
+    assert_eq(head.max, u16(EXTENT_ROOT_SLOTS))
+    assert_eq(head.count, 0)
+    // A directory records its parent; a device node has no extent root.
+    val d = make(&fs, dir(ROOT_INO))
+    val dn: *Inode = at(inode_bytes(&fs, d), 0)
+    assert_eq(dn.parent, ROOT_INO)
+    val c = make(&fs, NewInode(S_IFCHR | 0o600, 0, 0, 1, ROOT_INO))
+    val cn: *NodeHeader = at(inode_bytes(&fs, c), 112)
+    assert_eq(cn.magic, 0)
+    // A mode with no file type is refused before anything changes.
+    var h = fs.start("create", 3)
+    assert_eq(failure(alloc_inode(&fs, &h, NewInode(0o644, 0, 0, 1, ROOT_INO))), 3)
+    fs.stop(&h)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("a freed inode is zeroed but its generation, counted free at once, and its next allocation increments the generation")
+freed_inode_generation()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val top = make(&fs, dir(ROOT_INO))
+    val g = fs.inode_group(top)
+    val before = fs.free_inodes_total.load()
+    assert_eq(directories(&fs, g), 1)
+    var h = fs.start("rmdir", 3)
+    ok(free_inode(&fs, &h, top))
+    fs.stop(&h)
+    assert_eq(fs.free_inodes_total.load(), before + 1)
+    assert_eq(directories(&fs, g), 0)
+    val freed: *Inode = at(inode_bytes(&fs, top), 0)
+    assert_eq(freed.mode, 0)
+    assert_eq(freed.generation, 1)
+    assert(verify_inode(fs.seed, top, inode_bytes(&fs, top)))
+    // Freed inodes are allocatable before the freeing transaction commits (section 17's
+    // clarification): the same group's lowest clear bit is the same slot.
+    val again = make(&fs, file(top))
+    assert_eq(again, top)
+    val node: *Inode = at(inode_bytes(&fs, again), 0)
+    assert_eq(node.generation, 2)
+    commit(&fs)
+    check_disk(&dev)
+    check_totals(&fs)
+
+// -- Blocks ------------------------------------------------------------------------------------------
+
+@test("a file's first blocks start at its group's first data block, and the next run continues the last")
+blocks_contiguous_from_the_goal()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val top = make(&fs, dir(ROOT_INO))
+    val g = fs.inode_group(top)
+    val a = ok_run(blocks_for(&fs, goal_for(&fs, top, 0), 10, 1000))
+    assert_eq(a.first, fs.geo.data_start(g))
+    assert_eq(a.len, 10)
+    val b = ok_run(blocks_for(&fs, goal_for(&fs, top, a.first + 9), 5, 1000))
+    assert_eq(b.first, a.first + 10)
+    assert_eq(b.len, 5)
+    // In group 0 the root's leaf already holds the first data block.
+    val r = ok_run(blocks_for(&fs, goal_for(&fs, ROOT_INO, 0), 1, 0))
+    assert_eq(r.first, fs.geo.data_start(0) + 1)
+    check_totals(&fs)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("from a goal the first hole of the full length is taken, smaller holes passed over")
+blocks_first_hole_of_full_length()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val start = fs.geo.data_start(1)
+    val all = ok_run(blocks_for(&fs, start, 4096, 0))
+    assert_eq(all.first, start)
+    assert_eq(u64(all.len), fs.geo.group_end(1) - start)
+    ok(release(&fs, start + 10, 3))
+    ok(release(&fs, start + 100, 7))
+    ok(release(&fs, start + 200, 5))
+    commit(&fs)
+    val r = ok_run(blocks_for(&fs, start + 10, 5, 0))
+    assert_eq(r.first, start + 100)
+    assert_eq(r.len, 5)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("with no hole of the full length the longest in the goal's group is taken, cut short")
+blocks_longest_run_fallback()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val start = fs.geo.data_start(1)
+    ok_run(blocks_for(&fs, start, 4096, 0))
+    ok(release(&fs, start + 10, 3))
+    ok(release(&fs, start + 100, 7))
+    ok(release(&fs, start + 200, 5))
+    commit(&fs)
+    val r = ok_run(blocks_for(&fs, start, 20, 0))
+    assert_eq(r.first, start + 100)
+    assert_eq(r.len, 7)
+    commit(&fs)
+    check_disk(&dev)
+    check_totals(&fs)
+
+@test("a full group sends the request on to the next group, round the groups")
+blocks_next_group_fallback()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val start = fs.geo.data_start(1)
+    ok_run(blocks_for(&fs, start, 4096, 0))
+    val r = ok_run(blocks_for(&fs, start + 5, 8, 0))
+    assert_eq(fs.block_group(r.first), 2)
+    // Group 2's data area begins with the journal; the run is the first free blocks after it.
+    assert_eq(r.first, fs.geo.journal_start + u64(fs.geo.journal_blocks))
+    // A goal in the last group with that group full wraps to group 0.
+    val s3 = fs.geo.data_start(3)
+    ok_run(blocks_for(&fs, s3, 4096, 0))
+    val w = ok_run(blocks_for(&fs, s3, 1, 0))
+    assert_eq(fs.block_group(w.first), 0)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("blocks run out: others stop at the reserve, uid 0 may use it, then NoSpace for everyone")
+blocks_reserve_and_exhaustion()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val reserve = fs.sb.reserved_blocks
+    assert(reserve > 0)
+    var rounds = 0
+    loop
+        blocks_for(&fs, 0, 4096, 1000) match
+            Ok(_) -> rounds += 1
+            Err(_) -> break
+        assert(rounds < 100)
+    assert_eq(fs.free_blocks_total.load(), reserve)
+    assert_eq(failure(blocks_for(&fs, 0, 1, 1000)), 1)
+    val root = ok_run(blocks_for(&fs, 0, 1, 0))
+    assert_eq(root.len, 1)
+    assert_eq(fs.free_blocks_total.load(), reserve - 1)
+    loop
+        blocks_for(&fs, 0, 4096, 0) match
+            Ok(_) -> rounds += 1
+            Err(_) -> break
+        assert(rounds < 200)
+    assert_eq(fs.free_blocks_total.load(), 0)
+    assert_eq(failure(blocks_for(&fs, 0, 1, 0)), 1)
+    check_totals(&fs)
+    commit(&fs)
+    check_disk(&dev)
+    val m = open(&dev) match
+        Ok(m) -> m
+        Err(_) -> panic("no open")
+    for g in 0..<m.geo.group_count
+        assert_eq(m.desc(g).free_blocks, 0)
+
+@test("a block freed in an uncommitted transaction is not handed out until the commit callback, then is")
+freed_blocks_wait_for_the_commit()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val start = fs.geo.data_start(1)
+    val held = ok_run(blocks_for(&fs, start, 16, 0))
+    commit(&fs)
+    // Take every other free block, so the only blocks left are the ones about to be freed.
+    loop
+        blocks_for(&fs, 0, 4096, 0) match
+            Ok(_) -> ()
+            Err(_) -> break
+    assert_eq(fs.free_blocks_total.load(), 0)
+
+    var h = fs.start("truncate", 2)
+    ok(free_blocks(&fs, &h, held.first, held.len))
+    fs.stop(&h)
+    // The bitmap and the descriptor say free; the total and the allocator do not.
+    assert_eq(fs.pending_in(1), 16)
+    assert_eq(fs.free_blocks_total.load(), 0)
+    check_totals(&fs)
+    assert_eq(failure(blocks_for(&fs, held.first, 4, 0)), 1)
+    // The same in a later handle of the same transaction.
+    var h2 = fs.start("write", 2)
+    assert_eq(failure(alloc_blocks(&fs, &h2, held.first, 1, 0)), 1)
+    fs.stop(&h2)
+
+    commit(&fs)
+    assert_eq(fs.pending_in(1), 0)
+    assert_eq(fs.free_blocks_total.load(), 16)
+    val again = ok_run(blocks_for(&fs, held.first, 16, 0))
+    assert_eq(again.first, held.first)
+    assert_eq(again.len, 16)
+    commit(&fs)
+    check_disk(&dev)
+    check_totals(&fs)
+
+@test("pending frees in a group with other free blocks are passed over, not handed out")
+pending_blocks_passed_over()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val start = fs.geo.data_start(1)
+    val a = ok_run(blocks_for(&fs, start, 8, 0))
+    commit(&fs)
+    ok(release(&fs, a.first, a.len))
+    val b = ok_run(blocks_for(&fs, a.first, 4, 0))
+    assert_eq(b.first, a.first + 8)
+    commit(&fs)
+    val c = ok_run(blocks_for(&fs, a.first, 4, 0))
+    assert_eq(c.first, a.first)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("a sync with no commit thread commits inline, and a commit with a handle open is refused")
+sync_commits_inline()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val seq = fs.running()
+    var h = fs.start("create", 3)
+    ok_inode(alloc_inode(&fs, &h, file(ROOT_INO)))
+    assert_eq(failure(fs.commit()), 3)
+    fs.stop(&h)
+    val writes = dev.writes()
+    ok(fs.sync())
+    assert_eq(fs.plat.commit_requests, 1)
+    assert_eq(fs.running(), seq + 1)
+    // The inode bitmap, the descriptor-table block and the inode-table block, then a flush.
+    assert_eq(dev.writes() - writes, 3)
+    check_disk(&dev)
+
+// -- Credits and corruption ---------------------------------------------------------------------------
+
+@test("a handle that touches more buffers than its credits is a bug: fatal, and nothing changes")
+credit_overrun_fails()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    fs.plat.record_fatal = true
+    val before = fs.free_inodes_total.load()
+    var h = fs.start("create", 2)
+    assert_eq(failure(alloc_inode(&fs, &h, file(ROOT_INO))), 2)
+    fs.stop(&h)
+    assert_eq(fs.plat.fatals, 1)
+    assert_eq(fs.free_inodes_total.load(), before)
+    assert_eq(h.spent(), 2)
+    // A block allocation costs two: in a handle of one it fails the same way.
+    var h1 = fs.start("write", 1)
+    assert_eq(failure(alloc_blocks(&fs, &h1, 0, 1, 0)), 2)
+    fs.stop(&h1)
+    assert_eq(fs.plat.fatals, 2)
+    // A buffer already declared costs nothing more: three allocations in one group, three credits.
+    var h3 = fs.start("create", 3)
+    for _ in 0..<3
+        ok_inode(alloc_inode(&fs, &h3, file(ROOT_INO)))
+    fs.stop(&h3)
+    assert_eq(h3.spent(), 3)
+    assert_eq(fs.plat.fatals, 2)
+    check_totals(&fs)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("freeing a free block, a free inode, metadata, the journal or a reserved inode is corruption, and changes nothing")
+frees_that_are_corruption()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val start = fs.geo.data_start(1)
+    val r = ok_run(blocks_for(&fs, start, 4, 0))
+    commit(&fs)
+    val total = fs.free_blocks_total.load()
+    assert_eq(failure(release(&fs, start + 4, 1)), 10)
+    // A run partly in use is refused whole.
+    assert_eq(failure(release(&fs, start + 2, 4)), 10)
+    ok(release(&fs, r.first, 2))
+    assert_eq(failure(release(&fs, r.first, 1)), 10)
+    assert_eq(failure(release(&fs, fs.geo.block_bitmap(1), 1)), 12)
+    assert_eq(failure(release(&fs, fs.geo.group_first(0), 1)), 12)
+    assert_eq(failure(release(&fs, fs.geo.journal_start + 3, 1)), 12)
+    assert_eq(failure(release(&fs, fs.geo.group_end(1) - 1, 2)), 12)
+    assert_eq(failure(release(&fs, fs.geo.blocks, 1)), 12)
+    assert_eq(failure(release(&fs, 0, 1)), 12)
+    assert_eq(failure(release(&fs, start, 0)), 3)
+    assert_eq(fs.pending_in(1), 2)
+    assert_eq(fs.free_blocks_total.load(), total)
+
+    var h = fs.start("unlink", 3)
+    assert_eq(failure(free_inode(&fs, &h, 20)), 11)
+    assert_eq(failure(free_inode(&fs, &h, ROOT_INO)), 13)
+    assert_eq(failure(free_inode(&fs, &h, 5)), 13)
+    assert_eq(failure(free_inode(&fs, &h, fs.sb.inode_count + 1)), 13)
+    val f = ok_inode(alloc_inode(&fs, &h, file(ROOT_INO)))
+    ok(free_inode(&fs, &h, f))
+    assert_eq(failure(free_inode(&fs, &h, f)), 11)
+    fs.stop(&h)
+    commit(&fs)
+    check_disk(&dev)
+    check_totals(&fs)
+
+@test("a bitmap whose checksum disagrees with its descriptor is reported when first used")
+corrupt_bitmap_is_detected()
+    var dev = standard_device()
+    val m = open(&dev) match
+        Ok(m) -> m
+        Err(_) -> panic("no open")
+    var bb = read_block(&dev, m.geo.block_bitmap(1))
+    bb[2000] = bb[2000] ^ 1
+    assert(dev.write(m.geo.block_bitmap(1), bb.view()).is_ok())
+    var ib = read_block(&dev, m.geo.inode_bitmap(1))
+    ib[3000] = ib[3000] ^ 0x80
+    assert(dev.write(m.geo.inode_bitmap(1), ib.view()).is_ok())
+    var fs = mounted_fs(&dev)
+    assert_eq(failure(blocks_for(&fs, fs.geo.data_start(1), 1, 0)), 101)
+    var h = fs.start("mkdir", 3)
+    assert_eq(failure(alloc_inode(&fs, &h, file(1025))), 201)
+    fs.stop(&h)
+
+@test("allocation never holds two group locks, and leaves no lock held")
+allocation_lock_discipline()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    for _ in 0..<5
+        make(&fs, dir(ROOT_INO))
+    val start = fs.geo.data_start(1)
+    ok_run(blocks_for(&fs, start, 4096, 0))
+    ok_run(blocks_for(&fs, start, 10, 0))
+    ok(release(&fs, start, 10))
+    commit(&fs)
+    assert(fs.plat.group_locks > 10)
+    assert_eq(fs.plat.most_groups_held, 1)
+    assert_eq(fs.plat.held(), 0)
+
+// -- Boundaries ---------------------------------------------------------------------------------------
+
+@test("the search finds a run at the first bit and one ending exactly at the last bit")
+find_run_at_the_edges()
+    var b = new_block()
+    bit_set_range(b.view(), 8, 64)
+    val first = find_run(b.view(), 0, 64, 0, 8).unwrap()
+    assert_eq(first.start, 0)
+    assert_eq(first.len, 8)
+    assert(find_run(b.view(), 0, 64, 0, 9).unwrap().len == 8)
+    var e = new_block()
+    bit_set_range(e.view(), 0, 60)
+    val last = find_run(e.view(), 0, 64, 10, 4).unwrap()
+    assert_eq(last.start, 60)
+    assert_eq(last.len, 4)
+    // Bits past `hi` are never part of a run, even when clear.
+    assert_eq(find_run(e.view(), 0, 62, 0, 4).unwrap().len, 2)
+    // From the last bit itself.
+    assert_eq(find_run(e.view(), 0, 64, 63, 1).unwrap().start, 63)
+
+@test("a whole group is one run ending exactly at the group's end, and so is the shorter last group")
+whole_groups_end_at_their_ends()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val one = ok_run(blocks_for(&fs, fs.geo.data_start(1), 2048, 0))
+    assert_eq(one.first + u64(one.len), fs.geo.group_end(1))
+    assert_eq(fs.geo.group_len(3), 2047)
+    val three = ok_run(blocks_for(&fs, fs.geo.data_start(3), 2048, 0))
+    assert_eq(three.first, fs.geo.data_start(3))
+    assert_eq(three.first + u64(three.len), fs.geo.blocks)
+    assert_eq(u64(three.len), fs.geo.blocks - fs.geo.data_start(3))
+    // The very last block of the filesystem can be freed and allocated again.
+    commit(&fs)
+    ok(release(&fs, fs.geo.blocks - 1, 1))
+    commit(&fs)
+    val again = ok_run(blocks_for(&fs, fs.geo.blocks - 1, 1, 0))
+    assert_eq(again.first, fs.geo.blocks - 1)
+    // A request past one group is cut to the group's size.
+    val big = ok_run(blocks_for(&fs, fs.geo.data_start(0), 40000, 0))
+    assert(big.len <= fs.geo.blocks_per_group)
+    commit(&fs)
+    check_disk(&dev)
+    check_totals(&fs)
+
+@test("a request for exactly a hole's length takes the hole; one block more takes the longest hole, short")
+exact_and_one_more()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val start = fs.geo.data_start(1)
+    ok_run(blocks_for(&fs, start, 2048, 0))
+    ok(release(&fs, start + 100, 7))
+    ok(release(&fs, start + 300, 7))
+    commit(&fs)
+    val exact = ok_run(blocks_for(&fs, start + 100, 7, 0))
+    assert_eq(exact.first, start + 100)
+    assert_eq(exact.len, 7)
+    val more = ok_run(blocks_for(&fs, start, 8, 0))
+    assert_eq(more.first, start + 300)
+    assert_eq(more.len, 7)
+    // The group is full now: the next request moves on to group 2.
+    assert_eq(fs.block_group(ok_run(blocks_for(&fs, start, 1, 0)).first), 2)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("a goal at a group's last data block takes it, and a longer request from there wraps to the group's start")
+goal_at_the_last_data_block()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val end = fs.geo.group_end(1)
+    val one = ok_run(blocks_for(&fs, end - 1, 1, 0))
+    assert_eq(one.first, end - 1)
+    ok(release(&fs, one.first, 1))
+    commit(&fs)
+    val wrapped = ok_run(blocks_for(&fs, end - 1, 5, 0))
+    assert_eq(wrapped.first, fs.geo.data_start(1))
+    assert_eq(wrapped.len, 5)
+    // A goal in a group's metadata starts at its first data block; one past the end is group 0's.
+    val meta = ok_run(blocks_for(&fs, fs.geo.block_bitmap(3), 1, 0))
+    assert_eq(meta.first, fs.geo.data_start(3))
+    val outside = ok_run(blocks_for(&fs, fs.geo.blocks + 7, 1, 0))
+    assert_eq(outside.first, fs.geo.data_start(0) + 1)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("with every group full but one the request finds that one, from any goal")
+every_group_full_but_one()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    // Each fresh group's free blocks are one run: one request of exactly that many fills it.
+    for g in 0u32..<3
+        val id = ok_id(fs.buffer(fs.desc_block(g)))
+        val d: *GroupDesc = at(fs.bytes(id), fs.desc_offset(g))
+        val r = ok_run(blocks_for(&fs, fs.geo.data_start(g), d.free_blocks, 0))
+        assert_eq(fs.block_group(r.first), g)
+        assert_eq(d.free_blocks, 0)
+    val free3 = fs.free_blocks_total.load()
+    assert(free3 > 0)
+    for g in 0u32..<4
+        val r = ok_run(blocks_for(&fs, fs.geo.data_start(g), 1, 0))
+        assert_eq(fs.block_group(r.first), 3)
+    assert_eq(fs.free_blocks_total.load(), free3 - 4)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("the reserve boundary: a non-root request is cut to what lies above it, uid 0 is not")
+reserve_boundary_exactly()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val reserve = fs.sb.reserved_blocks
+    loop
+        val above = fs.free_blocks_total.load() - (reserve + 5)
+        if above == 0 then break
+        val want = if above > 2048 then 2048u32 else u32(above)
+        ok_run(blocks_for(&fs, 0, want, 0))
+    assert_eq(fs.free_blocks_total.load(), reserve + 5)
+    val cut = ok_run(blocks_for(&fs, 0, 10, 1000))
+    assert_eq(cut.len, 5)
+    assert_eq(fs.free_blocks_total.load(), reserve)
+    assert_eq(failure(blocks_for(&fs, 0, 1, 1000)), 1)
+    assert_eq(fs.free_blocks_total.load(), reserve)
+    val root = ok_run(blocks_for(&fs, 0, 3, 0))
+    assert_eq(root.len, 3)
+    // Freed and committed, the blocks above the reserve are a non-root caller's again.
+    ok(release(&fs, cut.first, cut.len))
+    commit(&fs)
+    assert_eq(fs.free_blocks_total.load(), reserve + 2)
+    assert_eq(ok_run(blocks_for(&fs, 0, 10, 1000)).len, 2)
+    commit(&fs)
+    check_disk(&dev)
+    check_totals(&fs)
+
+@test("inodes fill a group to its last bit, then the next group's first bit")
+inode_bitmap_edges()
+    var dev = few_inodes_device()
+    var fs = mounted_fs(&dev)
+    var last: u64 = 0
+    for _ in 0..<(128 - 11)
+        last = make(&fs, file(ROOT_INO))
+    assert_eq(last, 128)
+    assert_eq(make(&fs, file(ROOT_INO)), 129)
+    // The last inode of the filesystem.
+    for _ in 0..<126
+        last = make(&fs, file(ROOT_INO))
+    assert_eq(last, 255)
+    assert_eq(make(&fs, file(ROOT_INO)), 256)
+    var full = fs.start("create", 3)
+    assert_eq(failure(alloc_inode(&fs, &full, file(ROOT_INO))), 1)
+    fs.stop(&full)
+    // Freeing the last one makes it the only free inode, and it comes back.
+    var h = fs.start("unlink", 3)
+    ok(free_inode(&fs, &h, 256))
+    fs.stop(&h)
+    assert_eq(make(&fs, dir(ROOT_INO)), 256)
+    commit(&fs)
+    check_disk(&dev)
+    check_totals(&fs)
+
+@test("the generation counts every allocation of a slot and survives on the disk")
+generation_counts_allocations()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = make(&fs, file(ROOT_INO))
+    for round in 1u32..<5
+        val node: *Inode = at(inode_bytes(&fs, ino), 0)
+        assert_eq(node.generation, round)
+        var h = fs.start("unlink", 3)
+        ok(free_inode(&fs, &h, ino))
+        fs.stop(&h)
+        commit(&fs)
+        assert_eq(make(&fs, file(ROOT_INO)), ino)
+    commit(&fs)
+    val loc = fs.inode_location(ino)
+    val raw = read_block(&dev, loc.block)
+    val on_disk: *Inode = at(raw.view(), loc.offset)
+    assert_eq(on_disk.generation, 5)
+    assert(verify_inode(fs.seed, ino, raw.view()[loc.offset..<loc.offset + INODE_SIZE]))
+
+@test("directories goes up for each directory made, down for each freed, not for files, and reaches the disk")
+directories_count()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val top = make(&fs, dir(ROOT_INO))
+    val g = fs.inode_group(top)
+    val a = make(&fs, dir(top))
+    val b = make(&fs, dir(top))
+    val f = make(&fs, file(top))
+    assert_eq(directories(&fs, g), 3)
+    var h = fs.start("unlink", 3)
+    ok(free_inode(&fs, &h, f))
+    fs.stop(&h)
+    assert_eq(directories(&fs, g), 3)
+    var h2 = fs.start("rmdir", 3)
+    ok(free_inode(&fs, &h2, a))
+    fs.stop(&h2)
+    assert_eq(directories(&fs, g), 2)
+    commit(&fs)
+    check_disk(&dev)
+    val m = open(&dev) match
+        Ok(m) -> m
+        Err(_) -> panic("no open")
+    assert_eq(m.desc(g).directories, 2)
+    assert_eq(m.desc(0).directories, 2)
+    assert(b != 0)
+
+@test("every reserved inode and every kind of metadata block is refused by a free")
+reserved_and_metadata_refused()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    var h = fs.start("unlink", 3)
+    for ino in 0u64..<11
+        assert_eq(failure(free_inode(&fs, &h, ino)), 13)
+    fs.stop(&h)
+    for g in 0u32..<4
+        assert_eq(failure(release(&fs, fs.geo.group_first(g), 1)), 12)
+        assert_eq(failure(release(&fs, fs.geo.block_bitmap(g), 1)), 12)
+        assert_eq(failure(release(&fs, fs.geo.inode_bitmap(g), 1)), 12)
+        assert_eq(failure(release(&fs, fs.geo.inode_table(g) + 5, 1)), 12)
+        // A run that starts in metadata and ends in data.
+        assert_eq(failure(release(&fs, fs.geo.data_start(g) - 1, 2)), 12)
+    assert_eq(failure(release(&fs, fs.desc_block(0), 1)), 12)
+    assert_eq(failure(release(&fs, fs.geo.journal_start, 1)), 12)
+    assert_eq(failure(release(&fs, fs.geo.journal_start + u64(fs.geo.journal_blocks) - 1, 1)), 12)
+    assert_eq(fs.pending_in(0), 0)
+    commit(&fs)
+    check_disk(&dev)
+
+@test("an inode slot that fails its checksum is corruption, to an allocation and to a free")
+corrupt_inode_slot()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val ino = make(&fs, file(ROOT_INO))
+    commit(&fs)
+    // Spoil the slot of the next free inode and of the allocated one, on the disk.
+    val loc = fs.inode_location(ino)
+    var raw = read_block(&dev, loc.block)
+    raw[loc.offset + 8] = raw[loc.offset + 8] ^ 1
+    raw[loc.offset + INODE_SIZE + 3] = 0x5A
+    assert(dev.write(loc.block, raw.view()).is_ok())
+    var fresh = mounted_fs(&dev)
+    var h = fresh.start("create", 3)
+    assert_eq(failure(alloc_inode(&fresh, &h, file(ROOT_INO))), 14)
+    assert_eq(failure(free_inode(&fresh, &h, ino)), 14)
+    fresh.stop(&h)
+
+@test("a descriptor that counts free inodes or blocks its bitmap has not got is corruption")
+counts_disagreeing_with_the_bitmap()
+    var dev = standard_device()
+    val m = open(&dev) match
+        Ok(m) -> m
+        Err(_) -> panic("no open")
+    // Mark every inode and block of group 1 in use, with matching checksums, but leave the counts.
+    var full = new_block()
+    bit_set_range(full.view(), 0, BLOCK_SIZE * 8)
+    assert(dev.write(m.geo.inode_bitmap(1), full.view()).is_ok())
+    assert(dev.write(m.geo.block_bitmap(1), full.view()).is_ok())
+    var table = read_block(&dev, 2)
+    val d: *GroupDesc = at(table.view(), 64)
+    d.inode_bitmap_crc = bitmap_crc(m.seed, 1, full.view())
+    d.block_bitmap_crc = bitmap_crc(m.seed, 1, full.view())
+    seal_group_desc(m.seed, 1, table.view()[64..<128])
+    assert(dev.write(2, table.view()).is_ok())
+    var fs = mounted_fs(&dev)
+    assert_eq(failure(blocks_for(&fs, fs.geo.data_start(1), 1, 0)), 301)
+    var h = fs.start("create", 3)
+    assert_eq(failure(alloc_inode(&fs, &h, dir(ROOT_INO))), 301)
+    fs.stop(&h)
+
+@test("mounting a device with no filesystem answers the open error; a zero-length request is refused")
+mount_and_argument_errors()
+    var blank = ram_device(64)
+    assert_eq(failure(mount(&blank, host_platform())), 4)
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    assert_eq(failure(blocks_for(&fs, 0, 0, 0)), 3)
+
+@test("a buffer another handle already put in the transaction still costs this handle a credit")
+credits_count_per_handle()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    var a = fs.start("create", 3)
+    ok_inode(alloc_inode(&fs, &a, file(ROOT_INO)))
+    fs.stop(&a)
+    var b = fs.start("create", 3)
+    ok_inode(alloc_inode(&fs, &b, file(ROOT_INO)))
+    fs.stop(&b)
+    assert_eq(a.spent(), 3)
+    assert_eq(b.spent(), 3)
+    // The transaction holds each buffer once.
+    assert_eq(fs.txn_buffers.len(), 3)
+    commit(&fs)
+    assert_eq(fs.txn_buffers.len(), 0)
+
+@test("pending frees of an older transaction are released by a later commit too, and each commit only its own")
+pending_by_transaction()
+    var dev = standard_device()
+    var fs = mounted_fs(&dev)
+    val start = fs.geo.data_start(1)
+    val r = ok_run(blocks_for(&fs, start, 20, 0))
+    commit(&fs)
+    val total = fs.free_blocks_total.load()
+    ok(release(&fs, r.first, 10))
+    val first_seq = fs.running()
+    // The commit callback for an older sequence releases nothing of this one.
+    fs.committed(first_seq - 1)
+    assert_eq(fs.pending_in(1), 10)
+    commit(&fs)
+    ok(release(&fs, r.first + 10, 10))
+    assert_eq(fs.pending_in(1), 10)
+    assert_eq(fs.free_blocks_total.load(), total + 10)
+    commit(&fs)
+    assert_eq(fs.pending_in(1), 0)
+    assert_eq(fs.free_blocks_total.load(), total + 20)
+    check_totals(&fs)

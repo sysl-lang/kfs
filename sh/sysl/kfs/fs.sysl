@@ -1,0 +1,257 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+import sysl.sync.{Atomic, Ordering}
+
+// A mounted filesystem, and the metadata-buffer layer every change to it goes through (kfs/SPEC.md
+// sections 14 and 19).
+//
+// **Buffers.** A metadata block is changed only through its buffer: `buffer(b)` answers the cached
+// copy of block `b` (reading it the first time), `bytes(id)` its bytes. A change is made in three
+// steps, always in this order:
+//
+//     lock(Buffer(b)); write_access(h, id)?; unlock(Buffer(b))     -- declare it, before any byte moves
+//     lock(Buffer(b)); <change the bytes>; unlock(Buffer(b))       -- then change it
+//
+// `write_access` is the seam the journal plugs into. It charges the buffer to the handle (a credit
+// overrun is a bug, section 14) and makes it part of the running transaction; in stage 5 it is also
+// where a buffer the committing transaction still owns is frozen before the change (section 14, step
+// 3), which is why it must come before the change and not after.
+//
+// **Handles and the transaction.** `start` opens a handle with a credit count and joins the running
+// transaction; `stop` closes it. `commit` commits the running transaction when no handle is open. In
+// this stage that is a write-through: every buffer of the transaction is written in place and the
+// device flushed. Stage 5 replaces the body of `commit` with the journal's commit (log, flush, commit
+// block, flush, checkpoint later); everything above it calls the same five things. Either way a
+// commit ends with `committed(seq)`, the commit callback, which is what returns the transaction's
+// freed blocks to the allocatable pool (section 17).
+//
+// **The totals** of section 19 are two atomics, moved by the same deltas as the descriptors under the
+// same group lock. A block freed by a transaction that has not committed is in its descriptor's
+// `free_blocks` (the bitmap bit is clear) but not yet in `free_blocks_total` (section 20), so the
+// total is always the sum of the descriptors less the blocks pending free.
+
+enum Corruption
+    // A bitmap block disagrees with the checksum its group's descriptor holds for it.
+    BlockBitmap(group: u32)
+    InodeBitmap(group: u32)
+    // A descriptor says its group has free inodes or blocks and the bitmap has none.
+    GroupCounts(group: u32)
+    // An inode slot fails its checksum.
+    Inode(ino: u64)
+    // A free of a block whose bit is already clear.
+    FreeingFreeBlock(block: u64)
+    // A free of an inode whose bit is already clear.
+    FreeingFreeInode(ino: u64)
+    // A free naming blocks that are not data blocks of one group: metadata, the journal, past the end,
+    // or a run that crosses into the next group.
+    NotDataBlocks(block: u64)
+    // An inode number that is reserved or past the last inode.
+    BadInodeNumber(ino: u64)
+
+enum FsError
+    NoSpace
+    Device(why: DeviceError)
+    Open(why: OpenError)
+    Corrupt(why: Corruption)
+    // A bug in KFS; the platform's `fatal` was told first.
+    Bug
+    // An argument no caller should pass: a zero-length request, a mode with no file type, a commit
+    // while a handle is open.
+    Invalid
+
+impl From[DeviceError] for FsError
+    from(e: DeviceError) -> FsError = FsError.Device(e)
+
+impl From[OpenError] for FsError
+    from(e: OpenError) -> FsError = FsError.Open(e)
+
+// One cached metadata block.
+struct Buffer
+    block: u64
+    data: Buf[u8]
+    // The sequence of the transaction the buffer belongs to, 0 when it belongs to none.
+    txn: u64
+
+// An operation's handle on the running transaction (section 14). `op` names the operation in a credit
+// failure; `used` is the blocks of the distinct buffers it has declared.
+struct Handle
+    op: string
+    credits: u32
+    seq: u64
+    private[kfs] used: Buf[u64]
+
+    // How many credits it has used.
+    spent(self) -> u32 = u32(self.used.len())
+
+// A run of blocks freed by transaction `seq` and not yet allocatable.
+struct Pending
+    seq: u64
+    first: u64
+    len: u32
+
+// What the package keeps for one group beside its descriptor: the pending frees and whether its
+// bitmaps have been checked against their checksums since they were read.
+struct GroupState
+    pending: Buf[Pending]
+    pending_blocks: u32
+    block_bitmap_checked: bool
+    inode_bitmap_checked: bool
+
+struct Fs[D: BlockDevice, P: Platform]
+    dev: *D
+    plat: P
+    sb: Superblock
+    geo: Geometry
+    seed: u32
+    free_blocks_total: Atomic[u64]
+    free_inodes_total: Atomic[u64]
+    private[kfs] buffers: Buf[Buffer]
+    private[kfs] groups: Buf[GroupState]
+    // The running transaction: its sequence, its buffers and how many handles are open in it.
+    private[kfs] seq: u64
+    private[kfs] txn_buffers: Buf[usize]
+    private[kfs] handles: u32
+
+    // -- Buffers -------------------------------------------------------------------------------------
+
+    // The buffer holding block `b`, read from the device the first time it is asked for.
+    buffer(*self, b: u64) -> Result[usize, FsError]
+        self.plat.lock(LockId.Cache)
+        val have = self.cached(b)
+        self.plat.unlock(LockId.Cache)
+        have match
+            Some(id) -> return Ok(id)
+            None -> ()
+        var data = block_buf()
+        self.dev.read(b, data.view())?
+        self.plat.lock(LockId.Cache)
+        val raced = self.cached(b)
+        val id = raced match
+            Some(other) -> other
+            None ->
+                self.buffers.push(Buffer(b, data, 0))
+                self.buffers.len() - 1
+        self.plat.unlock(LockId.Cache)
+        Ok(id)
+
+    private cached(self, b: u64) -> Option[usize]
+        for i in 0..<self.buffers.len()
+            if self.buffers[i].block == b then return Some(i)
+        None
+
+    // A buffer's block number and bytes.
+    block_of(self, id: usize) -> u64 = self.buffers[id].block
+    bytes(self, id: usize) -> []u8 = self.buffers[id].data.view()
+
+    // -- Handles and the transaction -----------------------------------------------------------------
+
+    // Open a handle for operation `op` with `credits` buffers to spend, joining the running
+    // transaction. (Stage 5: may wait for room in the log or for a commit.)
+    start(*self, op: string, credits: u32) -> Handle
+        self.plat.lock(LockId.Journal)
+        self.handles += 1
+        val seq = self.seq
+        self.plat.unlock(LockId.Journal)
+        Handle(op, credits, seq, buf())
+
+    // Declare that `h` is about to change buffer `id`. Call it under the buffer's lock, before the
+    // change. A buffer the handle has not declared before costs one credit; past the last credit the
+    // platform is told of the bug and the call answers `Bug`.
+    write_access(*self, h: *Handle, id: usize) -> Result[unit, FsError]
+        val b = self.buffers[id].block
+        var known = false
+        for x in h.used.view()
+            if x == b then known = true
+        if !known
+            if h.used.len() >= usize(h.credits)
+                self.plat.fatal(Fatal.CreditOverrun(h.op, h.credits))
+                return Err(FsError.Bug)
+            h.used.push(b)
+        self.plat.lock(LockId.Journal)
+        if self.buffers[id].txn != h.seq
+            self.buffers.view()[id].txn = h.seq
+            self.txn_buffers.push(id)
+        self.plat.unlock(LockId.Journal)
+        Ok(())
+
+    // Close a handle. Its changes stay in the running transaction until it commits.
+    stop(*self, h: *Handle)
+        self.plat.lock(LockId.Journal)
+        self.handles -= 1
+        self.plat.unlock(LockId.Journal)
+
+    // Commit the running transaction. Stage 3 writes every buffer it holds in place and flushes; stage
+    // 5 replaces this with the journal's commit. Every handle must be closed.
+    commit(*self) -> Result[unit, FsError]
+        if self.handles != 0 then return Err(FsError.Invalid)
+        for id in self.txn_buffers.view()
+            val b = self.buffers[id].block
+            self.plat.lock(LockId.Buffer(b))
+            val wrote = self.dev.write(b, self.buffers[id].data.view())
+            self.buffers.view()[id].txn = 0
+            self.plat.unlock(LockId.Buffer(b))
+            wrote?
+        self.dev.flush()?
+        val done = self.seq
+        self.seq += 1
+        self.txn_buffers.clear()
+        self.committed(done)
+        Ok(())
+
+    // The commit callback: transaction `seq` is durable, so the blocks it freed (and any older
+    // transaction's) become allocatable and count in the total again.
+    committed(*self, seq: u64)
+        for g in 0..<self.geo.group_count
+            self.plat.lock(LockId.Group(g))
+            val gs = self.groups[usize(g)]
+            var released: u32 = 0
+            var i: usize = 0
+            while i < gs.pending.len()
+                if gs.pending[i].seq <= seq
+                    released += gs.pending[i].len
+                    gs.pending.remove(i)
+                else
+                    i += 1
+            self.groups.view()[usize(g)].pending_blocks = gs.pending_blocks - released
+            self.free_blocks_total.add(u64(released))
+            self.plat.unlock(LockId.Group(g))
+
+    // `sync`: ask the platform for a commit, and run it here when there is no commit thread.
+    sync(*self) -> Result[unit, FsError]
+        if self.plat.wake_committer() then return self.commit()
+        Ok(())
+
+    // The running transaction's sequence.
+    running(self) -> u64 = self.seq
+
+    // -- Where things are ----------------------------------------------------------------------------
+
+    // The descriptor-table block holding group `g`'s descriptor, and the descriptor's offset in it.
+    desc_block(self, g: u32) -> u64 = 2 + u64(g / 64)
+    desc_offset(self, g: u32) -> usize = usize(g % 64) * 64
+
+    // The group inode `ino` belongs to, and the group block `b` belongs to.
+    inode_group(self, ino: u64) -> u32 = u32((ino - 1) / u64(self.geo.inodes_per_group))
+    block_group(self, b: u64) -> u32 = u32((b - 1) / u64(self.geo.blocks_per_group))
+
+    // Where inode `ino` is: the inode-table block and the offset in it.
+    inode_location(self, ino: u64) -> InodeLoc
+        val i = (ino - 1) % u64(self.geo.inodes_per_group)
+        InodeLoc(self.geo.inode_table(self.inode_group(ino)) + i / 16, usize(i % 16) * INODE_SIZE)
+
+    // Blocks pending free in group `g`.
+    pending_in(self, g: u32) -> u32 = self.groups[usize(g)].pending_blocks
+
+// Mount `dev`: verify the superblock and descriptors (`open`), and take the totals from the
+// descriptors.
+mount[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D, P], FsError]
+    val m = open(dev)?
+    var blocks: u64 = 0
+    var inodes: u64 = 0
+    var groups: Buf[GroupState] = buf()
+    for d in m.descs.view()
+        blocks += u64(d.free_blocks)
+        inodes += u64(d.free_inodes)
+        groups.push(GroupState(buf(), 0, false, false))
+    Ok(Fs(dev, plat, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, 1, buf(), 0))

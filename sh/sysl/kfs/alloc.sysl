@@ -1,0 +1,454 @@
+module keel.kfs
+
+import sysl.sync.{Atomic, Ordering}
+
+// The inode and block allocators of kfs/SPEC.md section 17, over the buffer layer of fs.sysl.
+//
+// Each works one group at a time under that group's lock and never holds two (section 19, rule 6): it
+// tries a group, releases it, tries the next. Within a group every buffer it will change is declared
+// first (`write_access`, each under its own buffer lock) and only then changed, so a failure (a credit
+// overrun, a device error) leaves nothing half done. Every allocation and free changes the bitmap, the
+// descriptor's counts, the bitmap's checksum and the descriptor's checksum together, in one handle.
+//
+// The totals are claimed before a group is searched, by compare-and-swap, and what was not used is
+// given back: two allocations racing for the last free blocks cannot both pass the reserve check.
+
+// Mode types (section 8).
+const S_IFMT: u16 = 0o170000
+const S_IFREG: u16 = 0o100000
+const S_IFDIR: u16 = 0o040000
+const S_IFLNK: u16 = 0o120000
+const S_IFCHR: u16 = 0o020000
+const S_IFBLK: u16 = 0o060000
+const S_IFIFO: u16 = 0o010000
+const S_IFSOCK: u16 = 0o140000
+
+// What a new inode starts as. `parent` is the directory it is being created in; it places the inode,
+// and a directory records it.
+struct NewInode
+    mode: u16
+    uid: u32
+    gid: u32
+    links: u32
+    parent: u64
+
+// A run of blocks: `len` blocks from `first`.
+struct Run
+    first: u64
+    len: u32
+
+private valid_type(mode: u16) -> bool
+    val t = mode & S_IFMT
+    t == S_IFREG || t == S_IFDIR || t == S_IFLNK || t == S_IFCHR || t == S_IFBLK || t == S_IFIFO || t == S_IFSOCK
+
+private is_dir(mode: u16) -> bool = mode & S_IFMT == S_IFDIR
+
+// Take up to `want` from `total`, leaving at least `keep`: answers how many were taken (0 when there
+// was nothing above `keep`).
+private claim(total: *Atomic[u64], want: u64, keep: u64) -> u64
+    loop
+        val t = total.load()
+        if t <= keep then return 0
+        val n = if t - keep < want then t - keep else want
+        if total.cas(t, t - n) == t then return n
+
+// -- Bitmap buffers ----------------------------------------------------------------------------------
+
+// The buffer of group `g`'s block bitmap (or inode bitmap), checked against the descriptor's checksum
+// the first time it is used. Called under the group's lock.
+private bitmap_buffer[D: BlockDevice, P: Platform](fs: *Fs[D, P], g: u32, d: *GroupDesc, inodes: bool) -> Result[usize, FsError]
+    val gs = fs.groups[usize(g)]
+    val id = fs.buffer(if inodes then d.inode_bitmap else d.block_bitmap)?
+    val checked = if inodes then gs.inode_bitmap_checked else gs.block_bitmap_checked
+    if !checked
+        val want = if inodes then d.inode_bitmap_crc else d.block_bitmap_crc
+        if bitmap_crc(fs.seed, g, fs.bytes(id)) != want
+            return Err(FsError.Corrupt(if inodes then Corruption.InodeBitmap(g) else Corruption.BlockBitmap(g)))
+        if inodes
+            fs.groups.view()[usize(g)].inode_bitmap_checked = true
+        else
+            fs.groups.view()[usize(g)].block_bitmap_checked = true
+    Ok(id)
+
+// The buffer holding group `g`'s descriptor, and the descriptor inside it.
+private descriptor[D: BlockDevice, P: Platform](fs: *Fs[D, P], g: u32) -> Result[usize, FsError]
+    fs.buffer(fs.desc_block(g))
+
+private desc_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], id: usize, g: u32) -> *GroupDesc
+    at(fs.bytes(id), fs.desc_offset(g))
+
+// Declare a buffer under its own lock.
+private declare[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, id: usize) -> Result[unit, FsError]
+    val b = fs.block_of(id)
+    fs.plat.lock(LockId.Buffer(b))
+    val r = fs.write_access(h, id)
+    fs.plat.unlock(LockId.Buffer(b))
+    r
+
+// Re-seal group `g`'s descriptor after its fields changed. Called under the buffer's lock, in the same
+// hold as the change.
+private reseal[D: BlockDevice, P: Platform](fs: *Fs[D, P], g: u32, did: usize)
+    val off = fs.desc_offset(g)
+    seal_group_desc(fs.seed, g, fs.bytes(did)[off..<off + 64])
+
+// -- Inodes ------------------------------------------------------------------------------------------
+
+// The group a new inode should go to first (section 17, "Inodes").
+private preferred_group[D: BlockDevice, P: Platform](fs: *Fs[D, P], n: NewInode) -> Result[u32, FsError]
+    val parent_ok = n.parent >= 1 && n.parent <= fs.sb.inode_count
+    val home = if parent_ok then fs.inode_group(n.parent) else 0
+    if !is_dir(n.mode) then return Ok(home)
+    val groups = u64(fs.geo.group_count)
+    if n.parent != ROOT_INO
+        fs.plat.lock(LockId.Group(home))
+        val free = free_inodes_in(fs, home)
+        fs.plat.unlock(LockId.Group(home))
+        if u64(free?) >= fs.free_inodes_total.load() / groups then return Ok(home)
+    spread_group(fs, home)
+
+// Group `g`'s free inodes. Called under its lock.
+private free_inodes_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], g: u32) -> Result[u32, FsError]
+    val id = descriptor(fs, g)?
+    Ok(desc_in(fs, id, g).free_inodes)
+
+// The group with the fewest directories among those with at least the average free inodes and the
+// average free blocks (the lowest such on a tie); `fallback` when none qualifies.
+private spread_group[D: BlockDevice, P: Platform](fs: *Fs[D, P], fallback: u32) -> Result[u32, FsError]
+    val groups = u64(fs.geo.group_count)
+    val avg_inodes = fs.free_inodes_total.load() / groups
+    val avg_blocks = fs.free_blocks_total.load() / groups
+    var best = fallback
+    var best_dirs: u32 = 0
+    var found = false
+    for g in 0..<fs.geo.group_count
+        fs.plat.lock(LockId.Group(g))
+        val did = descriptor(fs, g)
+        var inodes: u32 = 0
+        var blocks: u32 = 0
+        var dirs: u32 = 0
+        did match
+            Ok(id) ->
+                val d = desc_in(fs, id, g)
+                inodes = d.free_inodes
+                blocks = d.free_blocks - fs.pending_in(g)
+                dirs = d.directories
+            Err(_) -> ()
+        fs.plat.unlock(LockId.Group(g))
+        did?
+        if inodes > 0 && u64(inodes) >= avg_inodes && u64(blocks) >= avg_blocks && (!found || dirs < best_dirs)
+            best = g
+            best_dirs = dirs
+            found = true
+    Ok(best)
+
+// Allocate an inode for `n` (section 17): choose the group, take the lowest clear bit there (else the
+// next group with a free inode, round the groups), and initialise the slot: generation incremented,
+// every time now, an empty extent root for a file, directory or symlink. Answers its number.
+alloc_inode[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, n: NewInode) -> Result[u64, FsError]
+    if !valid_type(n.mode) then return Err(FsError.Invalid)
+    val first = preferred_group(fs, n)?
+    if claim(&fs.free_inodes_total, 1, 0) == 0 then return Err(FsError.NoSpace)
+    val groups = fs.geo.group_count
+    for k in 0..<groups
+        val g = (first + k) % groups
+        inode_in_group(fs, h, g, n) match
+            Ok(Some(ino)) -> return Ok(ino)
+            Ok(None) -> ()
+            Err(e) ->
+                fs.free_inodes_total.add(1)
+                return Err(e)
+    fs.free_inodes_total.add(1)
+    Err(FsError.NoSpace)
+
+private inode_in_group[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, g: u32, n: NewInode) -> Result[Option[u64], FsError]
+    fs.plat.lock(LockId.Group(g))
+    val r = inode_in_group_locked(fs, h, g, n)
+    fs.plat.unlock(LockId.Group(g))
+    r
+
+private inode_in_group_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, g: u32, n: NewInode) -> Result[Option[u64], FsError]
+    val did = descriptor(fs, g)?
+    val d = desc_in(fs, did, g)
+    if d.free_inodes == 0 then return Ok(None)
+    val ib = bitmap_buffer(fs, g, d, true)?
+    val ipg = usize(fs.geo.inodes_per_group)
+    var i: usize = 0
+    while i < ipg && bit_test(fs.bytes(ib), i)
+        i += 1
+    if i == ipg then return Err(FsError.Corrupt(Corruption.GroupCounts(g)))
+    val ino = u64(g) * u64(ipg) + u64(i) + 1
+    val loc = fs.inode_location(ino)
+    val tb = fs.buffer(loc.block)?
+    val slot = fs.bytes(tb)[loc.offset..<loc.offset + INODE_SIZE]
+    if !all_zero(slot) && !verify_inode(fs.seed, ino, slot) then return Err(FsError.Corrupt(Corruption.Inode(ino)))
+
+    declare(fs, h, ib)?
+    declare(fs, h, did)?
+    declare(fs, h, tb)?
+
+    val now = fs.plat.now()
+    fs.plat.lock(LockId.Buffer(fs.block_of(ib)))
+    bit_set(fs.bytes(ib), i)
+    fs.plat.unlock(LockId.Buffer(fs.block_of(ib)))
+
+    fs.plat.lock(LockId.Buffer(fs.block_of(tb)))
+    init_inode(fs.bytes(tb), loc.offset, fs.seed, ino, n, now)
+    fs.plat.unlock(LockId.Buffer(fs.block_of(tb)))
+
+    fs.plat.lock(LockId.Buffer(fs.block_of(did)))
+    d.free_inodes -= 1
+    if is_dir(n.mode) then d.directories += 1
+    d.inode_bitmap_crc = bitmap_crc(fs.seed, g, fs.bytes(ib))
+    reseal(fs, g, did)
+    fs.plat.unlock(LockId.Buffer(fs.block_of(did)))
+    Ok(Some(ino))
+
+private all_zero(bytes: []const u8) -> bool
+    for x in bytes
+        if x != 0 then return false
+    true
+
+// Initialise inode `ino`'s slot at `offset` in `block`: everything zero but the generation (the old
+// one plus one), the caller's mode, owner, links and parent, every time `now`, and for a file,
+// directory or symlink an empty extent root. Sealed.
+private init_inode(block: []u8, offset: usize, seed: u32, ino: u64, n: NewInode, now: Time)
+    val node: *Inode = at(block, offset)
+    val generation = node.generation + 1
+    for k in offset..<offset + INODE_SIZE
+        block[k] = 0
+    node.mode = n.mode
+    node.links = n.links
+    node.uid = n.uid
+    node.gid = n.gid
+    node.generation = generation
+    node.atime_sec = now.sec
+    node.mtime_sec = now.sec
+    node.ctime_sec = now.sec
+    node.crtime_sec = now.sec
+    node.atime_nsec = now.nsec
+    node.mtime_nsec = now.nsec
+    node.ctime_nsec = now.nsec
+    node.crtime_nsec = now.nsec
+    if is_dir(n.mode) then node.parent = n.parent
+    val t = n.mode & S_IFMT
+    if t == S_IFREG || t == S_IFDIR || t == S_IFLNK
+        val head: *NodeHeader = at(block, offset + 112)
+        head.magic = EXTENT_MAGIC
+        head.max = u16(EXTENT_ROOT_SLOTS)
+    seal_inode(seed, ino, block[offset..<offset + INODE_SIZE])
+
+// Free inode `ino` (section 8, "Generation"): clear its bit, zero its slot but the generation, count it
+// free (and one directory fewer for a directory). A free of an inode that is not allocated is
+// corruption, and changes nothing.
+free_inode[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> Result[unit, FsError]
+    if ino < FIRST_INO || ino > fs.sb.inode_count then return Err(FsError.Corrupt(Corruption.BadInodeNumber(ino)))
+    val g = fs.inode_group(ino)
+    fs.plat.lock(LockId.Group(g))
+    val r = free_inode_locked(fs, h, g, ino)
+    fs.plat.unlock(LockId.Group(g))
+    r?
+    fs.free_inodes_total.add(1)
+    Ok(())
+
+private free_inode_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, g: u32, ino: u64) -> Result[unit, FsError]
+    val did = descriptor(fs, g)?
+    val d = desc_in(fs, did, g)
+    val ib = bitmap_buffer(fs, g, d, true)?
+    val i = usize((ino - 1) % u64(fs.geo.inodes_per_group))
+    if !bit_test(fs.bytes(ib), i) then return Err(FsError.Corrupt(Corruption.FreeingFreeInode(ino)))
+    val loc = fs.inode_location(ino)
+    val tb = fs.buffer(loc.block)?
+    val slot = fs.bytes(tb)[loc.offset..<loc.offset + INODE_SIZE]
+    if !verify_inode(fs.seed, ino, slot) then return Err(FsError.Corrupt(Corruption.Inode(ino)))
+
+    declare(fs, h, ib)?
+    declare(fs, h, did)?
+    declare(fs, h, tb)?
+
+    fs.plat.lock(LockId.Buffer(fs.block_of(ib)))
+    bit_clear(fs.bytes(ib), i)
+    fs.plat.unlock(LockId.Buffer(fs.block_of(ib)))
+
+    fs.plat.lock(LockId.Buffer(fs.block_of(tb)))
+    val node: *Inode = at(fs.bytes(tb), loc.offset)
+    val dir = is_dir(node.mode)
+    val generation = node.generation
+    for k in loc.offset..<loc.offset + INODE_SIZE
+        fs.bytes(tb)[k] = 0
+    node.generation = generation
+    seal_inode(fs.seed, ino, fs.bytes(tb)[loc.offset..<loc.offset + INODE_SIZE])
+    fs.plat.unlock(LockId.Buffer(fs.block_of(tb)))
+
+    fs.plat.lock(LockId.Buffer(fs.block_of(did)))
+    d.free_inodes += 1
+    if dir then d.directories -= 1
+    d.inode_bitmap_crc = bitmap_crc(fs.seed, g, fs.bytes(ib))
+    reseal(fs, g, did)
+    fs.plat.unlock(LockId.Buffer(fs.block_of(did)))
+    Ok(())
+
+// -- Blocks ------------------------------------------------------------------------------------------
+
+// The goal for inode `ino`'s next block (section 17, "Blocks"): the block after `last`, its last
+// mapped physical block, or the first data block of its group when it has none (`last` 0). An
+// extent-tree node asks with `last` 0.
+goal_for[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, last: u64) -> u64
+    if last != 0 && last + 1 < fs.geo.blocks then return last + 1
+    fs.geo.data_start(fs.inode_group(ino))
+
+// Allocate one run of at most `want` blocks for a caller of uid `uid` (section 17): from the goal, the
+// first free run of the full length in the goal's group (from the goal to the group's end, then from
+// the group's first data block); failing that the longest free run in that group; failing that the
+// same search in each next group, round the groups. A caller other than uid 0 may not take the free
+// count below `reserved_blocks`: its request is cut to what lies above the reserve, and answers
+// `NoSpace` when nothing does.
+alloc_blocks[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, goal: u64, want: u32, uid: u32) -> Result[Run, FsError]
+    if want == 0 then return Err(FsError.Invalid)
+    var asked = want
+    if asked > EXTENT_MAX_LEN then asked = EXTENT_MAX_LEN
+    if asked > fs.geo.blocks_per_group then asked = fs.geo.blocks_per_group
+    val keep = if uid == 0 then 0 else fs.sb.reserved_blocks
+    val n = u32(claim(&fs.free_blocks_total, u64(asked), keep))
+    if n == 0 then return Err(FsError.NoSpace)
+
+    val groups = fs.geo.group_count
+    val inside = goal >= 1 && goal < fs.geo.blocks
+    val g0 = if inside then fs.block_group(goal) else 0
+    for k in 0..<groups
+        val g = (g0 + k) % groups
+        val from = if k == 0 && inside then goal else fs.geo.data_start(g)
+        blocks_in_group(fs, h, g, from, n) match
+            Ok(Some(run)) ->
+                fs.free_blocks_total.add(u64(n - run.len))
+                return Ok(run)
+            Ok(None) -> ()
+            Err(e) ->
+                fs.free_blocks_total.add(u64(n))
+                return Err(e)
+    fs.free_blocks_total.add(u64(n))
+    Err(FsError.NoSpace)
+
+private blocks_in_group[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, g: u32, from: u64, n: u32) -> Result[Option[Run], FsError]
+    fs.plat.lock(LockId.Group(g))
+    val r = blocks_in_group_locked(fs, h, g, from, n)
+    fs.plat.unlock(LockId.Group(g))
+    r
+
+private blocks_in_group_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, g: u32, from: u64, n: u32) -> Result[Option[Run], FsError]
+    val did = descriptor(fs, g)?
+    val d = desc_in(fs, did, g)
+    if d.free_blocks <= fs.pending_in(g) then return Ok(None)
+    val bb = bitmap_buffer(fs, g, d, false)?
+    val first = fs.geo.group_first(g)
+    val lo = usize(fs.geo.data_start(g) - first)
+    val hi = usize(fs.geo.group_len(g))
+    var start = usize(from - first)
+    if start < lo || start >= hi then start = lo
+
+    // What may be handed out: the bitmap with the pending frees marked in use.
+    var usable = block_buf()
+    for k in 0..<BLOCK_SIZE
+        usable[k] = fs.bytes(bb)[k]
+    for p in fs.groups[usize(g)].pending.view()
+        bit_set_range(usable.view(), usize(p.first - first), usize(p.first - first) + usize(p.len))
+
+    val found = find_run(usable.view(), lo, hi, start, usize(n)) match
+        Some(s) -> s
+        None -> return Err(FsError.Corrupt(Corruption.GroupCounts(g)))
+
+    declare(fs, h, bb)?
+    declare(fs, h, did)?
+
+    fs.plat.lock(LockId.Buffer(fs.block_of(bb)))
+    bit_set_range(fs.bytes(bb), found.start, found.start + found.len)
+    fs.plat.unlock(LockId.Buffer(fs.block_of(bb)))
+
+    fs.plat.lock(LockId.Buffer(fs.block_of(did)))
+    d.free_blocks -= u32(found.len)
+    d.block_bitmap_crc = bitmap_crc(fs.seed, g, fs.bytes(bb))
+    reseal(fs, g, did)
+    fs.plat.unlock(LockId.Buffer(fs.block_of(did)))
+    Ok(Some(Run(first + u64(found.start), u32(found.len))))
+
+// A stretch of bits: `len` from `start`.
+struct Stretch
+    start: usize
+    len: usize
+
+private run_at(bits: []const u8, i: usize, hi: usize) -> usize
+    var j = i
+    while j < hi && !bit_test(bits, j)
+        j += 1
+    j - i
+
+// The search of section 17 over one bitmap, among bits `lo ..< hi`, from bit `from`: the first clear
+// run of at least `want` (from `from` to `hi`, then from `lo` up to `from`), taken as its first `want`
+// bits; else the longest clear run (its first `want` bits at most); None when every bit is set.
+find_run(bits: []const u8, lo: usize, hi: usize, from: usize, want: usize) -> Option[Stretch]
+    var best = Stretch(0, 0)
+    var i = from
+    while i < hi
+        if bit_test(bits, i)
+            i += 1
+        else
+            val len = run_at(bits, i, hi)
+            if len >= want then return Some(Stretch(i, want))
+            if len > best.len then best = Stretch(i, len)
+            i += len
+    i = lo
+    while i < from
+        if bit_test(bits, i)
+            i += 1
+        else
+            val len = run_at(bits, i, hi)
+            if len >= want then return Some(Stretch(i, want))
+            if len > best.len then best = Stretch(i, len)
+            i += len
+    if best.len == 0 then return None
+    Some(Stretch(best.start, if best.len < want then best.len else want))
+
+// Free `len` blocks from `first` in handle `h` (section 17): clear their bits and count them in the
+// descriptor now; they become allocatable, and count in the total, only when `h`'s transaction
+// commits. The run must be data blocks of one group, every one of them in use; anything else is
+// corruption and changes nothing.
+free_blocks[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, first: u64, len: u32) -> Result[unit, FsError]
+    if len == 0 then return Err(FsError.Invalid)
+    if first < 1 || first >= fs.geo.blocks then return not_data(first)
+    val g = fs.block_group(first)
+    val end = first + u64(len)
+    if first < fs.geo.data_start(g) || end > fs.geo.group_end(g) then return not_data(first)
+    if g == fs.geo.journal_group() && first < fs.geo.journal_start + u64(fs.geo.journal_blocks) && end > fs.geo.journal_start
+        return not_data(first)
+    fs.plat.lock(LockId.Group(g))
+    val r = free_blocks_locked(fs, h, g, first, len)
+    fs.plat.unlock(LockId.Group(g))
+    r
+
+private not_data(first: u64) -> Result[unit, FsError] = Err(FsError.Corrupt(Corruption.NotDataBlocks(first)))
+
+private free_blocks_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, g: u32, first: u64, len: u32) -> Result[unit, FsError]
+    val did = descriptor(fs, g)?
+    val d = desc_in(fs, did, g)
+    val bb = bitmap_buffer(fs, g, d, false)?
+    val at_bit = usize(first - fs.geo.group_first(g))
+    for k in 0..<usize(len)
+        if !bit_test(fs.bytes(bb), at_bit + k)
+            return Err(FsError.Corrupt(Corruption.FreeingFreeBlock(first + u64(k))))
+
+    declare(fs, h, bb)?
+    declare(fs, h, did)?
+
+    fs.plat.lock(LockId.Buffer(fs.block_of(bb)))
+    for k in 0..<usize(len)
+        bit_clear(fs.bytes(bb), at_bit + k)
+    fs.plat.unlock(LockId.Buffer(fs.block_of(bb)))
+
+    fs.plat.lock(LockId.Buffer(fs.block_of(did)))
+    d.free_blocks += len
+    d.block_bitmap_crc = bitmap_crc(fs.seed, g, fs.bytes(bb))
+    reseal(fs, g, did)
+    fs.plat.unlock(LockId.Buffer(fs.block_of(did)))
+
+    fs.groups[usize(g)].pending.push(Pending(h.seq, first, len))
+    fs.groups.view()[usize(g)].pending_blocks = fs.groups[usize(g)].pending_blocks + len
+    Ok(())

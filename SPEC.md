@@ -825,7 +825,11 @@ Per operation (section 18 says what each writes):
 
 **Credits are checked, not trusted.** A handle counts the distinct buffers it adds to the
 transaction; adding one past its credits is a bug in the credit table and stops the kernel (and fails
-the host test) at once, naming the operation. The tests of every stage run with this check, so a
+the host test) at once, naming the operation. "Adds" means every distinct buffer the handle declares
+before changing it, **whether or not another handle already put it in the transaction**: the count
+then depends only on what the operation touches, never on what ran beside it, so an undercount fails
+every run rather than the unlucky one. A handle declares a buffer (`write_access`) under the buffer's
+lock and before any byte of it changes, which is where step 3's frozen copy is taken. The tests of every stage run with this check, so a
 credit undercount shows up as a failure instead of as a transaction that overflows the log.
 
 `MAX_OP_CREDITS` = 192 bounds every operation that is never split. **Operations whose worst case is
@@ -1061,6 +1065,27 @@ ones, and let the next mount finish whatever a crash interrupted.
   `f_ffree = 0`. Inodes are not created dynamically (section 24). The default of one inode per 8 KiB
   costs 3.1% of the disk and runs out first only if the average file is under 8 KiB; small files,
   empty directories, inline symlinks and device nodes cost an inode and no block.
+- **The averages** are `free_inodes_total / group_count` and `free_blocks_total / group_count`, in
+  integer arithmetic; a group's free blocks for the comparison are its descriptor's `free_blocks` less
+  its blocks pending free. A group qualifies only with at least one free inode. **Ties** for the
+  fewest directories go to the lowest-numbered group. When no group qualifies, the inode goes to its
+  parent's group. Whatever the first choice, a group found full is passed over for the next, round the
+  groups, so the rules above choose where the search *starts*.
+- **Initialisation**: the slot is zeroed but `generation`, which is incremented; `mode`, `uid`, `gid`,
+  `links` are the caller's; `parent` is set for a directory; a regular file, directory or symlink gets
+  an empty extent root (the caller replaces it for an inline symlink or a device node's numbers). A
+  slot that is neither all zero (never used) nor passes its checksum is corruption.
+- **Freeing** an inode clears its bit, zeroes its slot but `generation` (section 8), increments
+  `free_inodes` (and decrements `directories` for a directory) in the same handle. Freeing an inode
+  whose bit is clear, or one below `first_ino`, is corruption and changes nothing.
+- **A freed inode is allocatable at once; it needs no pending-free rule.** The block rule below exists
+  because a new owner's *data* is written in place, outside the journal, before the transaction that
+  allocated it commits, so it can land in a block the old owner still maps if the freeing transaction
+  is lost. Nothing about an inode is written outside the journal: the slot, the bitmap and the
+  descriptor are journaled metadata, and a transaction that reuses an inode number commits after the
+  one that freed it (transactions commit in order), so after a crash either both are durable or the
+  reuse is lost too. Nothing in memory still names a freed inode: it is freed only when its last link
+  and last open reference are gone, and the incremented `generation` refuses any block it owned.
 
 ### Blocks
 
@@ -1078,6 +1103,29 @@ ones, and let the next mount finish whatever a crash interrupted.
   unless the caller is uid 0.
 - Every allocation and free updates the bitmap, the descriptor's `free_blocks`, both bitmap checksums
   and the descriptor's checksum, in the same handle.
+
+**Clarifications** (stage 3):
+
+- **The search in a group** runs from the goal to the group's end, then from the group's first data
+  block up to the goal; the first free run at least as long as the request is taken from its start.
+  The longest-run fallback answers a run *shorter* than asked (the caller asks again for the rest); its
+  first such run in that order wins a tie. The next groups are searched the same way from their first
+  data block. A goal outside the filesystem is group 0's first data block. "Free" means clear in the
+  bitmap and not pending free.
+- **A request** is cut to `EXTENT_MAX_LEN` and to `blocks_per_group`.
+- **The reserve cuts a request rather than refusing it**: a caller other than uid 0 gets at most what
+  lies above `reserved_blocks`, and `ENOSPC` only when nothing does. The count is claimed from
+  `free_blocks_total` by compare-and-swap before any group is searched and what was not used is given
+  back, so two allocations racing cannot both pass the check.
+- **A free** names data blocks of one group, every one of them in use. A run that reaches into
+  metadata, the journal, another group or past the end, or a block whose bit is already clear, is
+  corruption and changes nothing (fsck repairs; the kernel answers `EIO`, section 22).
+- **Pending frees** are per group, tagged with the freeing transaction's sequence; the commit callback
+  of transaction T releases every entry of T and older, adding them to `free_blocks_total`. The bitmap
+  and the descriptor's `free_blocks` show the blocks free in the freeing handle itself (section 7);
+  only `free_blocks_total` and the allocator wait for the commit (section 20).
+- **A bitmap is checked against its descriptor's checksum** the first time it is used after being
+  read; a mismatch is corruption.
 
 **Pedagogical note.** "Allocate near the last block" is most of what keeps an extent-based filesystem
 unfragmented; delayed allocation (deciding at write-back time, when the whole size is known) is the
@@ -1308,8 +1356,11 @@ transaction under `buffer.lock` in turn.
 
 **The superblock's totals**: each group's counts change under its lock; the kernel also keeps two
 atomic 64-bit counters, `free_blocks_total` and `free_inodes_total`, adjusted by the same deltas under
-the same group lock. `statfs` reads the atomics (no lock). They equal the sum of the descriptors
-whenever no group lock is held, and the superblock is written from them at unmount.
+the same group lock. `statfs` reads the atomics (no lock). Whenever no group lock is held,
+`free_inodes_total` equals the sum of the descriptors' `free_inodes`, and `free_blocks_total` the sum
+of their `free_blocks` **less the blocks pending free** (section 17), which a descriptor already counts
+and the total does not until the freeing transaction commits (section 20). The superblock is written
+from them at unmount.
 
 **What a read takes**: `read` takes the inode lock for the extent lookup and the size (a later
 reader-writer lock can make concurrent readers of one file parallel; keel's scheduler has none yet).
@@ -1625,7 +1676,12 @@ is found by the search of section 5.
 ### Stage 3 — Allocation
 
 Builds: the inode and block allocators of section 17 over the platform's group locks; pending-free
-lists released by a commit callback; the reserve; the totals.
+lists released by a commit callback; the reserve; the totals. Also the two seams later stages build on:
+the **platform** (`Platform`: `lock`/`unlock` by `LockId`, `now`, `wake_committer`, `fatal`; the host's
+`HostPlatform` checks section 19's order on every acquisition) and the **metadata-buffer layer**
+(`Fs.buffer`, `start`/`write_access`/`stop`, `commit` and its callback `committed`). In this stage
+`commit` writes the transaction's buffers in place and flushes; stage 5 replaces its body with the
+journal's commit and adds the frozen copy to `write_access`, and nothing that calls them changes.
 Tests: inode placement (top-level directories spread, files beside their parent); contiguity from a
 goal; fallback to other groups; exhaustion answers `ENOSPC` for inodes and for blocks; uid 0 may use
 the reserve and others may not; a block freed in an uncommitted transaction is not handed out until
