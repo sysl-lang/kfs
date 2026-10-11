@@ -1,6 +1,7 @@
 module keel.kfs
 
 import sysl.buf.{Buf, buf}
+import sysl.slices.as_mut_ptr
 import sysl.sync.{Atomic, Ordering}
 
 // A mounted filesystem, and the metadata-buffer layer every change to it goes through (kfs/SPEC.md
@@ -133,10 +134,16 @@ impl From[DeviceError] for FsError
 impl From[OpenError] for FsError
     from(e: OpenError) -> FsError = FsError.Open(e)
 
-// One cached metadata block, with its journal state (journal.sysl, "Buffer states").
+// One cached metadata block, with its journal state (journal.sysl, "Buffer states"). A buffer is a record
+// of the buffer table (table.sysl), reached by address and never copied.
 struct Buffer
     block: u64
-    data: Buf[u8]
+    // The block's BLOCK_SIZE bytes, at an address: `bytes` views them through it, and a view of an address
+    // holds no count, so cores reading different buffers' bytes, each under that buffer's lock, never
+    // share a counter. `own` keeps the storage alive and is touched only when the slot is filled or
+    // emptied, under the cache lock.
+    data: *u8
+    own: Buf[u8]
     // The sequence of the running transaction that changed or freed it; 0 when none.
     txn: u64
     // The sequence of the committing transaction that logs it; 0 when none.
@@ -149,11 +156,20 @@ struct Buffer
     freed: bool
     // Whether the slot holds a buffer at all.
     valid: bool
+    // When an operation last looked it up, on the platform's clock of operations (`Platform.stamp`): the
+    // kernel's cache drops only a buffer no operation still running can be holding (`drop_clean`).
+    used: u64
 
     // Pinned: an uncommitted transaction holds it, so it may not be written home or evicted.
     pinned(self) -> bool = self.txn != 0 || self.committing != 0
 
-private empty_slot() -> Buffer = Buffer(0, buf(), 0, 0, buf(), 0, false, false)
+    // Clean: neither pinned nor waiting for a checkpoint write, so its bytes are the home block's.
+    clean(self) -> bool = !self.pinned() && self.cp == 0
+
+private empty_slot() -> Buffer = Buffer(0, null, buf(), 0, 0, buf(), 0, false, false, 0)
+
+// A buffer holding block `b`, with `data` (BLOCK_SIZE bytes) as its bytes.
+private filled_slot(b: u64, data: Buf[u8], now: u64) -> Buffer = Buffer(b, as_mut_ptr(data.view()), data, 0, 0, buf(), 0, false, true, now)
 
 // An operation's handle on the running transaction (section 14). `op` names the operation in a credit
 // failure; `used` is the blocks of the distinct buffers it has declared and `revoked` how many blocks it
@@ -192,12 +208,20 @@ struct Fs[D: BlockDevice, P: Platform]
     seed: u32
     free_blocks_total: Atomic[u64]
     free_inodes_total: Atomic[u64]
-    private[kfs] buffers: Buf[Buffer]
-    private[kfs] groups: Buf[GroupState]
+    // The three tables several cores share, each record under its own lock (table.sysl): the buffer
+    // cache (`cache.lock` for the table, `buffer.lock` for a record), the groups (`group[g].lock`) and the
+    // in-memory inodes (`icache.lock`, and the inode's own lock).
+    private[kfs] buffers: Table[Buffer]
+    private[kfs] groups: Table[GroupState]
     private[kfs] j: Journal
     // The in-memory inodes (inode.sysl) and the first member of the orphan list as memory has it.
-    private[kfs] incore: Buf[InCore]
+    private[kfs] incore: Table[InCore]
     private[kfs] orphan_first: u64
+    // How many transactions recovery replayed when this filesystem was mounted (section 15).
+    replayed: u64
+    // Buffers read from the device into the cache, and buffers `drop_clean` took out of it.
+    loads: Atomic[u64]
+    drops: Atomic[u64]
     // The `max` new extent-tree node blocks are written with: the capacity, or less on a test's RAM disk
     // (section 9, "`max` may be smaller than the capacity").
     node_max: u16
@@ -207,10 +231,12 @@ struct Fs[D: BlockDevice, P: Platform]
 
     // -- Buffers -------------------------------------------------------------------------------------
 
-    // The buffer holding block `b`, read from the device the first time it is asked for.
+    // The buffer holding block `b`, read from the device the first time it is asked for. Every lookup
+    // stamps the buffer with the platform's clock of operations (`drop_clean`).
     buffer(*self, b: u64) -> Result[usize, FsError]
+        val now = self.plat.stamp()
         self.plat.lock(LockId.Cache)
-        val have = self.cached(b)
+        val have = self.cached(b, now)
         self.plat.unlock(LockId.Cache)
         have match
             Some(id) -> return Ok(id)
@@ -218,83 +244,153 @@ struct Fs[D: BlockDevice, P: Platform]
         var data = block_buf()
         self.dev.read(b, data.view())?
         self.plat.lock(LockId.Cache)
-        val raced = self.cached(b)
-        val id = raced match
-            Some(other) -> other
-            None -> self.place(Buffer(b, data, 0, 0, buf(), 0, false, true))
+        val placed = self.cached(b, now) match
+            Some(other) -> Some(other)
+            None -> self.place(filled_slot(b, data, now))
+        // The slot owns the bytes now; this name lets go of them here, under the cache lock, rather than
+        // at the end of the function, when another core may already be using them.
+        data.release()
         self.plat.unlock(LockId.Cache)
-        Ok(id)
+        placed match
+            Some(id) ->
+                self.loads.add(1)
+                Ok(id)
+            None ->
+                self.plat.fatal(Fatal.TableFull("buffer cache"))
+                Err(FsError.Bug)
 
-    // A free slot for `bf`, or a new one. Under the cache lock.
-    private place(*self, bf: Buffer) -> usize
+    // A free slot for `bf`, or a new one; None when the table is full. Under the cache lock.
+    private place(*self, bf: Buffer) -> Option[usize]
         for i in 0..<self.buffers.len()
-            if !self.buffers[i].valid
-                self.buffers[i] = bf
-                return i
-        self.buffers.push(bf)
-        self.buffers.len() - 1
+            val s = self.buffers.at(i)
+            if !s.valid
+                *s = bf
+                return Some(i)
+        self.buffers.add(bf)
 
-    private cached(self, b: u64) -> Option[usize]
+    // The buffer holding `b`, stamped `now`. Under the cache lock. By address: a method taking the
+    // filesystem by value is handed a copy of it, which retains every counted field it holds.
+    private cached(*self, b: u64, now: u64) -> Option[usize]
         for i in 0..<self.buffers.len()
-            if self.buffers[i].valid && self.buffers[i].block == b then return Some(i)
+            val s = self.buffers.at(i)
+            if s.valid && s.block == b
+                if now > s.used then s.used = now
+                return Some(i)
         None
 
-    // The buffer holding block `b` if one is cached.
+    // The buffer holding block `b` if one is cached (stamped, as `buffer` does).
     cached_id(*self, b: u64) -> Option[usize]
+        val now = self.plat.stamp()
         self.plat.lock(LockId.Cache)
-        val r = self.cached(b)
+        val r = self.cached(b, now)
         self.plat.unlock(LockId.Cache)
         r
 
     // Drop buffer `id` from the cache. Its id may then name another block.
     private[kfs] forget(*self, id: usize)
         self.plat.lock(LockId.Cache)
-        self.buffers[id] = empty_slot()
+        *self.buffers.at(id) = empty_slot()
         self.plat.unlock(LockId.Cache)
 
-    // A buffer's block number and bytes.
-    block_of(self, id: usize) -> u64 = self.buffers[id].block
-    bytes(self, id: usize) -> []u8 = self.buffers[id].data.view()
+    // Buffer `id`'s record.
+    private[kfs] slot(self, id: usize) -> *Buffer = self.buffers.at(id)
+
+    // A buffer's block number and bytes. The bytes are read and written under the buffer's lock.
+    block_of(self, id: usize) -> u64 = self.buffers.at(id).block
+    bytes(self, id: usize) -> []u8 = self.buffers.at(id).data[0..<BLOCK_SIZE]
 
     // Whether buffer `id` is pinned by an uncommitted transaction.
-    pinned(self, id: usize) -> bool = self.buffers[id].pinned()
+    pinned(self, id: usize) -> bool = self.buffers.at(id).pinned()
 
-    // How many buffers are cached.
+    // How many slots the buffer table has, and how many hold a buffer.
+    slots(self) -> usize = self.buffers.len()
     cached_count(self) -> usize
         var n: usize = 0
-        for bf in self.buffers.view()
-            if bf.valid then n += 1
+        for i in 0..<self.buffers.len()
+            if self.buffers.at(i).valid then n += 1
         n
+
+    // Whether slot `id` holds a buffer, and when it was last looked up.
+    holds(self, id: usize) -> bool = self.buffers.at(id).valid
+    stamped(self, id: usize) -> u64 = self.buffers.at(id).used
 
     // Evict buffer `id`: refused (false) while it is pinned; a committed buffer not yet checkpointed is
     // written home first (a checkpoint write, section 14). Call it only where no id is held across the
-    // call, since the slot is reused.
+    // call, since the slot is reused: on one thread. Several cores use `drop_clean`.
     evict(*self, id: usize) -> Result[bool, FsError]
-        val b = self.buffers[id].block
+        val s = self.buffers.at(id)
+        val b = s.block
         self.plat.lock(LockId.Buffer(b))
         self.plat.lock(LockId.Journal)
-        val bf = self.buffers[id]
+        val valid = s.valid && s.block == b
+        val pinned = s.pinned()
+        val cp = s.cp
         self.plat.unlock(LockId.Journal)
-        if !bf.valid || bf.pinned()
+        if !valid || pinned
             self.plat.unlock(LockId.Buffer(b))
             return Ok(false)
-        if bf.cp != 0
-            val w = self.dev.write(b, bf.data.view())
+        if cp != 0
+            val w = self.dev.write(b, self.bytes(id))
             if w.is_err()
                 self.plat.unlock(LockId.Buffer(b))
                 abort_journal(self, ERROR_EIO)
                 return Err(FsError.Device(DeviceError.Io))
             self.plat.lock(LockId.Journal)
             for l in self.j.logged.view()
-                if l.seq == bf.cp
-                    for i in 0..<l.ids.len()
-                        if l.ids[i] == id
-                            l.ids.remove(i)
-                            break
+                if l.seq == cp then drop_id(l.ids, id)
             self.plat.unlock(LockId.Journal)
         self.plat.unlock(LockId.Buffer(b))
         self.forget(id)
         Ok(true)
+
+    // Drop buffer `id` if it is clean (neither pinned nor waiting for a checkpoint write, so the home
+    // block holds the same bytes) and no operation still running can be holding its id: one that looked
+    // it up was stamped at or after its own start, so a buffer stamped before `before` — the start of the
+    // oldest operation still running — is held by none. The kernel's cache drops buffers this way while
+    // other cores run operations: the check and the drop are one step under the cache lock, which every
+    // lookup takes too, so a lookup either finds the buffer before it goes or reads the block again.
+    drop_clean(*self, id: usize, before: u64) -> bool
+        self.plat.lock(LockId.Cache)
+        val s = self.buffers.at(id)
+        val gone = s.valid && s.clean() && s.used < before
+        if gone then *s = empty_slot()
+        self.plat.unlock(LockId.Cache)
+        if gone then self.drops.add(1)
+        gone
+
+    // The cache's eviction policy: drop clean buffers no running operation can hold (`drop_clean`),
+    // least recently looked up first, until at most `keep` buffers are cached or none more can go.
+    // Answers how many went. Pinned buffers and those waiting for a checkpoint write stay: the first may
+    // not be written home, and the second wait for the checkpoint that writes them.
+    trim_buffers(*self, keep: usize, before: u64) -> usize
+        var dropped: usize = 0
+        loop
+            if self.cached_count() <= keep then break
+            self.plat.lock(LockId.Cache)
+            var victim: Option[usize] = None
+            var oldest = before
+            for i in 0..<self.buffers.len()
+                val s = self.buffers.at(i)
+                if s.valid && s.clean() && s.used < oldest
+                    oldest = s.used
+                    victim = Some(i)
+            self.plat.unlock(LockId.Cache)
+            val id = victim match
+                Some(id) -> id
+                None -> break
+            if self.drop_clean(id, before) then dropped += 1
+        dropped
+
+    // How many cached buffers are clean, pinned, and waiting for a checkpoint write.
+    cache_census(self) -> (usize, usize, usize)
+        var clean: usize = 0
+        var pinned: usize = 0
+        var dirty: usize = 0
+        for i in 0..<self.buffers.len()
+            val s = self.buffers.at(i)
+            if s.valid
+                if s.pinned() then pinned += 1 elif s.cp != 0 then dirty += 1 else clean += 1
+        (clean, pinned, dirty)
 
     // -- Handles and transactions ----------------------------------------------------------------------
 
@@ -384,7 +480,7 @@ struct Fs[D: BlockDevice, P: Platform]
     committed(*self, seq: u64)
         for g in 0..<self.geo.group_count
             self.plat.lock(LockId.Group(g))
-            val gs = self.groups[usize(g)]
+            val gs = self.group(g)
             var released: u32 = 0
             var i: usize = 0
             while i < gs.pending.len()
@@ -393,14 +489,28 @@ struct Fs[D: BlockDevice, P: Platform]
                     gs.pending.remove(i)
                 else
                     i += 1
-            self.groups.view()[usize(g)].pending_blocks = gs.pending_blocks - released
+            gs.pending_blocks -= released
             self.free_blocks_total.add(u64(released))
             self.plat.unlock(LockId.Group(g))
 
-    // `sync`: ask the platform for a commit, and run it here when there is no commit thread.
-    sync(*self) -> Result[unit, FsError]
-        if self.plat.wake_committer() then return self.commit()
-        Ok(())
+    // `sync`: everything changed so far is durable when it returns.
+    sync(*self) -> Result[unit, FsError] = self.commit_through(self.j.running.seq)
+
+    // Make transaction `seq` and every one before it durable. With no commit thread the commit runs here
+    // (every handle must be closed: `Invalid` otherwise); with one, the running transaction is closed to
+    // new handles and this waits until the commit thread has committed it. A running transaction nothing
+    // has joined holds nothing to commit.
+    commit_through(*self, seq: u64) -> Result[unit, FsError]
+        loop
+            if self.j.aborted then return Err(FsError.ReadOnly)
+            self.plat.lock(LockId.Journal)
+            val r = &self.j.running
+            val empty_now = r.seq == seq && r.empty()
+            if !empty_now && seq >= r.seq then r.closed = true
+            self.plat.unlock(LockId.Journal)
+            if empty_now || !self.uncommitted(seq) then return Ok(())
+            if self.plat.wake_committer() then return self.commit()
+            self.plat.wait_for_commit()
 
     // Corruption found while mounted: the journal aborts (section 22) and the error to answer.
     corrupt(*self, c: Corruption) -> FsError
@@ -481,7 +591,13 @@ struct Fs[D: BlockDevice, P: Platform]
         InodeLoc(self.geo.inode_table(self.inode_group(ino)) + i / 16, usize(i % 16) * INODE_SIZE)
 
     // Blocks pending free in group `g`.
-    pending_in(self, g: u32) -> u32 = self.groups[usize(g)].pending_blocks
+    pending_in(self, g: u32) -> u32 = self.groups.at(usize(g)).pending_blocks
+
+    // Group `g`'s record, under its lock.
+    private[kfs] group(self, g: u32) -> *GroupState = self.groups.at(usize(g))
+
+    // In-memory inode `i`'s record (inode.sysl).
+    private[kfs] core(self, i: usize) -> *InCore = self.incore.at(i)
 
 // Set bits `set` and clear bits `clear` of the superblock's `state` on the disk, directly, and flush;
 // everything else in block 1 stays as it is there. Only while the log is empty (section 5).
@@ -525,14 +641,16 @@ mount[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D, P], FsError
 
     var blocks: u64 = 0
     var inodes: u64 = 0
-    var groups: Buf[GroupState] = buf()
+    var groups: Table[GroupState] = table(m.descs.len())
     for d in m.descs.view()
         blocks += u64(d.free_blocks)
         inodes += u64(d.free_inodes)
-        groups.push(GroupState(buf(), 0, false, false))
+        groups.add(GroupState(buf(), 0, false, false))
     var p = plat
     if !read_only then m.sb = set_state_directly(dev, 0, STATE_CLEAN, Some(p.now().sec))?
-    var fs = Fs(dev, p, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, new_journal(st, read_only, m.sb.max_transaction), buf(), 0, u16(EXTENT_NODE_SLOTS), u16(DIR_INDEX_SLOTS))
+    val buffers: Table[Buffer] = table(p.buffer_slots())
+    val incore: Table[InCore] = table(p.inode_slots())
+    var fs = Fs(dev, p, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buffers, groups, new_journal(st, read_only, m.sb.max_transaction), incore, 0, u64(rec.replayed), Atomic(0), Atomic(0), u16(EXTENT_NODE_SLOTS), u16(DIR_INDEX_SLOTS))
     // Then the orphan list (section 16), in ordinary transactions. A list that breaks its rules aborts
     // the journal: the filesystem is mounted read-only, and fsck repairs it.
     if !read_only

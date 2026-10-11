@@ -36,8 +36,11 @@ struct InCore
     // The last transaction that changed the inode, and the last that changed its size or its mapping.
     meta_seq: u64
     map_seq: u64
+    // When an operation last looked the record up (`Platform.stamp`), as a buffer is stamped: the
+    // kernel's inode cache forgets only a record no running operation can be holding (`drop_idle_core`).
+    used: u64
 
-private free_core() -> InCore = InCore(0, 0, false, 0, 0, buf(), 0, 0)
+private[kfs] free_core() -> InCore = InCore(0, 0, false, 0, 0, buf(), 0, 0, 0)
 
 // Where an inode's slot is: the inode-table block's buffer and the offset in it.
 struct Slot
@@ -45,38 +48,100 @@ struct Slot
     loc: InodeLoc
     id: usize
 
-// The in-memory record of inode `ino`, if there is one.
+// The in-memory record of inode `ino`, if there is one (stamped).
 find_core[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Option[usize]
+    val now = fs.plat.stamp()
     fs.plat.lock(LockId.Icache)
-    var found: Option[usize] = None
-    for i in 0..<fs.incore.len()
-        if fs.incore[i].ino == ino then found = Some(i)
+    val found = find_locked(fs, ino, now)
     fs.plat.unlock(LockId.Icache)
     found
 
-// The in-memory record of inode `ino`, made on first use.
-core_of[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> usize
-    find_core(fs, ino) match
-        Some(i) -> return i
-        None -> ()
-    fs.plat.lock(LockId.Icache)
-    var slot = fs.incore.len()
+// `find_core` under `icache.lock`.
+private find_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, now: u64) -> Option[usize]
     for i in 0..<fs.incore.len()
-        if fs.incore[i].ino == 0 then slot = i
+        val c = fs.core(i)
+        if c.ino == ino
+            if now > c.used then c.used = now
+            return Some(i)
+    None
+
+// The in-memory record of inode `ino`, made on first use. Finding it and making it are one step under
+// `icache.lock`, so two cores asking at once get one record.
+core_of[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> usize
+    val now = fs.plat.stamp()
+    fs.plat.lock(LockId.Icache)
+    val have = find_locked(fs, ino, now)
+    val i = have match
+        Some(i) -> Some(i)
+        None -> place_core(fs, ino, now)
+    fs.plat.unlock(LockId.Icache)
+    i match
+        Some(i) -> i
+        None ->
+            fs.plat.fatal(Fatal.TableFull("inode cache"))
+            panic("keel.kfs: the in-memory inode table is full")
+
+// A new record for `ino`, in a free slot or a new one; None when the table is full. Under `icache.lock`.
+private place_core[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, now: u64) -> Option[usize]
     var c = free_core()
     c.ino = ino
-    if slot == fs.incore.len() then fs.incore.push(c) else fs.incore[slot] = c
-    fs.plat.unlock(LockId.Icache)
-    slot
+    c.used = now
+    for i in 0..<fs.incore.len()
+        val s = fs.core(i)
+        if s.ino == 0
+            *s = c
+            return Some(i)
+    fs.incore.add(c)
 
 // Forget inode `ino`'s record: it has been freed.
 forget_core[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64)
-    find_core(fs, ino) match
-        Some(i) ->
-            fs.plat.lock(LockId.Icache)
-            fs.incore[i] = free_core()
-            fs.plat.unlock(LockId.Icache)
-        None -> ()
+    fs.plat.lock(LockId.Icache)
+    for i in 0..<fs.incore.len()
+        val s = fs.core(i)
+        if s.ino == ino then *s = free_core()
+    fs.plat.unlock(LockId.Icache)
+
+// Whether in-memory record `c` may be forgotten while the filesystem is in use: nothing holds the inode
+// open, it is not on the orphan list, it has no data waiting for an `fsync`, every transaction that
+// changed it has committed (`oldest_uncommitted` is the first sequence that has not), and no operation
+// still running can be holding its index (stamped before `before`, as `Fs.drop_clean` reasons). Such a
+// record carries nothing the disk does not: made again on the next use, it is the same.
+idle_core(c: *InCore, oldest_uncommitted: u64, before: u64) -> bool
+    c.ino != 0 && c.held == 0 && !c.orphan && c.dirty.len() == 0 && c.meta_seq < oldest_uncommitted && c.map_seq < oldest_uncommitted && c.used < before
+
+// Forget in-memory record `i` if it is idle (`idle_core`): the kernel's inode cache keeps its table
+// within its room this way while other cores run operations. True when it was forgotten.
+drop_idle_core[D: BlockDevice, P: Platform](fs: *Fs[D, P], i: usize, before: u64) -> bool
+    // The oldest transaction not yet committed, read first: sequences only grow, so a record judged
+    // against an older reading is judged conservatively.
+    fs.plat.lock(LockId.Journal)
+    val oldest = if fs.j.committing.live then fs.j.committing.seq else fs.j.running.seq
+    fs.plat.unlock(LockId.Journal)
+    fs.plat.lock(LockId.Icache)
+    val s = fs.core(i)
+    val gone = idle_core(s, oldest, before)
+    if gone then *s = free_core()
+    fs.plat.unlock(LockId.Icache)
+    gone
+
+// In-memory record `i`'s inode and how many references hold it open (0, 0 for a free slot): what a
+// platform's inode cache sees of a record.
+core_at[D: BlockDevice, P: Platform](fs: *Fs[D, P], i: usize) -> (u64, u32)
+    fs.plat.lock(LockId.Icache)
+    val c = fs.core(i)
+    val answer = (c.ino, c.held)
+    fs.plat.unlock(LockId.Icache)
+    answer
+
+// How many slots the in-memory inode table has, and how many hold a record.
+core_slots[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> usize = fs.incore.len()
+cores_live[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> usize
+    fs.plat.lock(LockId.Icache)
+    var n: usize = 0
+    for i in 0..<fs.incore.len()
+        if fs.core(i).ino != 0 then n += 1
+    fs.plat.unlock(LockId.Icache)
+    n
 
 // Inode `ino`'s slot, checked: a number in range (else corruption, section 22), a slot in use (a free
 // one, all zero or with mode 0, answers `Invalid`), and a checksum that verifies.
@@ -132,16 +197,17 @@ change_inode[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, e
 
 // Remember that transaction `seq` changed inode `ino` — and, with `mapping`, its size or its mapping.
 note_change[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, seq: u64, mapping: bool)
-    val i = core_of(fs, ino)
-    fs.incore.view()[i].meta_seq = seq
-    if mapping then fs.incore.view()[i].map_seq = seq
+    val c = fs.core(core_of(fs, ino))
+    c.meta_seq = seq
+    if mapping then c.map_seq = seq
 
-// Remember that inode `ino` wrote data block `b`, for `fsync`.
+// Remember that inode `ino` wrote data block `b`, for `fsync`. Under the inode's lock, which is what
+// guards the list.
 note_dirty[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, b: u64)
-    val i = core_of(fs, ino)
-    for x in fs.incore[i].dirty.view()
-        if x == b then return
-    fs.incore[i].dirty.push(b)
+    val c = fs.core(core_of(fs, ino))
+    for k in 0..<c.dirty.len()
+        if c.dirty[k] == b then return
+    c.dirty.push(b)
 
 set_atime(n: *Inode, t: Time)
     n.atime_sec = t.sec
@@ -181,8 +247,7 @@ hold[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsErr
     fs.plat.lock(LockId.Inode(ino))
     val r = slot_of(fs, ino)
     if r.is_ok()
-        val i = core_of(fs, ino)
-        fs.incore.view()[i].held += 1
+        fs.core(core_of(fs, ino)).held += 1
     fs.plat.unlock(LockId.Inode(ino))
     r?
     Ok(())
@@ -196,17 +261,17 @@ release[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, Fs
     r
 
 private release_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
-    val i = find_core(fs, ino) match
-        Some(i) -> i
+    val c = find_core(fs, ino) match
+        Some(i) -> fs.core(i)
         None -> return Err(FsError.Invalid)
-    if fs.incore[i].held == 0 then return Err(FsError.Invalid)
-    fs.incore.view()[i].held -= 1
-    if fs.incore[i].held > 0 then return Ok(())
+    if c.held == 0 then return Err(FsError.Invalid)
+    c.held -= 1
+    if c.held > 0 then return Ok(())
     val node = read_inode(fs, ino)?
     if node.links == 0 then delete_locked(fs, ino) else Ok(())
 
 // Whether anything holds inode `ino` open.
 held_open[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> bool
     find_core(fs, ino) match
-        Some(i) -> fs.incore[i].held > 0
+        Some(i) -> fs.core(i).held > 0
         None -> false

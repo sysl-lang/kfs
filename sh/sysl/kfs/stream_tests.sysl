@@ -141,8 +141,8 @@ private stream(seed: u64)
                 committer_moves += 1
 
         if fs.committing()
-            for bf in fs.buffers.view()
-                if bf.frozen.len() > 0
+            for id in 0..<fs.slots()
+                if fs.slot(id).frozen.len() > 0
                     frozen_seen += 1
                     break
         val used = fs.log_used()

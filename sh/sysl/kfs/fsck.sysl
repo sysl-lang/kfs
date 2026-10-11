@@ -361,12 +361,14 @@ private repair_fs[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D,
     val st = read_journal_super(dev, m.sb)?
     var blocks: u64 = 0
     var inodes: u64 = 0
-    var groups: Buf[GroupState] = buf()
+    var groups: Table[GroupState] = table(m.descs.len())
     for d in m.descs.view()
         blocks += u64(d.free_blocks)
         inodes += u64(d.free_inodes)
-        groups.push(GroupState(buf(), 0, false, false))
-    Ok(Fs(dev, plat, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, new_journal(st, false, m.sb.max_transaction), buf(), 0, u16(EXTENT_NODE_SLOTS), u16(DIR_INDEX_SLOTS)))
+        groups.add(GroupState(buf(), 0, false, false))
+    val buffers: Table[Buffer] = table(plat.buffer_slots())
+    val incore: Table[InCore] = table(plat.inode_slots())
+    Ok(Fs(dev, plat, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buffers, groups, new_journal(st, false, m.sb.max_transaction), incore, 0, 0, Atomic(0), Atomic(0), u16(EXTENT_NODE_SLOTS), u16(DIR_INDEX_SLOTS)))
 
 // One round: the first kind of repair with something to do, then everything checkpointed. Answers how
 // many things it changed.

@@ -38,16 +38,21 @@ struct HostPlatform
     // Whether a (simulated) commit thread exists; see above.
     committer_thread: bool
     // The last fatal reported, as a number: 1 credit overrun, 2 revoke overrun, 3 deadlock, 4 log
-    // overrun.
+    // overrun, 5 a full table.
     last_fatal: u32
     // Milliseconds the monotonic clock moves after every reading: a test that sets it lets
     // `COMMIT_INTERVAL` pass inside one long operation, so the operation's steps commit apart.
     ms_step: u64
+    // The clock of operations `stamp` answers; a test moves it to play operations starting and ending.
+    ops: u64
+    // Room in the buffer and inode tables; 0 (the default) for tables that grow.
+    buffer_limit: usize
+    inode_limit: usize
 
     // How many locks are held now.
     held(self) -> usize = self.held_rank.len()
 
-host_platform() -> HostPlatform = HostPlatform(buf(), buf(), 1_700_000_000, false, 0, 0, 0, 0, 0, false, 0, 0)
+host_platform() -> HostPlatform = HostPlatform(buf(), buf(), 1_700_000_000, false, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0)
 
 private key_of(l: LockId) -> u64
     l match
@@ -106,6 +111,10 @@ impl Platform for HostPlatform
     wait_for_commit(*self)
         panic("keel.kfs: a blocking start with a simulated commit thread; use try_start")
 
+    override stamp(*self) -> u64 = self.ops
+    override buffer_slots(self) -> usize = self.buffer_limit
+    override inode_slots(self) -> usize = self.inode_limit
+
     fatal(*self, f: Fatal)
         self.fatals += 1
         self.last_fatal = f match
@@ -113,9 +122,11 @@ impl Platform for HostPlatform
             Fatal.RevokeOverrun(_, _) -> 2
             Fatal.Deadlock(_) -> 3
             Fatal.LogOverrun(_) -> 4
+            Fatal.TableFull(_) -> 5
         if !self.record_fatal
             f match
                 Fatal.CreditOverrun(_, _) -> panic("keel.kfs: a handle went past its credits")
                 Fatal.RevokeOverrun(_, _) -> panic("keel.kfs: a handle revoked past its credits")
                 Fatal.Deadlock(_) -> panic("keel.kfs: a handle waits for log room nothing can make")
                 Fatal.LogOverrun(_) -> panic("keel.kfs: a transaction overran the log")
+                Fatal.TableFull(_) -> panic("keel.kfs: a table of records is full")

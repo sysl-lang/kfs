@@ -1,0 +1,324 @@
+module keel.kfs
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+
+// What a kernel needs to run KFS on several cores, tested on one thread: the tables whose records never
+// move (table.sysl), the buffer cache's eviction rules (`drop_clean`, `trim_buffers`), the inode cache's
+// (`idle_core`, `drop_idle_core`), the limits a platform sets on both, `commit_through`, and the count of
+// transactions a mount replayed. The kernel's boot test runs the same code on four cores.
+
+private struct Rec
+    n: u64
+    tag: Buf[u8]
+
+// A small device mounted with platform `p` (its table limits are read at mount).
+private mounted_with(dev: *RamDevice, p: HostPlatform) -> RamFs
+    mount(dev, p) match
+        Ok(fs) -> fs
+        Err(_) -> panic("the filesystem did not mount")
+
+// -- Tables ---------------------------------------------------------------------------------------------
+
+@test("a table's records keep their addresses while thousands more are added beside them")
+table_records_never_move()
+    var t: Table[Rec] = table(0)
+    assert_eq(t.room(), TABLE_MAX)
+    var first: Buf[usize] = buf()
+    for k in 0..<3000u64
+        assert_eq(t.add(Rec(k, buf())).unwrap(), usize(k))
+        if k < 3 || k == 1023 || k == 1024 then first.push(usize(t.at(usize(k))))
+    assert_eq(t.len(), 3000)
+    // The records the first chunk and the start of the second held are where they were.
+    assert_eq(first[0], usize(t.at(0)))
+    assert_eq(first[1], usize(t.at(1)))
+    assert_eq(first[2], usize(t.at(2)))
+    assert_eq(first[3], usize(t.at(1023)))
+    assert_eq(first[4], usize(t.at(1024)))
+    for k in 0..<t.len()
+        assert_eq(t.at(k).n, u64(k))
+    // Writing through an address changes the record, and replacing a whole record works through it.
+    t.at(7).n = 70
+    t.at(7).tag.push(1)
+    assert_eq(t.at(7).n, 70)
+    assert_eq(t.at(7).tag.len(), 1)
+    *t.at(7) = Rec(71, buf())
+    assert_eq(t.at(7).n, 71)
+    assert_eq(t.at(7).tag.len(), 0)
+
+@test("a table with a limit takes that many records and refuses the next; past TABLE_MAX a limit is TABLE_MAX")
+table_limit()
+    var t: Table[Rec] = table(3)
+    assert_eq(t.room(), 3)
+    assert(t.add(Rec(0, buf())).is_some())
+    assert(t.add(Rec(1, buf())).is_some())
+    assert(t.add(Rec(2, buf())).is_some())
+    assert(t.add(Rec(3, buf())).is_none())
+    assert_eq(t.len(), 3)
+    var big: Table[Rec] = table(TABLE_MAX + 1)
+    assert_eq(big.room(), TABLE_MAX)
+    var one: Table[Rec] = table(1)
+    assert_eq(one.add(Rec(9, buf())).unwrap(), 0)
+    assert(one.add(Rec(10, buf())).is_none())
+
+// -- The buffer cache --------------------------------------------------------------------------------------
+
+@test("a clean buffer is dropped only when its last lookup came before the oldest running operation began")
+drop_clean_honours_stamps()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val b = scratch(&fs, 0)
+    fs.plat.ops = 5
+    val id = must_id(fs.buffer(b))
+    assert_eq(fs.stamped(id), 5)
+    // An operation that began at 5 may hold it; one that began at 6 cannot.
+    assert(!fs.drop_clean(id, 5))
+    assert(!fs.drop_clean(id, 0))
+    assert(fs.drop_clean(id, 6))
+    assert(!fs.holds(id))
+    assert(fs.cached_id(b).is_none())
+    // A lookup later is a fresh read of the same block, stamped at the clock it was asked at.
+    val loads = fs.loads.load()
+    fs.plat.ops = 9
+    val again = must_id(fs.buffer(b))
+    assert_eq(fs.loads.load(), loads + 1)
+    assert_eq(fs.stamped(again), 9)
+    assert_eq(fs.block_of(again), b)
+    // A hit moves the stamp forward, never back.
+    fs.plat.ops = 12
+    assert_eq(must_id(fs.buffer(b)), again)
+    assert_eq(fs.stamped(again), 12)
+    fs.plat.ops = 3
+    assert_eq(must_id(fs.buffer(b)), again)
+    assert_eq(fs.stamped(again), 12)
+    // `cached_id` stamps as a lookup does.
+    fs.plat.ops = 20
+    assert_eq(fs.cached_id(b).unwrap(), again)
+    assert_eq(fs.stamped(again), 20)
+    assert(!fs.drop_clean(again, 20))
+    assert(fs.drop_clean(again, 21))
+    assert(fs.drops.load() == 2)
+    // A slot already empty is not dropped again.
+    assert(!fs.drop_clean(again, 100))
+
+@test("a pinned buffer and one waiting for its checkpoint are never dropped; checkpointed, it is")
+drop_clean_respects_pins()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    val b = scratch(&fs, 1)
+    var h = fs.start("pin", 1)
+    val id = stamp(&fs, &h, b, 7)
+    assert(fs.pinned(id))
+    assert(!fs.drop_clean(id, 1_000))
+    fs.stop(&h)
+    assert(!fs.drop_clean(id, 1_000))
+    must(fs.commit())
+    // Committed: no longer pinned, but its bytes are not home yet.
+    assert(!fs.pinned(id))
+    assert(!holds(&dev, b, 7))
+    assert(!fs.drop_clean(id, 1_000))
+    assert_eq(fs.cache_census().2, 1)
+    must(fs.checkpoint_all())
+    assert(holds(&dev, b, 7))
+    assert(fs.drop_clean(id, 1_000))
+    // Read again, the block holds what the transaction wrote.
+    var again = mounted(&dev)
+    assert(holds(&dev, b, 7))
+    val nid = must_id(again.buffer(b))
+    assert_eq(again.bytes(nid)[0], filled_block(7)[0])
+
+@test("trim_buffers drops the least recently looked-up clean buffers first, and keeps pinned and dirty ones")
+trim_buffers_policy()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    must(fs.checkpoint_all())
+    // Every buffer the mount read, then four more at increasing stamps.
+    var ids: Buf[usize] = buf()
+    for k in 0..<4u64
+        fs.plat.ops = 100 + k
+        ids.push(must_id(fs.buffer(scratch(&fs, 10 + k))))
+    val (clean0, pinned0, dirty0) = fs.cache_census()
+    assert_eq(pinned0, 0)
+    assert_eq(dirty0, 0)
+    val total = fs.cached_count()
+    assert_eq(clean0, total)
+    // Keep all but two: the two oldest go, and of the four, those stamped 100 and 101 are older than
+    // anything but the mount's own reads (stamped 0), which go first.
+    val mount_reads = total - 4
+    assert_eq(fs.trim_buffers(total - mount_reads - 2, 1_000), mount_reads + 2)
+    assert(!fs.holds(ids[0]))
+    assert(!fs.holds(ids[1]))
+    assert(fs.holds(ids[2]))
+    assert(fs.holds(ids[3]))
+    // Nothing a running operation may hold goes: an operation began at 102, so 102 and 103 stay.
+    assert_eq(fs.trim_buffers(0, 102), 0)
+    assert_eq(fs.trim_buffers(0, 103), 1)
+    assert(fs.holds(ids[3]))
+    // Pinned and dirty buffers stay whatever is asked.
+    fs.plat.ops = 200
+    var h = fs.start("pin", 2)
+    val p = stamp(&fs, &h, scratch(&fs, 20), 1)
+    fs.stop(&h)
+    must(fs.commit())
+    var h2 = fs.start("pin2", 1)
+    val q = stamp(&fs, &h2, scratch(&fs, 21), 2)
+    assert_eq(fs.trim_buffers(0, 1_000_000), 1)
+    assert(fs.holds(p))
+    assert(fs.holds(q))
+    val (c, pn, d) = fs.cache_census()
+    assert_eq(c, 0)
+    assert_eq(pn, 1)
+    assert(d >= 1)
+    fs.stop(&h2)
+    must(fs.checkpoint_all())
+    assert(fs.trim_buffers(0, 1_000_000) >= 2)
+    assert_eq(fs.cached_count(), 0)
+
+@test("more buffers alive at once than the platform's limit is fatal; dropping makes room again")
+buffer_table_limit()
+    var dev = small_device()
+    var p = host_platform()
+    p.buffer_limit = 24
+    p.record_fatal = true
+    var fs = mounted_with(&dev, p)
+    must(fs.checkpoint_all())
+    val used = fs.cached_count()
+    assert(used < 24)
+    for k in 0..<u64(24 - used)
+        must_id(fs.buffer(scratch(&fs, k)))
+    assert_eq(fs.slots(), 24)
+    assert_eq(fails(fs.buffer(scratch(&fs, 100))), 2)
+    assert_eq(fs.plat.fatals, 1)
+    assert_eq(fs.plat.last_fatal, 5)
+    // Room again: a dropped slot is reused, and the table does not grow.
+    assert(fs.trim_buffers(20, 1) >= 4)
+    must_id(fs.buffer(scratch(&fs, 100)))
+    assert_eq(fs.slots(), 24)
+    assert_eq(fs.plat.fatals, 1)
+
+// -- The inode cache ------------------------------------------------------------------------------------
+
+@test("a record is idle only with no holder, off the orphan list, no dirty data, committed, and unstamped since")
+idle_core_rules()
+    var c = free_core()
+    // A free slot is not a record to drop.
+    assert(!idle_core(&c, 10, 10))
+    c.ino = 12
+    c.meta_seq = 4
+    c.map_seq = 3
+    c.used = 5
+    assert(idle_core(&c, 10, 10))
+    // Each condition alone keeps it.
+    c.held = 1
+    assert(!idle_core(&c, 10, 10))
+    c.held = 0
+    c.orphan = true
+    assert(!idle_core(&c, 10, 10))
+    c.orphan = false
+    c.dirty.push(77)
+    assert(!idle_core(&c, 10, 10))
+    c.dirty.clear()
+    // Changed by the oldest uncommitted transaction or a later one.
+    assert(!idle_core(&c, 4, 10))
+    assert(idle_core(&c, 5, 10))
+    c.map_seq = 9
+    assert(!idle_core(&c, 9, 10))
+    assert(idle_core(&c, 10, 10))
+    // Stamped at or after the oldest running operation's start.
+    assert(!idle_core(&c, 10, 5))
+    assert(idle_core(&c, 10, 6))
+
+@test("the inode cache keeps an open inode and forgets an idle one, which comes back the same")
+drop_idle_core_keeps_open_inodes()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    fs.plat.ops = 1
+    val a = mk(&fs, ROOT_INO, "a")
+    val b = mk(&fs, ROOT_INO, "b")
+    must(hold(&fs, a))
+    put_pattern(&fs, b, 0, 5000, 3)
+    // Uncommitted changes keep both; after the commit only the open one stays.
+    fs.plat.ops = 50
+    for i in 0..<core_slots(&fs)
+        drop_idle_core(&fs, i, 50)
+    assert(find_core(&fs, a).is_some())
+    assert(find_core(&fs, b).is_some())
+    must(fs.sync())
+    fs.plat.ops = 60
+    for i in 0..<core_slots(&fs)
+        drop_idle_core(&fs, i, 60)
+    assert(find_core(&fs, a).is_some())
+    assert(held_open(&fs, a))
+    // b's data has not been through an fsync: its record stays until one has.
+    assert(find_core(&fs, b).is_some())
+    must(fsync(&fs, b))
+    fs.plat.ops = 65
+    for i in 0..<core_slots(&fs)
+        drop_idle_core(&fs, i, 66)
+    assert(find_core(&fs, a).is_some())
+    assert(find_core(&fs, b).is_none())
+    // b comes back on its next use with what it had.
+    assert(bytes_equal(got(&fs, b, 0, 5000), pattern(5000, 3)))
+    must(release(&fs, a))
+    must(fs.sync())
+    fs.plat.ops = 70
+    for i in 0..<core_slots(&fs)
+        drop_idle_core(&fs, i, 71)
+    assert_eq(cores_live(&fs), 0)
+    // An unlinked file still open stays (held, and on the orphan list) until its last release.
+    val c = mk(&fs, ROOT_INO, "c")
+    put_pattern(&fs, c, 0, 100, 4)
+    must(hold(&fs, c))
+    must(unlink(&fs, ROOT_INO, "c".bytes))
+    must(fs.sync())
+    fs.plat.ops = 90
+    for i in 0..<core_slots(&fs)
+        drop_idle_core(&fs, i, 91)
+    assert(find_core(&fs, c).is_some())
+    assert(bytes_equal(got(&fs, c, 0, 100), pattern(100, 4)))
+    must(release(&fs, c))
+    assert(!alive(&fs, c))
+
+// -- Commits and mounts -------------------------------------------------------------------------------------
+
+@test("commit_through commits inline on the host, and with nothing running it has nothing to do")
+commit_through_inline()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    must(fs.checkpoint_all())
+    val writes = dev.writes()
+    // A running transaction nothing has joined: nothing to commit, nothing written.
+    must(fs.commit_through(fs.running()))
+    assert_eq(dev.writes(), writes)
+    val f = mk(&fs, ROOT_INO, "f")
+    val seq = fs.running()
+    assert(fs.uncommitted(seq))
+    must(fs.commit_through(seq))
+    assert(!fs.uncommitted(seq))
+    assert(dev.writes() > writes)
+    // An older sequence is already durable.
+    must(fs.commit_through(seq - 1))
+    // A handle still open: the inline commit cannot run.
+    var h = fs.start("open", 1)
+    stamp(&fs, &h, scratch(&fs, 3), 1)
+    assert_eq(fails(fs.commit_through(fs.running())), 3)
+    fs.stop(&h)
+    must(fs.sync())
+    assert(alive(&fs, f))
+
+@test("a mount answers how many transactions recovery replayed")
+mount_counts_replayed_transactions()
+    var dev = small_device()
+    var fs = mounted(&dev)
+    assert_eq(fs.replayed, 0)
+    for k in 0..<3u64
+        mk(&fs, ROOT_INO, s"r$k")
+        must(fs.commit())
+    // Three committed, none checkpointed: the next mount replays all three.
+    var again = mounted(&dev)
+    assert_eq(again.replayed, 3)
+    must(again.unmount())
+    var third = mounted(&dev)
+    assert_eq(third.replayed, 0)
+    assert(named(&third, ROOT_INO, "r2") != 0)

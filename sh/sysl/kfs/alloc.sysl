@@ -57,17 +57,14 @@ private claim(total: *Atomic[u64], want: u64, keep: u64) -> u64
 // The buffer of group `g`'s block bitmap (or inode bitmap), checked against the descriptor's checksum
 // the first time it is used. Called under the group's lock.
 private bitmap_buffer[D: BlockDevice, P: Platform](fs: *Fs[D, P], g: u32, d: *GroupDesc, inodes: bool) -> Result[usize, FsError]
-    val gs = fs.groups[usize(g)]
+    val gs = fs.group(g)
     val id = fs.buffer(if inodes then d.inode_bitmap else d.block_bitmap)?
     val checked = if inodes then gs.inode_bitmap_checked else gs.block_bitmap_checked
     if !checked
         val want = if inodes then d.inode_bitmap_crc else d.block_bitmap_crc
         if bitmap_crc(fs.seed, g, fs.bytes(id)) != want
             return Err(fs.corrupt(if inodes then Corruption.InodeBitmap(g) else Corruption.BlockBitmap(g)))
-        if inodes
-            fs.groups.view()[usize(g)].inode_bitmap_checked = true
-        else
-            fs.groups.view()[usize(g)].block_bitmap_checked = true
+        if inodes then gs.inode_bitmap_checked = true else gs.block_bitmap_checked = true
     Ok(id)
 
 // The buffer holding group `g`'s descriptor, and the descriptor inside it.
@@ -352,7 +349,7 @@ private blocks_in_group_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *H
     var usable = block_buf()
     for k in 0..<BLOCK_SIZE
         usable[k] = fs.bytes(bb)[k]
-    for p in fs.groups[usize(g)].pending.view()
+    for p in fs.group(g).pending.view()
         bit_set_range(usable.view(), usize(p.first - first), usize(p.first - first) + usize(p.len))
 
     val found = find_run(usable.view(), lo, hi, start, usize(n)) match
@@ -453,6 +450,7 @@ private free_blocks_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handl
     reseal(fs, g, did)
     fs.plat.unlock(LockId.Buffer(fs.block_of(did)))
 
-    fs.groups[usize(g)].pending.push(Pending(h.seq, first, len))
-    fs.groups.view()[usize(g)].pending_blocks = fs.groups[usize(g)].pending_blocks + len
+    val gs = fs.group(g)
+    gs.pending.push(Pending(h.seq, first, len))
+    gs.pending_blocks += len
     Ok(())

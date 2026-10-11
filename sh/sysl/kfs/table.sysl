@@ -1,0 +1,66 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf, buf_with_capacity}
+import sysl.slices.as_mut_ptr
+
+// A table of records that several cores read and write at once, each record under the lock that guards
+// it (kfs/SPEC.md section 19): the buffer cache, the in-memory inodes, the groups.
+//
+// **Why not a plain `Buf[T]`.** Indexing a `Buf` answers a copy of the element, and copying a record that
+// holds a counted value — a buffer's frozen copy, an inode's list of dirty blocks — retains that value and
+// releases it again. The count is an ordinary integer, not an atomic one, so two cores reading
+// `buffers[id].block` at once, under two different locks, can lose an update to the count of a field
+// neither of them asked for and free it while it is still in use. `view()` is worse: it retains the
+// table's whole storage, one count every core shares. And a `Buf` that grows moves its elements, under
+// the feet of a core reading one. (FINDINGS.md 79 has the measurements.)
+//
+// **What this does instead.** `at(i)` answers the record's address. Reading a field through it is a load
+// and writing one is a store, so the only counts touched are those of a counted field itself, when it is
+// read whole or replaced — and that happens under the lock guarding the record. Assigning a whole record
+// through the address releases the old one and retains the new, as assigning a `Buf` element does.
+//
+// **Records never move.** They live in chunks of CHUNK, each chunk's room taken whole when it is made,
+// so an address from `at` stays good for the table's life while records are added beside it. `add` is
+// called under the lock that guards the table (the cache's, the inode table's); `at` needs none.
+struct Table[T]
+    private chunks: [CHUNKS]*T
+    private owners: Buf[Buf[T]]
+    private count: usize
+    private limit: usize
+
+    // How many records there are; every index below this is valid.
+    len(self) -> usize = self.count
+
+    // How many records the table may come to.
+    room(self) -> usize = self.limit
+
+    // Record `i`'s address. An index past the end is a bug in KFS.
+    at(self, i: usize) -> *T
+        if i >= self.count then panic("keel.kfs: a table index past its records")
+        &self.chunks[i / CHUNK][i % CHUNK]
+
+    // Add `v` as a new record and answer its index; None when the table is at its limit.
+    add(*self, v: T) -> Option[usize]
+        val n = self.count
+        if n >= self.limit then return None
+        val k = n / CHUNK
+        if n % CHUNK == 0
+            val chunk = buf_with_capacity(CHUNK, v)
+            chunk.push(v)
+            self.chunks[k] = as_mut_ptr(chunk.view())
+            self.owners.push(chunk)
+        else
+            self.owners[k].push(v)
+        self.count = n + 1
+        Some(n)
+
+private const CHUNK: usize = 1024
+private const CHUNKS: usize = 64
+
+// The most records a table holds: 65,536.
+const TABLE_MAX: usize = CHUNK * CHUNKS
+
+// An empty table that may come to `limit` records (at most TABLE_MAX; 0 means TABLE_MAX).
+table[T](limit: usize) -> Table[T]
+    val most = if limit == 0 || limit > TABLE_MAX then TABLE_MAX else limit
+    Table([null; CHUNKS], buf(), 0, most)

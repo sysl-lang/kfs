@@ -544,17 +544,16 @@ private sync_file[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, data_onl
 
 private sync_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, data_only: bool) -> Result[unit, FsError]
     slot_of(fs, ino)?
-    val i = core_of(fs, ino)
-    val c = fs.incore[i]
+    val c = fs.core(core_of(fs, ino))
     val seq = if data_only then c.map_seq else c.meta_seq
     if fs.uncommitted(seq)
-        fs.commit()?
+        fs.commit_through(seq)?
     else
         var blk = block_buf()
         for b in c.dirty.view()
             if fs.read_data(b, blk.view())? then fs.dev.write(b, blk.view())?
         fs.dev.flush()?
-    fs.incore[i].dirty.clear()
+    c.dirty.clear()
     Ok(())
 
 // -- delete -------------------------------------------------------------------------------------------

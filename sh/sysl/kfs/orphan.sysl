@@ -21,8 +21,8 @@ orphan_add[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> 
     r
 
 private add_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> Result[unit, FsError]
-    val i = core_of(fs, ino)
-    if fs.incore[i].orphan then return Err(FsError.Invalid)
+    val c = fs.core(core_of(fs, ino))
+    if c.orphan then return Err(FsError.Invalid)
     val head = fs.orphan_first
     val s = slot_of(fs, ino)?
     val sb = fs.buffer(1)?
@@ -33,12 +33,10 @@ private add_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: 
         n.flags = n.flags | INODE_ORPHAN)
     set_head(fs, sb, ino)
     note_change(fs, ino, h.seq, false)
-    fs.incore.view()[i].orphan = true
-    fs.incore.view()[i].prev = 0
-    fs.incore.view()[i].next = head
-    if head != 0
-        val k = core_of(fs, head)
-        fs.incore.view()[k].prev = ino
+    c.orphan = true
+    c.prev = 0
+    c.next = head
+    if head != 0 then fs.core(core_of(fs, head)).prev = ino
     fs.orphan_first = ino
     Ok(())
 
@@ -52,12 +50,12 @@ orphan_remove[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) 
     r
 
 private remove_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> Result[unit, FsError]
-    val i = find_core(fs, ino) match
-        Some(i) -> i
+    val c = find_core(fs, ino) match
+        Some(i) -> fs.core(i)
         None -> return Err(FsError.Invalid)
-    if !fs.incore[i].orphan then return Err(FsError.Invalid)
-    val prev = fs.incore[i].prev
-    val next = fs.incore[i].next
+    if !c.orphan then return Err(FsError.Invalid)
+    val prev = c.prev
+    val next = c.next
     val s = slot_of(fs, ino)?
     declare_slot(fs, h, s)?
     if prev == 0
@@ -75,14 +73,11 @@ private remove_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, in
     if prev == 0
         fs.orphan_first = next
     else
-        val p = core_of(fs, prev)
-        fs.incore.view()[p].next = next
-    if next != 0
-        val n = core_of(fs, next)
-        fs.incore.view()[n].prev = prev
-    fs.incore.view()[i].orphan = false
-    fs.incore.view()[i].prev = 0
-    fs.incore.view()[i].next = 0
+        fs.core(core_of(fs, prev)).next = next
+    if next != 0 then fs.core(core_of(fs, next)).prev = prev
+    c.orphan = false
+    c.prev = 0
+    c.next = 0
     Ok(())
 
 private unlink_slot(n: *Inode)
@@ -112,8 +107,7 @@ orphans[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Buf[u64]
     var ino = fs.orphan_first
     while ino != 0
         out.push(ino)
-        val i = core_of(fs, ino)
-        ino = fs.incore[i].next
+        ino = fs.core(core_of(fs, ino)).next
     fs.plat.unlock(LockId.Orphans)
     out
 
@@ -121,7 +115,7 @@ orphans[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Buf[u64]
 on_orphan_list[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> bool
     fs.plat.lock(LockId.Orphans)
     val listed = find_core(fs, ino) match
-        Some(i) -> fs.incore[i].orphan
+        Some(i) -> fs.core(i).orphan
         None -> false
     fs.plat.unlock(LockId.Orphans)
     listed
@@ -151,11 +145,11 @@ private load_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, 
             Ok(n) -> n
             Err(FsError.Invalid) -> return Err(fs.corrupt(Corruption.OrphanList(ino)))
             Err(e) -> return Err(e)
-        val i = core_of(fs, ino)
-        if node.flags & INODE_ORPHAN == 0 || fs.incore[i].orphan then return Err(fs.corrupt(Corruption.OrphanList(ino)))
-        fs.incore.view()[i].orphan = true
-        fs.incore.view()[i].prev = prev
-        fs.incore.view()[i].next = node.orphan_next
+        val c = fs.core(core_of(fs, ino))
+        if node.flags & INODE_ORPHAN == 0 || c.orphan then return Err(fs.corrupt(Corruption.OrphanList(ino)))
+        c.orphan = true
+        c.prev = prev
+        c.next = node.orphan_next
         prev = ino
         ino = node.orphan_next
         steps += 1

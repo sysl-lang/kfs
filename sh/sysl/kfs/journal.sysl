@@ -164,7 +164,7 @@ private index_of_u64(xs: Buf[u64], x: u64) -> Option[usize]
         if xs[i] == x then return Some(i)
     None
 
-private drop_id(xs: Buf[usize], x: usize)
+private[kfs] drop_id(xs: Buf[usize], x: usize)
     for i in 0..<xs.len()
         if xs[i] == x
             xs.remove(i)
@@ -202,17 +202,19 @@ join_running[D: BlockDevice, P: Platform](fs: *Fs[D, P], op: string, credits: u3
     if credits == 0 || credits > fs.j.max_credits then return Err(FsError.Invalid)
     val now = fs.plat.monotonic_ms()
     fs.plat.lock(LockId.Journal)
-    val r = fs.j.running
+    // The running transaction by address: a copy of it would retain its lists, and the copy would be let
+    // go of after the lock is (table.sysl says why that races).
+    val r = &fs.j.running
     if r.closed
         fs.plat.unlock(LockId.Journal)
         return Ok(None)
     if !r.empty() && now >= r.opened_ms + u64(COMMIT_INTERVAL_SECONDS) * 1000
-        fs.j.running.closed = true
+        r.closed = true
         fs.plat.unlock(LockId.Journal)
         return Ok(None)
     val after = txn_blocks(u32(r.ids.len()) + r.outstanding + credits, u32(r.revokes.len()) + r.outstanding_revokes + credits)
     if after > fs.sb.max_transaction
-        fs.j.running.closed = true
+        r.closed = true
         fs.plat.unlock(LockId.Journal)
         return Ok(None)
     val committing = if fs.j.committing.live then fs.j.committing.reserved() else 0
@@ -220,14 +222,15 @@ join_running[D: BlockDevice, P: Platform](fs: *Fs[D, P], op: string, credits: u3
         fs.j.wanted = credits
         fs.plat.unlock(LockId.Journal)
         return Ok(None)
-    if r.empty() then fs.j.running.opened_ms = now
-    fs.j.running.handles += 1
-    fs.j.running.outstanding += credits
-    fs.j.running.outstanding_revokes += credits
+    if r.empty() then r.opened_ms = now
+    r.handles += 1
+    r.outstanding += credits
+    r.outstanding_revokes += credits
+    val seq = r.seq
     fs.j.wanted = 0
     fs.j.opened += 1
     fs.plat.unlock(LockId.Journal)
-    Ok(Some(Handle(op, credits, r.seq, buf(), 0, None)))
+    Ok(Some(Handle(op, credits, seq, buf(), 0, None)))
 
 // Declare that `h` is about to change buffer `id` (under the buffer's lock, before the change).
 declare_access[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, id: usize) -> Result[unit, FsError]
@@ -235,7 +238,8 @@ declare_access[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, id: usize
         Some(e) -> return Err(e)
         None -> ()
     if fs.j.aborted then return Err(FsError.ReadOnly)
-    val b = fs.buffers[id].block
+    val bf = fs.slot(id)
+    val b = bf.block
     var known = false
     for x in h.used.view()
         if x == b then known = true
@@ -246,23 +250,29 @@ declare_access[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, id: usize
         h.used.push(b)
     fs.plat.lock(LockId.Journal)
     if !known then fs.j.running.outstanding -= 1
-    val bf = fs.buffers[id]
     val seq = fs.j.running.seq
     val mine = bf.txn == seq
+    val was_freed = bf.freed
     // Journaling a block cancels its revoke in the same transaction (section 14, "Revocation").
     index_of_u64(fs.j.running.revokes, b) match
         Some(k) -> fs.j.running.revokes.remove(k)
         None -> ()
-    if mine && bf.freed
+    if mine && was_freed
         drop_id(fs.j.running.freed, id)
-        fs.buffers.view()[id].freed = false
-    if !mine || bf.freed
+        bf.freed = false
+    if !mine || was_freed
         // Step 3: the committing transaction keeps its own bytes of a buffer the next one changes.
-        if bf.committing != 0 && bf.frozen.len() == 0 then fs.buffers.view()[id].frozen = bf.data.copy()
-        fs.buffers.view()[id].txn = seq
+        if bf.committing != 0 && bf.frozen.len() == 0 then bf.frozen = frozen_copy(fs.bytes(id))
+        bf.txn = seq
         fs.j.running.ids.push(id)
     fs.plat.unlock(LockId.Journal)
     Ok(())
+
+// A new `Buf` holding `bytes`.
+private frozen_copy(bytes: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    out.extend(bytes)
+    out
 
 // Record that `h` freed metadata block `b`: a revoke record in the running transaction, and the buffer,
 // if cached, pinned until the transaction commits and then dropped unwritten. A copy of `b` the same
@@ -282,12 +292,12 @@ revoke_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64)
     if index_of_u64(fs.j.running.revokes, b).is_none() then fs.j.running.revokes.push(b)
     cached match
         Some(id) ->
-            val bf = fs.buffers[id]
+            val bf = fs.slot(id)
             val seq = fs.j.running.seq
             if !(bf.txn == seq && bf.freed)
                 if bf.txn == seq then drop_id(fs.j.running.ids, id)
-                fs.buffers.view()[id].freed = true
-                fs.buffers.view()[id].txn = seq
+                bf.freed = true
+                bf.txn = seq
                 fs.j.running.freed.push(id)
         None -> ()
     fs.plat.unlock(LockId.Journal)
@@ -303,7 +313,7 @@ add_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64, bytes: 
     if fs.j.aborted then return Err(FsError.ReadOnly)
     if bytes.len != BLOCK_SIZE then return Err(FsError.Invalid)
     fs.plat.lock(LockId.Journal)
-    val t = fs.j.running
+    val t = &fs.j.running
     if order == DataOrder.After
         put_copy(t.late_blocks, t.late_data, b, bytes)
     else
@@ -329,7 +339,7 @@ private put_copy(blocks: Buf[u64], data: Buf[u8], b: u64, bytes: []const u8) -> 
 // Whether the running transaction maps data block `b` itself (`DataOrder.Fresh`).
 fresh_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], b: u64) -> bool
     fs.plat.lock(LockId.Journal)
-    val t = fs.j.running
+    val t = &fs.j.running
     val fresh = index_of_u64(t.data_blocks, b) match
         Some(k) -> t.data_fresh[k]
         None -> false
@@ -337,24 +347,27 @@ fresh_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], b: u64) -> bool
     fresh
 
 // The copy of block `b` in a list, into `out`: false when the list has none.
-private copy_from(blocks: Buf[u64], data: Buf[u8], b: u64, out: []u8) -> bool
-    index_of_u64(blocks, b) match
-        Some(k) ->
+// The lists are reached by address, for `pending_copy`'s reason.
+private copy_from(blocks: *Buf[u64], data: *Buf[u8], b: u64, out: []u8) -> bool
+    for k in 0..<blocks.len()
+        if blocks.at(k) == b
             for i in 0..<BLOCK_SIZE
-                out[i] = data[k * BLOCK_SIZE + i]
-            true
-        None -> false
+                out[i] = data.at(k * BLOCK_SIZE + i)
+            return true
+    false
 
 // The newest bytes of `t` for block `b`: its copy for after the commit, else its copy for before.
-private pending_copy(t: Txn, b: u64, out: []u8) -> bool
-    copy_from(t.late_blocks, t.late_data, b, out) || copy_from(t.data_blocks, t.data, b, out)
+// By address: a `Txn` handed by value is a copy, retaining its lists' counts, and the committing one's
+// are the commit thread's to count.
+private pending_copy(t: *Txn, b: u64, out: []u8) -> bool
+    copy_from(&t.late_blocks, &t.late_data, b, out) || copy_from(&t.data_blocks, &t.data, b, out)
 
 // The newest bytes of data block `b`: the running transaction's, else the committing one's, else the
 // device's. Answers whether a transaction still holds them (they are not yet home).
 newest_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], b: u64, out: []u8) -> Result[bool, FsError]
     fs.plat.lock(LockId.Journal)
-    var held = pending_copy(fs.j.running, b, out)
-    if !held && fs.j.committing.live then held = pending_copy(fs.j.committing, b, out)
+    var held = pending_copy(&fs.j.running, b, out)
+    if !held && fs.j.committing.live then held = pending_copy(&fs.j.committing, b, out)
     fs.plat.unlock(LockId.Journal)
     if !held then fs.dev.read(b, out)?
     Ok(held)
@@ -384,36 +397,42 @@ begin[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[Begin, FsError]
     if fs.j.committing.live
         fs.plat.unlock(LockId.Journal)
         return Ok(Begin.Busy)
-    val r = fs.j.running
+    val r = &fs.j.running
     if r.handles > 0
-        fs.j.running.closed = true
+        r.closed = true
         fs.plat.unlock(LockId.Journal)
         return Ok(Begin.Busy)
     if r.empty()
-        fs.j.running.closed = false
+        r.closed = false
         fs.plat.unlock(LockId.Journal)
         return Ok(Begin.Nothing)
-    fs.j.committing = r
-    fs.j.committing.closed = true
+    val seq = r.seq
     for id in r.ids.view()
-        fs.buffers.view()[id].committing = r.seq
-        fs.buffers.view()[id].txn = 0
+        fs.slot(id).committing = seq
+        fs.slot(id).txn = 0
     for id in r.freed.view()
-        fs.buffers.view()[id].committing = r.seq
-        fs.buffers.view()[id].txn = 0
-    fs.j.running = fresh_txn(if r.logs() then r.seq + 1 else r.seq)
+        fs.slot(id).committing = seq
+        fs.slot(id).txn = 0
+    val next = if r.logs() then seq + 1 else seq
+    fs.j.committing = *r
+    fs.j.committing.closed = true
+    fs.j.running = fresh_txn(next)
     fs.plat.unlock(LockId.Journal)
     Ok(Begin.Started)
 
 // The bytes the committing transaction `seq` logs for buffer `id`: its frozen copy when the running
 // transaction has changed the buffer since, else the buffer itself. Under the buffer's lock.
 private copy_for_log[D: BlockDevice, P: Platform](fs: *Fs[D, P], id: usize, out: []u8)
-    val b = fs.buffers[id].block
+    val bf = fs.slot(id)
+    val b = bf.block
     fs.plat.lock(LockId.Buffer(b))
-    val bf = fs.buffers[id]
-    val src = if bf.frozen.len() > 0 then bf.frozen.view() else bf.data.view()
-    for i in 0..<BLOCK_SIZE
-        out[i] = src[i]
+    if bf.frozen.len() > 0
+        for i in 0..<BLOCK_SIZE
+            out[i] = bf.frozen[i]
+    else
+        val src = fs.bytes(id)
+        for i in 0..<BLOCK_SIZE
+            out[i] = src[i]
     fs.plat.unlock(LockId.Buffer(b))
 
 private zero(b: []u8)
@@ -472,7 +491,7 @@ finish[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
             val id = t.ids[usize(i + k)]
             copy_for_log(fs, id, copy.view())
             val tag = tag_at(desc.view(), usize(k))
-            tag.block = fs.buffers[id].block
+            tag.block = fs.block_of(id)
             tag.flags = escape_copy(copy.view())
             seal_tag(seed, t.seq, tag, copy.view())
             io(fs, fs.dev.write(log_block(fs, advance(fs, pos, k + 1)), copy.view()))?
@@ -526,21 +545,21 @@ finish[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
     fs.j.used += size
     var list: Buf[usize] = buf()
     for id in t.ids.view()
-        val old = fs.buffers[id].cp
-        if old != 0 then off_list(fs, old, id)
-        fs.buffers.view()[id].committing = 0
-        fs.buffers.view()[id].frozen = buf()
-        fs.buffers.view()[id].cp = t.seq
+        val s = fs.slot(id)
+        if s.cp != 0 then off_list(fs, s.cp, id)
+        s.committing = 0
+        s.frozen = buf()
+        s.cp = t.seq
         list.push(id)
     fs.j.logged.push(Logged(t.seq, first, size, list))
     var gone: Buf[usize] = buf()
     for id in t.freed.view()
-        val old = fs.buffers[id].cp
-        if old != 0 then off_list(fs, old, id)
-        fs.buffers.view()[id].committing = 0
-        fs.buffers.view()[id].frozen = buf()
-        fs.buffers.view()[id].cp = 0
-        if fs.buffers[id].txn == 0 then gone.push(id) else fs.buffers.view()[id].freed = false
+        val s = fs.slot(id)
+        if s.cp != 0 then off_list(fs, s.cp, id)
+        s.committing = 0
+        s.frozen = buf()
+        s.cp = 0
+        if s.txn == 0 then gone.push(id) else s.freed = false
     fs.j.committing = no_txn()
     fs.plat.unlock(LockId.Journal)
     for id in gone.view()
@@ -579,39 +598,49 @@ checkpoint_oldest[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[Cp, FsEr
     if fs.j.logged.len() == 0
         fs.plat.unlock(LockId.Journal)
         return Ok(Cp.Empty)
-    val o = fs.j.logged[0]
+    // The oldest list by address, and what is needed of it copied out under the lock.
+    val o = &fs.j.logged.view()[0]
+    val seq = o.seq
+    val blocks = o.blocks
     var held = false
     for id in o.ids.view()
-        if fs.buffers[id].pinned() then held = true
+        if fs.slot(id).pinned() then held = true
     val list = o.ids.copy()
     fs.plat.unlock(LockId.Journal)
     if held then return Ok(Cp.Held)
 
     for id in list.view()
-        val b = fs.buffers[id].block
+        val s = fs.slot(id)
+        val b = s.block
         fs.plat.lock(LockId.Buffer(b))
         fs.plat.lock(LockId.Journal)
-        val pinned = fs.buffers[id].pinned()
+        val pinned = s.pinned()
+        // An eviction may have written it home and taken it off the list already.
+        val listed = s.valid && s.block == b && s.cp == seq
         fs.plat.unlock(LockId.Journal)
         if pinned
             fs.plat.unlock(LockId.Buffer(b))
             return Ok(Cp.Held)
-        val w = fs.dev.write(b, fs.buffers[id].data.view())
-        fs.plat.unlock(LockId.Buffer(b))
-        io(fs, w)?
+        if listed
+            val w = fs.dev.write(b, fs.bytes(id))
+            fs.plat.unlock(LockId.Buffer(b))
+            io(fs, w)?
+        else
+            fs.plat.unlock(LockId.Buffer(b))
     io(fs, fs.dev.flush())?
 
     fs.plat.lock(LockId.Journal)
     fs.j.logged.remove(0)
     for id in list.view()
-        if fs.buffers[id].cp == o.seq then fs.buffers.view()[id].cp = 0
+        val s = fs.slot(id)
+        if s.cp == seq then s.cp = 0
     val st = if fs.j.logged.len() == 0 then JournalState(0, next_seq(fs), fs.j.disk.error) else JournalState(fs.j.logged[0].first, fs.j.logged[0].seq, fs.j.disk.error)
     fs.plat.unlock(LockId.Journal)
     io(fs, write_journal_super(fs.dev, fs.sb, st))?
     io(fs, fs.dev.flush())?
     fs.plat.lock(LockId.Journal)
     fs.j.disk = st
-    fs.j.used -= o.blocks
+    fs.j.used -= blocks
     fs.plat.unlock(LockId.Journal)
     Ok(Cp.Done)
 
@@ -638,7 +667,7 @@ committer_step[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[bool, FsErr
         return Ok(true)
     val now = fs.plat.monotonic_ms()
     fs.plat.lock(LockId.Journal)
-    val r = fs.j.running
+    val r = &fs.j.running
     val due = r.closed || (!r.empty() && now >= r.opened_ms + u64(COMMIT_INTERVAL_SECONDS) * 1000)
     val wanted = fs.j.wanted
     val short = wanted > 0 && fs.j.used + txn_blocks(u32(r.ids.len()) + r.outstanding + wanted, u32(r.revokes.len()) + r.outstanding_revokes + wanted) > log_len(fs)

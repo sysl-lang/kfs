@@ -79,6 +79,9 @@ enum Fatal
     // A transaction about to be logged does not fit in the log's free space. The reservation of
     // section 14 makes this impossible; it is checked before a log block is written.
     LogOverrun(seq: u64)
+    // A table (`Platform.buffer_slots`, `inode_slots`) has no free record left: the platform's cache let
+    // more records live at once than it sized the table for.
+    TableFull(what: string)
 
 trait Platform
     // Take and release a lock. Taking may sleep for a sleeping lock and spins for a leaf.
@@ -104,3 +107,14 @@ trait Platform
     // A bug in KFS. The kernel stops here; a host test fails here unless it is the test of this very
     // failure, in which case the call returns and the operation answers `FsError.Bug`.
     fatal(*self, f: Fatal)
+
+    // The clock of operations the cache's records are stamped with when looked up (`Fs.drop_clean`):
+    // it only moves forward, and an operation that starts after a stamp starts at a later reading. A
+    // platform that never drops a record while operations run (the host) leaves it at 0.
+    stamp(*self) -> u64 = 0
+
+    // How many buffers, and how many in-memory inodes, the tables may come to (table.sysl); 0 for the
+    // most a table holds, TABLE_MAX. A platform whose caches drop records sizes them, and running out is
+    // `Fatal.TableFull`: the cache let more records live at once than it promised.
+    buffer_slots(self) -> usize = 0
+    inode_slots(self) -> usize = 0
