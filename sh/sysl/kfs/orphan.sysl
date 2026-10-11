@@ -1,0 +1,181 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The orphan list of kfs/SPEC.md section 16: the inodes whose work must be finished even if the system
+// crashes now — an inode with no links not yet freed, and a truncation still freeing blocks past the
+// new size.
+//
+// On the disk the list is singly linked: the superblock's `orphan_head` names the first member, each
+// member's `orphan_next` the next, and every member has `ORPHAN` set. In memory it is doubly linked
+// through the in-memory inodes (`InCore.prev`/`next`), built at mount, so a removal finds its
+// predecessor at once. Everything here runs under `orphans.lock`, which owns the links in memory and on
+// the disk (section 19): no other code writes `orphan_next`, `ORPHAN` or `orphan_head`.
+
+// Put inode `ino` at the head of the list, in `h`: its `orphan_next` takes the old head, `ORPHAN` is set,
+// and the superblock names it. Two buffers: the inode's and the superblock's (`C_INODE + C_SB`).
+orphan_add[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Orphans)
+    val r = add_locked(fs, h, ino)
+    fs.plat.unlock(LockId.Orphans)
+    r
+
+private add_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> Result[unit, FsError]
+    val i = core_of(fs, ino)
+    if fs.incore[i].orphan then return Err(FsError.Invalid)
+    val head = fs.orphan_first
+    val s = slot_of(fs, ino)?
+    val sb = fs.buffer(1)?
+    declare_slot(fs, h, s)?
+    declare_super(fs, h, sb)?
+    edit_slot(fs, s, (n) ->
+        n.orphan_next = head
+        n.flags = n.flags | INODE_ORPHAN)
+    set_head(fs, sb, ino)
+    note_change(fs, ino, h.seq, false)
+    fs.incore.view()[i].orphan = true
+    fs.incore.view()[i].prev = 0
+    fs.incore.view()[i].next = head
+    if head != 0
+        val k = core_of(fs, head)
+        fs.incore.view()[k].prev = ino
+    fs.orphan_first = ino
+    Ok(())
+
+// Take inode `ino` off the list, in `h`: its predecessor's `orphan_next` (or the superblock's
+// `orphan_head`) takes its own, and its `orphan_next` and `ORPHAN` are cleared. Two buffers: the inode's
+// and the predecessor's (an inode-table block or the superblock).
+orphan_remove[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Orphans)
+    val r = remove_locked(fs, h, ino)
+    fs.plat.unlock(LockId.Orphans)
+    r
+
+private remove_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64) -> Result[unit, FsError]
+    val i = find_core(fs, ino) match
+        Some(i) -> i
+        None -> return Err(FsError.Invalid)
+    if !fs.incore[i].orphan then return Err(FsError.Invalid)
+    val prev = fs.incore[i].prev
+    val next = fs.incore[i].next
+    val s = slot_of(fs, ino)?
+    declare_slot(fs, h, s)?
+    if prev == 0
+        val sb = fs.buffer(1)?
+        declare_super(fs, h, sb)?
+        edit_slot(fs, s, (n) -> unlink_slot(n))
+        set_head(fs, sb, next)
+    else
+        val ps = slot_of(fs, prev)?
+        declare_slot(fs, h, ps)?
+        edit_slot(fs, s, (n) -> unlink_slot(n))
+        edit_slot(fs, ps, (n) -> n.orphan_next = next)
+        note_change(fs, prev, h.seq, false)
+    note_change(fs, ino, h.seq, false)
+    if prev == 0
+        fs.orphan_first = next
+    else
+        val p = core_of(fs, prev)
+        fs.incore.view()[p].next = next
+    if next != 0
+        val n = core_of(fs, next)
+        fs.incore.view()[n].prev = prev
+    fs.incore.view()[i].orphan = false
+    fs.incore.view()[i].prev = 0
+    fs.incore.view()[i].next = 0
+    Ok(())
+
+private unlink_slot(n: *Inode)
+    n.orphan_next = 0
+    n.flags = n.flags & ~INODE_ORPHAN
+
+private declare_super[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, id: usize) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Buffer(1))
+    val r = fs.write_access(h, id)
+    fs.plat.unlock(LockId.Buffer(1))
+    r
+
+// The superblock's `orphan_head` becomes `ino` (its buffer declared already).
+private set_head[D: BlockDevice, P: Platform](fs: *Fs[D, P], id: usize, ino: u64)
+    fs.plat.lock(LockId.Buffer(1))
+    val bytes = fs.bytes(id)
+    val sb: *Superblock = at(bytes, 0)
+    sb.orphan_head = ino
+    seal_superblock(bytes)
+    fs.plat.unlock(LockId.Buffer(1))
+    fs.sb.orphan_head = ino
+
+// The members in order, from the head: for the tests and for mount.
+orphans[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Buf[u64]
+    var out: Buf[u64] = buf()
+    fs.plat.lock(LockId.Orphans)
+    var ino = fs.orphan_first
+    while ino != 0
+        out.push(ino)
+        val i = core_of(fs, ino)
+        ino = fs.incore[i].next
+    fs.plat.unlock(LockId.Orphans)
+    out
+
+// Whether inode `ino` is on the list.
+on_orphan_list[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> bool
+    fs.plat.lock(LockId.Orphans)
+    val listed = find_core(fs, ino) match
+        Some(i) -> fs.incore[i].orphan
+        None -> false
+    fs.plat.unlock(LockId.Orphans)
+    listed
+
+// Build the list in memory from the disk (section 16, "At mount"): from the superblock's head through
+// every `orphan_next`, at most `inode_count` steps. A member out of range, free, without `ORPHAN`, or met
+// a second time (a cycle) is corruption: the journal aborts and nothing is processed.
+load_orphans[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Orphans)
+    val r = load_locked(fs)
+    fs.plat.unlock(LockId.Orphans)
+    r
+
+private load_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
+    val sb = fs.buffer(1)?
+    fs.plat.lock(LockId.Buffer(1))
+    val first: *Superblock = at(fs.bytes(sb), 0)
+    val head = first.orphan_head
+    fs.plat.unlock(LockId.Buffer(1))
+    var ino = head
+    var prev: u64 = 0
+    var steps: u64 = 0
+    while ino != 0
+        if steps >= fs.sb.inode_count || ino < FIRST_INO || ino > fs.sb.inode_count
+            return Err(fs.corrupt(Corruption.OrphanList(ino)))
+        val node = read_inode(fs, ino) match
+            Ok(n) -> n
+            Err(FsError.Invalid) -> return Err(fs.corrupt(Corruption.OrphanList(ino)))
+            Err(e) -> return Err(e)
+        val i = core_of(fs, ino)
+        if node.flags & INODE_ORPHAN == 0 || fs.incore[i].orphan then return Err(fs.corrupt(Corruption.OrphanList(ino)))
+        fs.incore.view()[i].orphan = true
+        fs.incore.view()[i].prev = prev
+        fs.incore.view()[i].next = node.orphan_next
+        prev = ino
+        ino = node.orphan_next
+        steps += 1
+    fs.orphan_first = head
+    Ok(())
+
+// Finish every member's work, from the head (section 16): an inode with no links is truncated to 0 in
+// steps and freed; one with links has every block past `ceil(size / 4096)` freed in steps. Each leaves
+// the list in its last transaction.
+process_orphans[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
+    loop
+        fs.plat.lock(LockId.Orphans)
+        val ino = fs.orphan_first
+        fs.plat.unlock(LockId.Orphans)
+        if ino == 0 then return Ok(())
+        fs.plat.lock(LockId.Inode(ino))
+        val r = finish_orphan(fs, ino)
+        fs.plat.unlock(LockId.Inode(ino))
+        r?
+
+private finish_orphan[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
+    val node = read_inode(fs, ino)?
+    if node.links == 0 then delete_locked(fs, ino) else cut_from(fs, ino, blocks_for(node.size), "truncate")

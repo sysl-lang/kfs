@@ -48,6 +48,21 @@ const C_INODE: u32 = 1
 const C_GROUP: u32 = 2
 const C_EXT: u32 = 4 * (u32(EXTENT_MAX_DEPTH) + 1)
 const C_ALLOC: u32 = C_GROUP + C_EXT
+const C_SB: u32 = 1
+
+// The split operations of section 18, each step one handle: a write or preallocation chunk allocates at
+// most CHUNK_EXTENTS extents; a truncate, delete or punch step removes at most STEP_EXTENTS.
+const CHUNK_EXTENTS: u32 = 8
+const STEP_EXTENTS: u32 = 16
+const C_WRITE_CHUNK: u32 = C_INODE + CHUNK_EXTENTS * C_ALLOC
+const C_TRUNCATE_STEP: u32 = 64
+const C_PUNCH_STEP: u32 = C_TRUNCATE_STEP + C_EXT + C_GROUP
+// Delete's last transaction: the inode's own block, its group's bitmap and descriptor, the orphan
+// list's predecessor (an inode or the superblock), and the xattr block's group.
+const C_DELETE_LAST: u32 = C_INODE + C_GROUP + C_INODE + C_GROUP
+
+// The largest file: 2^32 blocks of 4 KiB, 16 TiB (section 3).
+const MAX_FILE_SIZE: u64 = LOGICAL_BLOCKS * 4096
 
 // Where things are inside a block. The tail is the last 16 bytes of every owned metadata block; the
 // journal's descriptor and revoke blocks keep only a 4-byte checksum there.

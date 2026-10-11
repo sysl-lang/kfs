@@ -47,9 +47,14 @@ struct Txn
     freed: Buf[usize]
     // The blocks it revokes.
     revokes: Buf[u64]
-    // Its ordered data: blocks written home before it is logged (step 2), with their bytes.
+    // Its ordered data: blocks written home before it is logged (step 2), with their bytes, and which of
+    // them it mapped itself (`DataOrder.Fresh`).
     data_blocks: Buf[u64]
     data: Buf[u8]
+    data_fresh: Buf[bool]
+    // Data written home only once its commit block is durable (`DataOrder.After`).
+    late_blocks: Buf[u64]
+    late_data: Buf[u8]
     handles: u32
     // Credits its open handles may still spend on new buffers, and on revokes.
     outstanding: u32
@@ -63,7 +68,7 @@ struct Txn
 
     // Nothing has joined it and nothing is in it.
     empty(self) -> bool
-        self.handles == 0 && self.ids.len() == 0 && self.freed.len() == 0 && self.revokes.len() == 0 && self.data_blocks.len() == 0
+        self.handles == 0 && self.ids.len() == 0 && self.freed.len() == 0 && self.revokes.len() == 0 && self.data_blocks.len() == 0 && self.late_blocks.len() == 0
 
     // Whether committing it writes anything to the log.
     logs(self) -> bool = self.ids.len() > 0 || self.revokes.len() > 0
@@ -72,9 +77,21 @@ struct Txn
     reserved(self) -> u32
         txn_blocks(u32(self.ids.len()) + self.outstanding, u32(self.revokes.len()) + self.outstanding_revokes)
 
-fresh_txn(seq: u64) -> Txn = Txn(seq, buf(), buf(), buf(), buf(), buf(), 0, 0, 0, false, 0, true)
+fresh_txn(seq: u64) -> Txn = Txn(seq, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, 0, 0, false, 0, true)
 
-no_txn() -> Txn = Txn(0, buf(), buf(), buf(), buf(), buf(), 0, 0, 0, false, 0, false)
+no_txn() -> Txn = Txn(0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, 0, 0, false, 0, false)
+
+// When a data block's bytes go home relative to its transaction's commit (section 18, `write`).
+enum DataOrder
+    // Before the commit (step 2): data=ordered's rule, and what an overwrite inside the file uses.
+    Ordered
+    // Before the commit, in a block the transaction itself maps (a new run, or an unwritten extent it
+    // converts): whatever later writes in the same transaction add to it stays before the commit.
+    Fresh
+    // After the commit block is durable: the bytes a write puts past the end of the file into the old
+    // last block, which the committed size must cover before they land, or a crash would leave them
+    // past the end — the zeroed tail of section 8.
+    After
 
 private ceil_by(a: u32, b: u32) -> u32 = (a + b - 1) / b
 
@@ -119,9 +136,11 @@ struct Journal
     wanted: u32
     // `handle_limit(max_transaction)`.
     max_credits: u32
+    // Handles opened since the mount: how the tests count a split operation's steps.
+    opened: u64
 
 new_journal(st: JournalState, read_only: bool, max_transaction: u32) -> Journal
-    Journal(fresh_txn(st.start_seq), no_txn(), buf(), 0, 1, st, false, read_only, 0, handle_limit(max_transaction))
+    Journal(fresh_txn(st.start_seq), no_txn(), buf(), 0, 1, st, false, read_only, 0, handle_limit(max_transaction), 0)
 
 // What `begin` did.
 enum Begin
@@ -206,6 +225,7 @@ join_running[D: BlockDevice, P: Platform](fs: *Fs[D, P], op: string, credits: u3
     fs.j.running.outstanding += credits
     fs.j.running.outstanding_revokes += credits
     fs.j.wanted = 0
+    fs.j.opened += 1
     fs.plat.unlock(LockId.Journal)
     Ok(Some(Handle(op, credits, r.seq, buf(), 0, None)))
 
@@ -272,9 +292,11 @@ revoke_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64)
         None -> ()
     fs.plat.unlock(LockId.Journal)
 
-// Put data block `b`'s new bytes on the running transaction's ordered list: written home before the
-// transaction is logged (step 2). A second write of the same block in the transaction replaces the first.
-add_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64, bytes: []const u8) -> Result[unit, FsError]
+// Put data block `b`'s new bytes on the running transaction's lists (`DataOrder`): before its commit
+// (step 2), or after it. A second write of the same block in the transaction replaces the first in its
+// list; one before the commit also replaces a copy waiting for after it, which would otherwise put the
+// older bytes back over it.
+add_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64, bytes: []const u8, order: DataOrder) -> Result[unit, FsError]
     h.refused match
         Some(e) -> return Err(e)
         None -> ()
@@ -282,15 +304,60 @@ add_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64, bytes: 
     if bytes.len != BLOCK_SIZE then return Err(FsError.Invalid)
     fs.plat.lock(LockId.Journal)
     val t = fs.j.running
-    index_of_u64(t.data_blocks, b) match
-        Some(k) ->
-            for i in 0..<BLOCK_SIZE
-                t.data[k * BLOCK_SIZE + i] = bytes[i]
-        None ->
-            t.data_blocks.push(b)
-            t.data.extend(bytes)
+    if order == DataOrder.After
+        put_copy(t.late_blocks, t.late_data, b, bytes)
+    else
+        val k = put_copy(t.data_blocks, t.data, b, bytes)
+        if k == t.data_fresh.len() then t.data_fresh.push(false)
+        if order == DataOrder.Fresh then t.data_fresh[k] = true
+        if index_of_u64(t.late_blocks, b).is_some() then put_copy(t.late_blocks, t.late_data, b, bytes)
     fs.plat.unlock(LockId.Journal)
     Ok(())
+
+// Put `bytes` as block `b`'s copy in a list, replacing an earlier one; answers its place.
+private put_copy(blocks: Buf[u64], data: Buf[u8], b: u64, bytes: []const u8) -> usize
+    index_of_u64(blocks, b) match
+        Some(k) ->
+            for i in 0..<BLOCK_SIZE
+                data[k * BLOCK_SIZE + i] = bytes[i]
+            k
+        None ->
+            blocks.push(b)
+            data.extend(bytes)
+            blocks.len() - 1
+
+// Whether the running transaction maps data block `b` itself (`DataOrder.Fresh`).
+fresh_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], b: u64) -> bool
+    fs.plat.lock(LockId.Journal)
+    val t = fs.j.running
+    val fresh = index_of_u64(t.data_blocks, b) match
+        Some(k) -> t.data_fresh[k]
+        None -> false
+    fs.plat.unlock(LockId.Journal)
+    fresh
+
+// The copy of block `b` in a list, into `out`: false when the list has none.
+private copy_from(blocks: Buf[u64], data: Buf[u8], b: u64, out: []u8) -> bool
+    index_of_u64(blocks, b) match
+        Some(k) ->
+            for i in 0..<BLOCK_SIZE
+                out[i] = data[k * BLOCK_SIZE + i]
+            true
+        None -> false
+
+// The newest bytes of `t` for block `b`: its copy for after the commit, else its copy for before.
+private pending_copy(t: Txn, b: u64, out: []u8) -> bool
+    copy_from(t.late_blocks, t.late_data, b, out) || copy_from(t.data_blocks, t.data, b, out)
+
+// The newest bytes of data block `b`: the running transaction's, else the committing one's, else the
+// device's. Answers whether a transaction still holds them (they are not yet home).
+newest_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], b: u64, out: []u8) -> Result[bool, FsError]
+    fs.plat.lock(LockId.Journal)
+    var held = pending_copy(fs.j.running, b, out)
+    if !held && fs.j.committing.live then held = pending_copy(fs.j.committing, b, out)
+    fs.plat.unlock(LockId.Journal)
+    if !held then fs.dev.read(b, out)?
+    Ok(held)
 
 // Close a handle. Its unspent credits leave the transaction's reservation. When it was the last handle of
 // a closed transaction, the commit is asked for (and run here when there is no commit thread).
@@ -366,6 +433,7 @@ finish[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
     for i in 0..<t.data_blocks.len()
         io(fs, fs.dev.write(t.data_blocks[i], t.data.view()[i * BLOCK_SIZE..<(i + 1) * BLOCK_SIZE]))?
     if !t.logs()
+        write_late(fs, t)?
         io(fs, fs.dev.flush())?
         fs.plat.lock(LockId.Journal)
         fs.j.committing = no_txn()
@@ -446,6 +514,12 @@ finish[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
     io(fs, fs.dev.flush())?
     pos = advance(fs, pos, 1)
 
+    // The data that had to wait for the commit, and a flush so that a commit asked for by fsync covers
+    // it. The blocks it may share with this transaction's frees are not allocatable before step 7.
+    if t.late_blocks.len() > 0
+        write_late(fs, t)?
+        io(fs, fs.dev.flush())?
+
     // Step 7: committed.
     fs.plat.lock(LockId.Journal)
     fs.j.head = pos
@@ -472,6 +546,11 @@ finish[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
     for id in gone.view()
         fs.forget(id)
     fs.committed(t.seq)
+    Ok(())
+
+private write_late[D: BlockDevice, P: Platform](fs: *Fs[D, P], t: Txn) -> Result[unit, FsError]
+    for i in 0..<t.late_blocks.len()
+        io(fs, fs.dev.write(t.late_blocks[i], t.late_data.view()[i * BLOCK_SIZE..<(i + 1) * BLOCK_SIZE]))?
     Ok(())
 
 // Take buffer `id` off committed transaction `seq`'s checkpoint list. Under the journal lock.

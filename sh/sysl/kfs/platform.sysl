@@ -15,9 +15,12 @@ module keel.kfs
 //
 // Plus one exit for a bug in KFS itself (`fatal`): the kernel stops, a host test fails.
 
-// Every lock of section 19 that the package takes. An inode's lock and the rename lock are taken by
+// Every lock of section 19 that the package takes. The rename lock and a directory's lock are taken by
 // the code above the package, so they have no names here yet.
 enum LockId
+    // `inode.lock` of a non-directory: its fields, its extent tree, its open count (sleeping). A split
+    // operation holds it from its first step to its last.
+    Inode(ino: u64)
     // `orphans.lock`: the orphan list (sleeping).
     Orphans
     // `group[g].lock`: group g's bitmaps, descriptor fields, pending frees and cursor (sleeping).
@@ -30,17 +33,22 @@ enum LockId
     Journal
     // `cache.lock`: the buffer cache's index (spinning, a leaf).
     Cache
+    // `icache.lock`: the in-memory inode table (spinning, a leaf).
+    Icache
 
 // Where a lock sits in section 19's order: a lock may be taken only while every lock held ranks
-// strictly lower. Rules 1-3 (the rename and inode locks) and rule 4 (opening a handle) are above
-// everything here; the leaves share rank 8 and none may be held while taking another.
+// strictly lower. Rules 1-2 (the rename lock and directories' locks) are above everything here, and
+// rule 4, opening a handle, comes between an inode's lock and the orphan list's; the leaves share rank 8
+// and none may be held while taking another.
 rank(l: LockId) -> u32
     l match
+        LockId.Inode(_) -> 3
         LockId.Orphans -> 5
         LockId.Group(_) -> 6
         LockId.Buffer(_) -> 7
         LockId.Journal -> 8
         LockId.Cache -> 8
+        LockId.Icache -> 8
 
 // A moment, as an inode stores one: signed seconds since the epoch and nanoseconds.
 struct Time

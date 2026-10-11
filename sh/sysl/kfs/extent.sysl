@@ -237,6 +237,29 @@ lookup[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, l: u64) -> Result[M
     if l >= end_of(e) then return Ok(Mapping.Hole)
     Ok(Mapping.Mapped(e.physical + (l - u64(e.logical)), u32(end_of(e) - l), e.flags & EXTENT_UNWRITTEN != 0))
 
+// The first logical block at or after `l` that an extent maps, or 2^32 when none does: where a hole
+// starting at `l` ends. Past the last extent of a leaf the next leaf's first extent begins exactly at
+// the leaf's upper bound, since an index key is its child's first key.
+next_mapped[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, l: u64) -> Result[u64, FsError]
+    if l >= LOGICAL_BLOCKS then return Ok(LOGICAL_BLOCKS)
+    val o = load_owner(fs, ino)?
+    val leaf = descend(fs, o, l)?.leaf()
+    val next = last_at_most(leaf.entries, l) match
+        Some(i) ->
+            if l < end_of(leaf.entries[i]) then return Ok(l)
+            i + 1
+        None -> 0
+    if next < leaf.entries.len() then Ok(u64(leaf.entries[next].logical)) else Ok(leaf.hi)
+
+// The extent mapping the highest logical blocks, or None for a tree that maps nothing.
+last_extent[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Option[Extent], FsError]
+    val o = load_owner(fs, ino)?
+    val leaf = descend(fs, o, LOGICAL_BLOCKS - 1)?.leaf()
+    val n = leaf.entries.len()
+    if n == 0 then return Ok(None)
+    val e = leaf.entries[n - 1]
+    Ok(Some(Extent(u64(e.logical), u32(e.len), e.physical, e.flags & EXTENT_UNWRITTEN != 0)))
+
 // The tree's depth: 0 while every extent is in the inode.
 depth_of[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[u16, FsError]
     val o = load_owner(fs, ino)?

@@ -37,16 +37,20 @@ struct HostPlatform
     // The last fatal reported, as a number: 1 credit overrun, 2 revoke overrun, 3 deadlock, 4 log
     // overrun.
     last_fatal: u32
+    // Milliseconds the monotonic clock moves after every reading: a test that sets it lets
+    // `COMMIT_INTERVAL` pass inside one long operation, so the operation's steps commit apart.
+    ms_step: u64
 
     // How many locks are held now.
     held(self) -> usize = self.held_rank.len()
 
-host_platform() -> HostPlatform = HostPlatform(buf(), buf(), 1_700_000_000, false, 0, 0, 0, 0, 0, false, 0)
+host_platform() -> HostPlatform = HostPlatform(buf(), buf(), 1_700_000_000, false, 0, 0, 0, 0, 0, false, 0, 0)
 
 private key_of(l: LockId) -> u64
     l match
         LockId.Group(g) -> u64(g)
         LockId.Buffer(b) -> b
+        LockId.Inode(i) -> i
         _ -> 0
 
 impl Platform for HostPlatform
@@ -80,7 +84,10 @@ impl Platform for HostPlatform
         self.clock += 1
         Time(self.clock, 500)
 
-    monotonic_ms(*self) -> u64 = self.ms
+    monotonic_ms(*self) -> u64
+        val t = self.ms
+        self.ms += self.ms_step
+        t
 
     wake_committer(*self) -> bool
         self.commit_requests += 1

@@ -152,7 +152,10 @@ alloc_inode[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, n: NewInode)
     for k in 0..<groups
         val g = (first + k) % groups
         inode_in_group(fs, h, g, n) match
-            Ok(Some(ino)) -> return Ok(ino)
+            Ok(Some(ino)) ->
+                // A new inode is a change of everything `fsync` cares about.
+                note_change(fs, ino, h.seq, true)
+                return Ok(ino)
             Ok(None) -> ()
             Err(e) ->
                 fs.free_inodes_total.add(1)

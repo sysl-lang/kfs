@@ -1,0 +1,235 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// The inode layer (kfs/SPEC.md sections 8, 16 and 19): reading an inode, changing it inside a handle,
+// and what memory keeps for an inode beside its slot on the disk.
+//
+// **The slot is the inode.** Every field lives in the inode-table block's buffer and is read from
+// there; a change is declared (`write_access`) and made in place, then the slot is sealed again. There
+// is no second copy to fall out of step with the disk: a change touches exactly the fields it means to,
+// so `orphan_next` and `ORPHAN`, which belong to the orphan list (orphan.sysl), are written by that code
+// alone, under `orphans.lock`, as section 19 requires.
+//
+// **In memory** (`InCore`) an inode has what the disk does not hold: how many references keep it open,
+// its neighbours on the orphan list (doubly linked in memory, singly on the disk, so the predecessor is
+// at hand), the data blocks it has written that `fsync` must make durable, and the last transactions
+// that changed it at all and that changed its size or its mapping, which tell `fsync` and `fdatasync`
+// whether a commit must be forced. The kernel's inode cache will own this table; here it is a list
+// searched by number under `icache.lock`, its slots reused, never moved.
+
+// Permission bits a write by anyone but root clears (section 18, `write`).
+const S_ISUID: u16 = 0o4000
+const S_ISGID: u16 = 0o2000
+
+// One inode in memory. `ino` 0 marks a free slot of the table.
+struct InCore
+    ino: u64
+    // References that keep the inode open: it is deleted at the last release once it has no links.
+    held: u32
+    // On the orphan list, with its neighbours there (0 for none). Owned by `orphans.lock`.
+    orphan: bool
+    prev: u64
+    next: u64
+    // Data blocks written and not yet made durable by an `fsync`.
+    dirty: Buf[u64]
+    // The last transaction that changed the inode, and the last that changed its size or its mapping.
+    meta_seq: u64
+    map_seq: u64
+
+private free_core() -> InCore = InCore(0, 0, false, 0, 0, buf(), 0, 0)
+
+// Where an inode's slot is: the inode-table block's buffer and the offset in it.
+struct Slot
+    ino: u64
+    loc: InodeLoc
+    id: usize
+
+// The in-memory record of inode `ino`, if there is one.
+find_core[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Option[usize]
+    fs.plat.lock(LockId.Icache)
+    var found: Option[usize] = None
+    for i in 0..<fs.incore.len()
+        if fs.incore[i].ino == ino then found = Some(i)
+    fs.plat.unlock(LockId.Icache)
+    found
+
+// The in-memory record of inode `ino`, made on first use.
+core_of[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> usize
+    find_core(fs, ino) match
+        Some(i) -> return i
+        None -> ()
+    fs.plat.lock(LockId.Icache)
+    var slot = fs.incore.len()
+    for i in 0..<fs.incore.len()
+        if fs.incore[i].ino == 0 then slot = i
+    var c = free_core()
+    c.ino = ino
+    if slot == fs.incore.len() then fs.incore.push(c) else fs.incore[slot] = c
+    fs.plat.unlock(LockId.Icache)
+    slot
+
+// Forget inode `ino`'s record: it has been freed.
+forget_core[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64)
+    find_core(fs, ino) match
+        Some(i) ->
+            fs.plat.lock(LockId.Icache)
+            fs.incore[i] = free_core()
+            fs.plat.unlock(LockId.Icache)
+        None -> ()
+
+// Inode `ino`'s slot, checked: a number in range (else corruption, section 22), a slot in use (a free
+// one, all zero or with mode 0, answers `Invalid`), and a checksum that verifies.
+slot_of[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Slot, FsError]
+    if ino == 0 || ino > fs.sb.inode_count then return Err(fs.corrupt(Corruption.BadInodeNumber(ino)))
+    val loc = fs.inode_location(ino)
+    val id = fs.buffer(loc.block)?
+    fs.plat.lock(LockId.Buffer(loc.block))
+    val bytes = fs.bytes(id)[loc.offset..<loc.offset + INODE_SIZE]
+    var zero = true
+    for x in bytes
+        if x != 0 then zero = false
+    val good = zero || verify_inode(fs.seed, ino, bytes)
+    val node: *Inode = at(fs.bytes(id), loc.offset)
+    val mode = node.mode
+    fs.plat.unlock(LockId.Buffer(loc.block))
+    if !good then return Err(fs.corrupt(Corruption.Inode(ino)))
+    if zero || mode == 0 then return Err(FsError.Invalid)
+    Ok(Slot(ino, loc, id))
+
+// A copy of inode `ino` as it is now.
+read_inode[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Inode, FsError]
+    val s = slot_of(fs, ino)?
+    fs.plat.lock(LockId.Buffer(s.loc.block))
+    val node: *Inode = at(fs.bytes(s.id), s.loc.offset)
+    val copy = *node
+    fs.plat.unlock(LockId.Buffer(s.loc.block))
+    Ok(copy)
+
+// Declare slot `s`'s block in `h`, under its buffer lock, before anything in it changes.
+declare_slot[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, s: Slot) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Buffer(s.loc.block))
+    val r = fs.write_access(h, s.id)
+    fs.plat.unlock(LockId.Buffer(s.loc.block))
+    r
+
+// Change slot `s` (declared already) with `edit`, and seal it again.
+edit_slot[D: BlockDevice, P: Platform](fs: *Fs[D, P], s: Slot, edit: &Fn(*Inode) -> unit)
+    fs.plat.lock(LockId.Buffer(s.loc.block))
+    val bytes = fs.bytes(s.id)
+    edit(at(bytes, s.loc.offset))
+    seal_inode(fs.seed, s.ino, bytes[s.loc.offset..<s.loc.offset + INODE_SIZE])
+    fs.plat.unlock(LockId.Buffer(s.loc.block))
+
+// Change inode `ino` in `h` with `edit`: declared, changed, sealed, and remembered as changed in `h`'s
+// transaction.
+change_inode[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, edit: &Fn(*Inode) -> unit) -> Result[unit, FsError]
+    val s = slot_of(fs, ino)?
+    declare_slot(fs, h, s)?
+    edit_slot(fs, s, edit)
+    note_change(fs, ino, h.seq, false)
+    Ok(())
+
+// Remember that transaction `seq` changed inode `ino` — and, with `mapping`, its size or its mapping.
+note_change[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, seq: u64, mapping: bool)
+    val i = core_of(fs, ino)
+    fs.incore.view()[i].meta_seq = seq
+    if mapping then fs.incore.view()[i].map_seq = seq
+
+// Remember that inode `ino` wrote data block `b`, for `fsync`.
+note_dirty[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, b: u64)
+    val i = core_of(fs, ino)
+    for x in fs.incore[i].dirty.view()
+        if x == b then return
+    fs.incore[i].dirty.push(b)
+
+set_atime(n: *Inode, t: Time)
+    n.atime_sec = t.sec
+    n.atime_nsec = t.nsec
+
+set_mtime(n: *Inode, t: Time)
+    n.mtime_sec = t.sec
+    n.mtime_nsec = t.nsec
+
+set_ctime(n: *Inode, t: Time)
+    n.ctime_sec = t.sec
+    n.ctime_nsec = t.nsec
+
+// Whether time (a_sec, a_nsec) is before time (b_sec, b_nsec).
+before(a_sec: i64, a_nsec: u32, b_sec: i64, b_nsec: u32) -> bool
+    a_sec < b_sec || (a_sec == b_sec && a_nsec < b_nsec)
+
+// `st_blocks`: 512-byte units (section 8, `blocks`).
+st_blocks(n: Inode) -> u64 = n.blocks * 8
+
+// Whether an inode of this mode and these flags has an extent tree (section 8, "The `data` union").
+has_tree(mode: u16, flags: u32) -> bool
+    val t = mode & S_IFMT
+    t == S_IFREG || t == S_IFDIR || (t == S_IFLNK && flags & INODE_INLINE == 0)
+
+// -- References and links -------------------------------------------------------------------------------
+
+// Inode `ino` as it is now, under its lock: `stat`'s view.
+stat[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Inode, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = read_inode(fs, ino)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+// One more reference keeps inode `ino` open (a descriptor, a mapping, a working directory).
+hold[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = slot_of(fs, ino)
+    if r.is_ok()
+        val i = core_of(fs, ino)
+        fs.incore.view()[i].held += 1
+    fs.plat.unlock(LockId.Inode(ino))
+    r?
+    Ok(())
+
+// A reference to inode `ino` goes. The last one, on an inode with no links, deletes it (section 18,
+// `unlinkat`: "otherwise the last close runs it").
+release[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = release_locked(fs, ino)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private release_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
+    val i = find_core(fs, ino) match
+        Some(i) -> i
+        None -> return Err(FsError.Invalid)
+    if fs.incore[i].held == 0 then return Err(FsError.Invalid)
+    fs.incore.view()[i].held -= 1
+    if fs.incore[i].held > 0 then return Ok(())
+    val node = read_inode(fs, ino)?
+    if node.links == 0 then delete_locked(fs, ino) else Ok(())
+
+// Whether anything holds inode `ino` open.
+held_open[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> bool
+    find_core(fs, ino) match
+        Some(i) -> fs.incore[i].held > 0
+        None -> false
+
+// The inode's half of `unlinkat` (section 18): `links` − 1 and `ctime`, and on the last link the orphan
+// list, in one transaction; then, with nothing holding it open, the delete. The directory's half is
+// the directory code's, in the same transaction.
+drop_link[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = drop_link_locked(fs, ino)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private drop_link_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
+    val node = read_inode(fs, ino)?
+    if node.links == 0 then return Err(FsError.Invalid)
+    val last = node.links == 1
+    val now = fs.plat.now()
+    var h = fs.start("unlink", C_INODE + C_SB)
+    var r = change_inode(fs, &h, ino, (n) ->
+        n.links -= 1
+        set_ctime(n, now))
+    if r.is_ok() && last then r = orphan_add(fs, &h, ino)
+    fs.stop(&h)
+    r?
+    if last && !held_open(fs, ino) then delete_locked(fs, ino) else Ok(())

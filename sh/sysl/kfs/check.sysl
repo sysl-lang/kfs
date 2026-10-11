@@ -18,15 +18,18 @@ import sysl.buf.{Buf, buf}
 //   permission bits, flags valid for the type, `parent` only for directories, devices, FIFOs and
 //   sockets without size or blocks, an inline symlink's size; its extent tree under every rule of
 //   section 9 (the same rules stage 4's test oracle checks); every block it claims, a block claimed
-//   twice being a problem; and `blocks` against what it claims. A free inode's slot with a mode is a
-//   warning.
+//   twice being a problem; and `blocks` against what it claims. Section 8's invariants: `links` 0 only
+//   with `ORPHAN`; no written extent at or past `ceil(size / 4096)`, and an unwritten one there only in
+//   a regular file (an inode on the orphan list is exempt: freeing those blocks is the work the list
+//   records); and the tail of a written last block zero from `size` on. A free inode's slot with a
+//   mode is a warning.
 // - **Pass 5** — each group's block bitmap against what it must be (metadata, the journal, the bits
 //   past the group's end, and the claimed blocks, nothing else), the inode bitmap against the slots in
 //   use, the descriptor's free counts, `directories` and both bitmap checksums, and the superblock's
-//   totals when `CLEAN` says they are exact.
+//   totals when `CLEAN` says they are exact. Then the orphan list from the superblock's head: every
+//   member an allocated inode with `ORPHAN`, no cycle, and no `ORPHAN` on an inode the list misses.
 //
-// Not yet checked, because nothing writes them yet: a written extent past `ceil(size / 4096)` and the
-// zeroed tail (stage 6), directories (stage 7), the orphan list (stage 6), xattr blocks (stage 8).
+// Not yet checked, because nothing writes them yet: directories (stage 7), xattr blocks (stage 8).
 
 enum Problem
     // Pass 0.
@@ -47,6 +50,13 @@ enum Problem
     Extent(ino: u64, block: u64, fault: NodeFault)
     DoubleClaim(block: u64, ino: u64)
     BlockCount(ino: u64, recorded: u64, counted: u64)
+    // A written extent at or past `ceil(size / 4096)`, or an unwritten one there outside a regular file;
+    // `logical` is the extent's first block.
+    ExtentPastEnd(ino: u64, logical: u64)
+    // The last block's bytes from `size` on are not zero.
+    TailNotZero(ino: u64)
+    // `links` 0 on an inode without `ORPHAN`.
+    Unlinked(ino: u64)
     // A warning: a free inode's slot holds a mode.
     FreeInodeInUse(ino: u64)
     // Pass 5.
@@ -58,12 +68,20 @@ enum Problem
     BlockBitmapCrc(group: u32)
     InodeBitmapCrc(group: u32)
     Totals
+    // The orphan list reaches `ino`, which is out of range, free, or without `ORPHAN`.
+    OrphanMember(ino: u64)
+    // The orphan list reaches `ino` a second time.
+    OrphanCycle(ino: u64)
+    // `ino` has `ORPHAN` and the list does not reach it.
+    OrphanFlag(ino: u64)
 
 struct Report
     problems: Buf[Problem]
     warnings: Buf[Problem]
     // Every block an inode claims (extent-tree nodes, data, the xattr block), in the order found.
     claimed: Buf[u64]
+    // The claimed blocks that unwritten extents map: they read as zeros whatever they hold.
+    unwritten: Buf[u64]
     // How many inodes pass 1 checked.
     inodes: u64
 
@@ -90,6 +108,12 @@ describe(p: Problem) -> string
         Problem.Extent(i, b, _) -> s"inode $i's extent tree breaks a rule at block $b"
         Problem.DoubleClaim(b, i) -> s"block $b is claimed twice, the second time by inode $i"
         Problem.BlockCount(i, r, c) -> s"inode $i records $r blocks and claims $c"
+        Problem.ExtentPastEnd(i, l) -> s"inode $i maps blocks from $l, past its size"
+        Problem.TailNotZero(i) -> s"inode $i's last block is not zero past its size"
+        Problem.Unlinked(i) -> s"inode $i has no links and is not an orphan"
+        Problem.OrphanMember(i) -> s"the orphan list reaches inode $i, which cannot be on it"
+        Problem.OrphanCycle(i) -> s"the orphan list reaches inode $i twice"
+        Problem.OrphanFlag(i) -> s"inode $i is marked an orphan and the list does not reach it"
         Problem.FreeInodeInUse(i) -> s"free inode $i has a mode"
         Problem.BlockBit(b, want) -> s"block $b's bitmap bit should be $want"
         Problem.InodeBit(i, want) -> s"inode $i's bitmap bit should be $want"
@@ -102,7 +126,7 @@ describe(p: Problem) -> string
 
 // Check the filesystem on `dev`.
 check[D: BlockDevice](dev: *D) -> Report
-    var rep = Report(buf(), buf(), buf(), 0)
+    var rep = Report(buf(), buf(), buf(), buf(), 0)
     val m = open(dev) match
         Ok(m) -> m
         Err(e) ->
@@ -121,11 +145,14 @@ check[D: BlockDevice](dev: *D) -> Report
         rep.add(Problem.NeedsRecovery)
         audit_log(dev, sb, st, rep)
         return rep
-    var c = Checker(m, 0, 0, buf(), buf())
+    var c = Checker(m, 0, 0, buf(), buf(), buf(), buf(), buf())
     for _ in 0..<usize(sb.blocks)
         c.owner.push(0)
     for _ in 0..<m.geo.group_count
         c.dirs.push(0)
+    for _ in 0..<(usize(sb.inode_count) + 1)
+        c.allocated.push(false)
+        c.flagged.push(false)
     var failed = pass1(dev, &c, rep).is_err()
     if !failed then failed = pass5(dev, &c, rep).is_err()
     if failed then rep.add(Problem.Super(OpenError.Device(DeviceError.Io)))
@@ -133,13 +160,17 @@ check[D: BlockDevice](dev: *D) -> Report
     rep
 
 // What pass 1 leaves for pass 5: the filesystem, which inode claims each block (0 for none) and each
-// group's directories; the blocks the inode being walked has claimed so far, and the inodes checked.
+// group's directories; the blocks the inode being walked has claimed so far and its extents, and the
+// inodes checked; and, by inode number, which are allocated and which carry `ORPHAN`.
 private struct Checker
     m: Mounted
     count: u64
     inodes: u64
     owner: Buf[u64]
     dirs: Buf[u32]
+    extents: Buf[ExtentLeaf]
+    allocated: Buf[bool]
+    flagged: Buf[bool]
 
 // -- Pass 0: the log ----------------------------------------------------------------------------------
 
@@ -204,11 +235,15 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
             if !bit_test(ibm.view(), usize(i))
                 if node.mode != 0 then rep.warnings.push(Problem.FreeInodeInUse(ino))
                 continue
+            c.allocated[usize(ino)] = true
             if ino == 1 || (ino >= 3 && ino < FIRST_INO) then continue
             c.inodes += 1
             if !verify_inode(seed, ino, slot)
                 rep.add(Problem.InodeChecksum(ino))
                 continue
+            val orphan = node.flags & INODE_ORPHAN != 0
+            c.flagged[usize(ino)] = orphan
+            if node.links == 0 && !orphan then rep.add(Problem.Unlinked(ino))
             val t = node.mode & S_IFMT
             if !valid_type(t) || node.mode & ~(S_IFMT | 0o7777) != 0
                 rep.add(Problem.InodeMode(ino))
@@ -223,6 +258,7 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
             if special && (node.size != 0 || node.blocks != 0) then rep.add(Problem.InodeSize(ino))
             if t == S_IFLNK && f & INODE_INLINE != 0 && (node.size == 0 || node.size > u64(SYMLINK_INLINE_MAX)) then rep.add(Problem.InodeSize(ino))
             c.count = 0
+            c.extents.clear()
             if t == S_IFREG || t == S_IFDIR || (t == S_IFLNK && f & INODE_INLINE == 0)
                 val head: *NodeHeader = at(table.view(), off + 112)
                 var fault: Option[Problem] = None
@@ -237,10 +273,37 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
                         rep.add(p)
                         continue
                     None -> ()
+                past_end(dev, c, rep, ino, node, t == S_IFREG)?
             if node.xattr_block != 0
                 claim(c, rep, node.xattr_block, ino)
                 c.count += 1
             if node.blocks != c.count then rep.add(Problem.BlockCount(ino, node.blocks, c.count))
+    Ok(())
+
+// Section 8's invariants about the end of the file, over the extents the walk collected: none written
+// at or past `ceil(size / 4096)`, unwritten ones there only in a regular file — both waived for an
+// orphan, whose blocks past the end are what the list is freeing — and the written last block zero
+// from `size` to its end.
+private past_end[D: BlockDevice](dev: *D, c: *Checker, rep: Report, ino: u64, node: *Inode, regular: bool) -> Result[unit, DeviceError]
+    val bs = u64(BLOCK_SIZE)
+    val keep = (node.size + bs - 1) / bs
+    if node.flags & INODE_ORPHAN == 0
+        for e in c.extents.view()
+            val unwritten = e.flags & EXTENT_UNWRITTEN != 0
+            if u64(e.logical) + u64(e.len) > keep && (!unwritten || !regular)
+                rep.add(Problem.ExtentPastEnd(ino, u64(e.logical)))
+                return Ok(())
+    val tail = usize(node.size % bs)
+    if tail == 0 then return Ok(())
+    val l = node.size / bs
+    for e in c.extents.view()
+        if u64(e.logical) <= l && l < u64(e.logical) + u64(e.len) && e.flags & EXTENT_UNWRITTEN == 0
+            var blk = block_buf()
+            dev.read(e.physical + (l - u64(e.logical)), blk.view())?
+            for i in tail..<BLOCK_SIZE
+                if blk[i] != 0
+                    rep.add(Problem.TailNotZero(ino))
+                    return Ok(())
     Ok(())
 
 private reserved_zero(head: *NodeHeader) -> bool
@@ -285,9 +348,12 @@ private walk_node[D: BlockDevice](dev: *D, c: *Checker, rep: Report, ino: u64, g
     for i in 0..<count
         val e = entries[i]
         if leaf
+            val unwritten = e.flags & EXTENT_UNWRITTEN != 0
             for k in 0..<u64(e.len)
                 claim(c, rep, e.physical + k, ino)
+                if unwritten then rep.unwritten.push(e.physical + k)
             c.count += u64(e.len)
+            c.extents.push(e)
         else
             claim(c, rep, e.physical, ino)
             c.count += 1
@@ -355,4 +421,32 @@ private pass5[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
         free_inodes += u64(d.free_inodes)
     if c.m.sb.state & STATE_CLEAN != 0 && (c.m.sb.free_blocks != free_blocks || c.m.sb.free_inodes != free_inodes)
         rep.add(Problem.Totals)
+    orphan_walk(dev, c, rep)
+
+// The orphan list (section 16): from the superblock's head through each member's `orphan_next`, every
+// member an allocated ordinary inode with `ORPHAN`, none reached twice; then every `ORPHAN` the walk did
+// not reach. The walk stops at the first bad link, since nothing after it can be trusted to be the list.
+private orphan_walk[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit, DeviceError]
+    val g = c.m.geo
+    val count = c.m.sb.inode_count
+    var reached: Buf[bool] = buf()
+    for _ in 0..<(usize(count) + 1)
+        reached.push(false)
+    var table = block_buf()
+    var ino = c.m.sb.orphan_head
+    while ino != 0
+        if ino < FIRST_INO || ino > count || !c.allocated[usize(ino)] || !c.flagged[usize(ino)]
+            rep.add(Problem.OrphanMember(ino))
+            break
+        if reached[usize(ino)]
+            rep.add(Problem.OrphanCycle(ino))
+            break
+        reached[usize(ino)] = true
+        val grp = u32((ino - 1) / u64(g.inodes_per_group))
+        val i = (ino - 1) % u64(g.inodes_per_group)
+        dev.read(g.inode_table(grp) + i / 16, table.view())?
+        val node: *Inode = at(table.view(), usize(i % 16) * INODE_SIZE)
+        ino = node.orphan_next
+    for k in FIRST_INO..<(count + 1)
+        if c.flagged[usize(k)] && !reached[usize(k)] then rep.add(Problem.OrphanFlag(k))
     Ok(())

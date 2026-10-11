@@ -459,6 +459,10 @@ time before 1970 is a negative `_sec` with a non-negative `_nsec`.
   there.
 - A device, FIFO or socket has `size` 0 and `blocks` 0.
 
+An inode on the orphan list is exempt from the second: blocks past its end are what the list is
+freeing (section 16). The tail is checked only in a written block; one under an unwritten extent, or a
+hole, reads as zeros whatever the disk holds. (Stage 6.)
+
 ---
 
 ## 9. The extent tree
@@ -867,6 +871,8 @@ Per operation (section 18 says what each writes):
 | one truncate step (≤ 16 extents, ≤ 4 nodes freed) | ≤ 64 |
 | one punch step (a truncate step that may split one extent) | ≤ 64 + `C_EXT` + `C_GROUP` = 90 |
 | `setattr` (mode, owner, times, size up) | `C_INODE` = 1 |
+| a shrink's first step, and its last (orphan add, remove) | `C_INODE + C_SB` = 2 |
+| delete's last step (xattr block, slot, bitmap, orphan remove) | `2·C_INODE + 2·C_GROUP` = 6 |
 | `setxattr`/`removexattr` | `C_INODE + C_GROUP + 2` = 5 |
 
 **Credits are checked, not trusted.** A handle counts the distinct buffers it adds to the
@@ -1135,6 +1141,11 @@ member's `orphan_next` the next, the last has 0. Every member has `ORPHAN` set; 
 - **At mount**, after journal replay, walk the list (at most `inode_count` steps; a cycle or an
   unallocated member is corruption): an inode with links 0 is truncated to 0 in steps and freed; one
   with links > 0 has every block past `ceil(size / 4096)` freed in steps; each is then removed.
+  (Stage 6: a member below `first_ino` or past the last inode, free, or without `ORPHAN` is corruption
+  too. The walk builds the whole list in memory first; corruption aborts the journal, so the mount
+  completes read-only with nothing processed. The members are then finished from the head, each under
+  its inode lock, the add costing the inode and the superblock and the remove the inode and its
+  predecessor — `C_INODE + C_SB` each.)
 
 **Pedagogical note.** The orphan list is the answer to "Unix lets you delete an open file — what does
 the disk do?" The name goes at once; the inode lives on the list until nobody holds it. The same list
@@ -1317,6 +1328,10 @@ for unlink.
 No transaction, except an `atime` update: with the default **relatime** policy, `atime` is written
 (one handle, `C_INODE`) only when it is older than `mtime` or `ctime` or more than 24 hours old.
 Holes and unwritten extents read as zeros.
+(Stage 6: "older" and "more than" are strict — a new inode, whose times are all equal, gets no `atime`
+write from its first read, and one exactly 86,400 s old none either. A read that asks for bytes counts
+even at the end of the file; a zero-length read touches nothing. A read-only or aborted filesystem
+writes no `atime`.)
 
 ### `write` (and `pwrite`, `writev`)
 
@@ -1341,6 +1356,31 @@ them, so a file never maps garbage and `size` never covers unwritten blocks. A c
 already mapped and written is not ordered: after a crash such a block may hold old or new bytes (or,
 torn, some sectors of each) — the price of data=ordered over data=journal.
 
+**Clarifications** (stage 6):
+
+- **The old last block is written after the commit.** A write that extends the file puts bytes past
+  the old `size` into the block that held the old end — a block mapped and written before the chunk.
+  Written home before the commit, a crash between the two would leave those bytes past the committed
+  `size`, breaking the zeroed tail (section 8) that a later growing truncate exposes. So that one block
+  goes home only **after** the commit block is durable (followed by a flush, so a commit `fsync` forced
+  covers it). A crash in between leaves the new `size` over that block's old bytes — zeros past the old
+  end — or a torn mixture: section 18's unordered overwrite, and the crash test's documented
+  intermediate. A block the chunk's own transaction maps (a new run, a converted unwritten extent) is
+  always written before the commit, whatever later writes in the same transaction add to it.
+- **A chunk ends at its ninth allocation**, not its eighth: blocks already mapped and written cost no
+  allocation, so a chunk goes on over them until a hole or an unwritten extent would be its ninth.
+  Converting an unwritten range counts as an allocation. All of a chunk's data is ordered data of its
+  own handle, the conversion included (step 4 is the same handle).
+- **Limits and partial results.** A write starting at or past 16 TiB answers `EFBIG`; one reaching past
+  it is cut there and answers the bytes below it (as Linux does). Out of space part-way — or past the
+  extent tree's fifth level — a write answers the bytes it wrote before (`ENOSPC` or `EFBIG` when that is
+  none); a run it had allocated for an insert that failed is freed in the same handle. A zero-length
+  write changes nothing, times included. Only a regular file is written (`EINVAL` otherwise: the VFS
+  answers `EISDIR` for a directory first).
+- **Where the newest bytes are.** Until a transaction's ordered data is home, a read finds a block's
+  bytes in the running transaction (its after-commit copy first), then the committing one, then the
+  device.
+
 ### `truncate`, `ftruncate`
 
 - **Growing** (`new ≥ size`): one transaction setting `size`, `mtime`, `ctime`. The new range is a
@@ -1354,6 +1394,13 @@ torn, some sectors of each) — the price of data=ordered over data=journal.
   3. Last step's transaction: orphan remove.
   **Crash**: after step 1, the inode is an orphan with links > 0, so the next mount frees what remains
   past `size`; the file is never seen with its old size again.
+- (Stage 6.) **The same size changes nothing** — no handle, no times (POSIX marks the times only when
+  the size changes). **A shrink with nothing mapped at or past `ceil(new / 4096)`** (a sparse tail, or a
+  cut inside the last block) is step 1 alone, without the orphan list. Steps 2 and 3 remove unwritten
+  extents past the end too. The one intermediate a crash may show besides before and after: the
+  zeroed tail written home and step 1's commit lost — the old `size` over a last block whose bytes from
+  `new` on are zero. Mount's processing of a truncation runs steps 2 and 3 exactly as the call would, so
+  it ends in the same image. Only a regular file is truncated.
 
 ### `fallocate` (mode 0, `FALLOC_FL_KEEP_SIZE`, `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`)
 
@@ -1369,6 +1416,12 @@ torn, some sectors of each) — the price of data=ordered over data=journal.
   leaves the range partly freed (reading as zeros) and partly still mapped (reading as the old bytes).
   The filesystem is consistent either way — every step is a transaction — and a call that never
   returned promised nothing about its range.
+- (Stage 6.) A length of 0 is `EINVAL`; a range reaching past 16 TiB is `EFBIG`. Preallocation sets
+  `ctime`, and `mtime` with the size; out of space it answers `ENOSPC`, keeping the chunks before (and
+  what the failing chunk had mapped). A punch is not clipped to `size`: it removes whatever its range
+  maps, unwritten blocks past the end included, and sets `mtime` and `ctime` even over a range that is
+  a hole already. A punch inside one block only zeroes bytes. Since steps remove from the end of the
+  range down, a crash part-way leaves the range's still-mapped whole blocks a prefix of it.
 
 ### `fsync`, `fdatasync`, `sync`
 
@@ -1380,6 +1433,10 @@ torn, some sectors of each) — the price of data=ordered over data=journal.
   inode's mapping (not only times).
 - **`fsync` of a directory**: commits the transaction holding its last change.
 - **`sync`**: commit the running transaction and wait; checkpointing is not needed for durability.
+- (Stage 6.) "The inode's dirty data blocks" are the blocks it has written whose bytes a transaction
+  still holds: with no commit to force, `fsync` and `fdatasync` write those home themselves, then flush.
+  A new inode counts as a change of its size and mapping, so `fdatasync` of a file created in the
+  running transaction commits it.
 
 ### `chmod`, `chown`, `utimensat`, xattrs
 
@@ -1475,6 +1532,13 @@ and whoever serialises an inode into its inode-table block copies them from the 
 `orphans.lock` (rule 5, before `buffer.lock`); no other code writes them. Without this, an inode
 written back from a stale in-memory copy would silently drop a list link and leak every inode behind
 it.
+
+(Stage 6.) The package keeps no serialised copy at all: an inode's fields are read from and changed in
+its inode-table buffer, each change declared and made in place under the buffer's lock, touching only
+the fields it means to. So nothing writes back a stale copy, and `orphan_next`, `ORPHAN` and
+`orphan_head` are written only by the orphan list's add and remove, under `orphans.lock`. The file
+operations take `inode.lock` themselves (`LockId.Inode`, rank 3) and hold it across every handle of a
+split operation; `icache.lock` (a leaf) guards the in-memory inode table.
 
 ---
 
@@ -1600,7 +1664,10 @@ reserved inode's or a past-the-end bit is clear; a set bit on a bad slot is pass
 in a clear one its warning, each reported once); compare `free_blocks`, `free_inodes`, `directories`, both bitmap checksums, and the
 superblock's totals. Walk the orphan list: no cycle, every member allocated with `ORPHAN` set, no
 `ORPHAN` outside the list. With `-y`: rewrite bitmaps, counts and checksums; process the orphan list
-as mount would.
+as mount would. (Stage 6: the walk stops at the first bad link; a member reached twice is a cycle, one
+below `first_ino`, past the last inode, free or without `ORPHAN` a bad member. Pass 1's checks of the
+end of a file follow section 8 with its orphan exemption, and `links` 0 without `ORPHAN` is pass 1's
+too.)
 
 **Repaired automatically with `-y`**: bitmaps and counts and their checksums; link counts;
 `lost+found` reconnection (creating `/lost+found` if missing, reusing it otherwise); `parent` fields;
@@ -1755,6 +1822,12 @@ leaves the old filesystem working until stage 12 retires it.
   Counting starts after the test's own preparation (a mount, the transactions that build the state
   before), so every crash point is inside the operation; the tear mode is run with sector 0 alone, with
   every sector but 0, and with a seeded mask, and the reorder mode with two seeds.
+  (Stage 6: a block under an unwritten extent reads as zeros whatever it holds, so its bytes are not
+  part of the visible state. The image is judged after a mount, which finishes the orphan list; the
+  documented intermediates are an append's old last block left old or torn under the new size
+  (section 18, `write`), and an unaligned shrink's zeroed tail under the old size (`truncate`); a
+  punch, which keeps no list, is judged by its property — outside the range every byte as before,
+  inside each byte as before or zero, the still-mapped whole blocks a prefix of the range.)
 
 ### Stage 1 — Codecs and structures
 

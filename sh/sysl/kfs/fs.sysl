@@ -55,6 +55,9 @@ enum Corruption
     // A node of inode `ino`'s extent tree breaks a rule of section 9: `block` is the node's block, 0
     // for the root in the inode.
     Extent(ino: u64, block: u64, fault: NodeFault)
+    // The orphan list (section 16) reaches `ino`, which is out of range, free, without `ORPHAN`, or
+    // already on the list (a cycle).
+    OrphanList(ino: u64)
 
 // What is wrong with an extent-tree node (section 9).
 enum NodeFault
@@ -165,6 +168,12 @@ struct Fs[D: BlockDevice, P: Platform]
     private[kfs] buffers: Buf[Buffer]
     private[kfs] groups: Buf[GroupState]
     private[kfs] j: Journal
+    // The in-memory inodes (inode.sysl) and the first member of the orphan list as memory has it.
+    private[kfs] incore: Buf[InCore]
+    private[kfs] orphan_first: u64
+    // The `max` new extent-tree node blocks are written with: the capacity, or less on a test's RAM disk
+    // (section 9, "`max` may be smaller than the capacity").
+    node_max: u16
 
     // -- Buffers -------------------------------------------------------------------------------------
 
@@ -275,7 +284,25 @@ struct Fs[D: BlockDevice, P: Platform]
     write_access(*self, h: *Handle, id: usize) -> Result[unit, FsError] = declare_access(self, h, id)
 
     // Data block `b`'s new bytes, written home before `h`'s transaction is logged (data=ordered).
-    write_data(*self, h: *Handle, b: u64, bytes: []const u8) -> Result[unit, FsError] = add_data(self, h, b, bytes)
+    write_data(*self, h: *Handle, b: u64, bytes: []const u8) -> Result[unit, FsError] = add_data(self, h, b, bytes, DataOrder.Ordered)
+
+    // The same for a block `h`'s transaction maps itself: a new run, or an unwritten one it converts.
+    write_new_data(*self, h: *Handle, b: u64, bytes: []const u8) -> Result[unit, FsError] = add_data(self, h, b, bytes, DataOrder.Fresh)
+
+    // Data block `b`'s new bytes, written home only after `h`'s transaction has committed.
+    write_data_after(*self, h: *Handle, b: u64, bytes: []const u8) -> Result[unit, FsError] = add_data(self, h, b, bytes, DataOrder.After)
+
+    // Whether the running transaction maps data block `b` itself.
+    maps_fresh(*self, b: u64) -> bool = fresh_data(self, b)
+
+    // Data block `b`'s newest bytes into `out`: a transaction's ordered copy not yet written home, else
+    // the device's. True when they came from a transaction.
+    read_data(*self, b: u64, out: []u8) -> Result[bool, FsError] = newest_data(self, b, out)
+
+    // Whether transaction `seq` has not yet committed: it is the running one or the committing one.
+    uncommitted(self, seq: u64) -> bool
+        if seq == 0 then return false
+        (self.j.committing.live && seq >= self.j.committing.seq) || seq >= self.j.running.seq
 
     // A metadata block (an extent-tree node, a directory block, an xattr block) was freed in `h`: a
     // revoke record in its transaction (section 14, "Revocation"), so replay of an older copy cannot
@@ -372,6 +399,8 @@ struct Fs[D: BlockDevice, P: Platform]
     // Whether a transaction is committing, and the running transaction's open handles.
     committing(self) -> bool = self.j.committing.live
     open_handles(self) -> u32 = self.j.running.handles
+    // Handles opened since the mount.
+    handles_opened(self) -> u64 = self.j.opened
 
     // Unmount (section 18): commit, checkpoint everything, and write the superblock directly with exact
     // totals and `CLEAN`. An aborted filesystem writes `ERROR` directly instead; a read-only one writes
@@ -446,7 +475,8 @@ private set_state_directly[D: BlockDevice](dev: *D, set: u16, clear: u16, mounti
 // descriptors; refuse unknown incompat features; recover (section 15: replay, then a recorded `error`
 // becomes `ERROR`); read-only for unknown ro_compat features, `ERROR`, a device without flush, or a
 // log recovery could not replay; the totals from the descriptors; then, read-write only, clear `CLEAN`,
-// count the mount and stamp its time — the last direct write before transactions start.
+// count the mount and stamp its time — the last direct write before transactions start — and finish
+// the work the orphan list records.
 mount[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D, P], FsError]
     var m = open(dev)?
     if m.sb.feature_incompat != 0 then return Err(FsError.Open(OpenError.UnknownFeatures))
@@ -471,7 +501,13 @@ mount[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[Fs[D, P], FsError
         inodes += u64(d.free_inodes)
         groups.push(GroupState(buf(), 0, false, false))
     var p = plat
+    if !read_only then m.sb = set_state_directly(dev, 0, STATE_CLEAN, Some(p.now().sec))?
+    var fs = Fs(dev, p, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, new_journal(st, read_only, m.sb.max_transaction), buf(), 0, u16(EXTENT_NODE_SLOTS))
+    // Then the orphan list (section 16), in ordinary transactions. A list that breaks its rules aborts
+    // the journal: the filesystem is mounted read-only, and fsck repairs it.
     if !read_only
-        m.sb = set_state_directly(dev, 0, STATE_CLEAN, Some(p.now().sec))?
-        // The orphan list (section 16) is processed here, in ordinary transactions (stage 6).
-    Ok(Fs(dev, p, m.sb, m.geo, m.seed, Atomic(blocks), Atomic(inodes), buf(), groups, new_journal(st, read_only, m.sb.max_transaction)))
+        load_orphans(&fs) match
+            Ok(_) -> process_orphans(&fs)?
+            Err(FsError.Corrupt(_)) -> ()
+            Err(e) -> return Err(e)
+    Ok(fs)

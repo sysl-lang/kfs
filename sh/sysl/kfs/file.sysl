@@ -1,0 +1,482 @@
+module keel.kfs
+
+import sysl.buf.{Buf, buf}
+
+// Files (kfs/SPEC.md section 18): read; write and append in chunks; truncate both ways; fallocate's
+// preallocation and punch; fsync and fdatasync; delete. Over the inode layer (inode.sysl), the extent
+// tree (extent.sysl), the orphan list (orphan.sysl) and the journal.
+//
+// **Locks.** Every entry point takes the inode's lock (section 19) and holds it to the end, across every
+// handle a split operation opens — a write's chunks, a shrinking truncate's steps, a punch's, a
+// delete's — so nothing else changes the inode between two steps.
+//
+// **Data.** Every data block a call writes goes on its transaction's ordered list (`write_data`): the
+// bytes reach their home before the commit that changes the file, and until then a read finds them there
+// (`read_data`). So a new block's bytes are durable before the mapping that exposes them, and a
+// conversion of an unwritten extent commits after its data. Overwrites of written blocks go the same
+// way, which is more than section 18 asks of them and what lets `fdatasync` make a times-only change's
+// data durable without a commit: it writes the inode's pending blocks home itself.
+//
+// **Steps.** A write or a preallocation allocates at most `CHUNK_EXTENTS` extents per handle
+// (`C_WRITE_CHUNK`); a truncate, delete or punch step removes at most `STEP_EXTENTS`
+// (`C_TRUNCATE_STEP`, `C_PUNCH_STEP`). A shrinking truncate puts the inode on the orphan list in its
+// first transaction, with the new size and the zeroed tail, and takes it off in its last, so a crash in
+// between leaves the next mount to free the rest.
+
+// fallocate's modes (section 18): `Allocate` is mode 0, `KeepSize` is `FALLOC_FL_KEEP_SIZE`, and
+// `PunchHole` is `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`.
+enum Falloc
+    Allocate
+    KeepSize
+    PunchHole
+
+// How many blocks `size` bytes take: `ceil(size / 4096)`.
+blocks_for(size: u64) -> u64 = (size + u64(BLOCK_SIZE) - 1) / u64(BLOCK_SIZE)
+
+private smaller(a: u64, b: u64) -> u64 = if a < b then a else b
+
+private regular[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Inode, FsError]
+    val node = read_inode(fs, ino)?
+    if node.mode & S_IFMT != S_IFREG then return Err(FsError.Invalid)
+    Ok(node)
+
+private tree[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, uid: u32) -> ExtentTree = ExtentTree(ino, uid, fs.node_max)
+
+// The file's last mapped physical block, 0 when it maps none: where its next run is sought (section 17).
+private last_physical[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[u64, FsError]
+    last_extent(fs, ino)? match
+        Some(e) -> Ok(e.physical + u64(e.len) - 1)
+        None -> Ok(0)
+
+// -- read ---------------------------------------------------------------------------------------------
+
+// Read from regular file `ino` at `offset` into `out`; answers the bytes read, 0 at or past the end.
+// Holes and unwritten extents read as zeros. Under relatime (section 18) a read that asked for bytes
+// writes `atime` when it is older than `mtime` or `ctime`, or more than a day old.
+read[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, offset: u64, out: []u8) -> Result[usize, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = read_locked(fs, ino, offset, out)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private read_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, offset: u64, out: []u8) -> Result[usize, FsError]
+    val node = regular(fs, ino)?
+    if out.len == 0 then return Ok(0)
+    val n = if offset >= node.size then 0 else smaller(u64(out.len), node.size - offset)
+    var blk = block_buf()
+    var done: u64 = 0
+    while done < n
+        val p = offset + done
+        val off = usize(p % u64(BLOCK_SIZE))
+        val piece = usize(smaller(u64(BLOCK_SIZE - off), n - done))
+        val dst = out[usize(done)..<usize(done) + piece]
+        lookup(fs, ino, p / u64(BLOCK_SIZE))? match
+            Mapping.Mapped(b, _, false) ->
+                fs.read_data(b, blk.view())?
+                for k in 0..<piece
+                    dst[k] = blk[off + k]
+            _ ->
+                for k in 0..<piece
+                    dst[k] = 0
+        done += u64(piece)
+    touch_atime(fs, ino, node)?
+    Ok(usize(n))
+
+private touch_atime[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, node: Inode) -> Result[unit, FsError]
+    if fs.read_only() || fs.aborted() then return Ok(())
+    val now = fs.plat.now()
+    val stale = before(node.atime_sec, node.atime_nsec, node.mtime_sec, node.mtime_nsec) || before(node.atime_sec, node.atime_nsec, node.ctime_sec, node.ctime_nsec) || now.sec - node.atime_sec > 86400
+    if !stale then return Ok(())
+    var h = fs.start("atime", C_INODE)
+    val r = change_inode(fs, &h, ino, (n) -> set_atime(n, now))
+    fs.stop(&h)
+    r
+
+// -- write --------------------------------------------------------------------------------------------
+
+// Write `data` into regular file `ino` at `offset`, for a caller of uid `uid` (the reserve, and who keeps
+// set-user-ID); answers the bytes written. A write starting at or past 16 TiB answers `TooBig`, and one
+// reaching past it is cut there. A gap past the old end stays a hole. Out of space part-way, the write
+// answers what it wrote before (`NoSpace` when that is nothing).
+write[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, offset: u64, data: []const u8, uid: u32) -> Result[usize, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = write_locked(fs, ino, offset, data, uid)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+// Write `data` at the end of regular file `ino`: the size is read under the lock, so appends never
+// interleave.
+append[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, data: []const u8, uid: u32) -> Result[usize, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = regular(fs, ino) match
+        Ok(node) -> write_locked(fs, ino, node.size, data, uid)
+        Err(e) -> Err(e)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private write_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, offset: u64, data: []const u8, uid: u32) -> Result[usize, FsError]
+    regular(fs, ino)?
+    if data.len == 0 then return Ok(0)
+    if offset >= MAX_FILE_SIZE then return Err(FsError.TooBig)
+    val n = usize(smaller(u64(data.len), MAX_FILE_SIZE - offset))
+    var done: usize = 0
+    while done < n
+        val r = write_chunk(fs, ino, offset + u64(done), data[done..<n], uid)
+        r match
+            Ok(k) -> done += k
+            Err(FsError.NoSpace) -> return if done > 0 then Ok(done) else Err(FsError.NoSpace)
+            Err(FsError.TooBig) -> return if done > 0 then Ok(done) else Err(FsError.TooBig)
+            Err(e) -> return Err(e)
+    Ok(done)
+
+// One chunk in one handle: the bytes from `pos` on until the chunk's eighth allocation, or the end.
+private write_chunk[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, pos: u64, data: []const u8, uid: u32) -> Result[usize, FsError]
+    var h = fs.start("write", C_WRITE_CHUNK)
+    val r = chunk_in(fs, &h, ino, pos, data, uid)
+    fs.stop(&h)
+    r
+
+// Section 18's chunk: map the blocks — a hole gets a new run, an unwritten range is converted — and
+// copy the bytes in, a new or unwritten block starting from zeros; then the size, `mtime`, `ctime` and,
+// for a writer other than root, set-user-ID and set-group-ID cleared. Out of space or past the tree's
+// depth after some bytes, it stops there and answers them.
+private chunk_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, pos: u64, data: []const u8, uid: u32) -> Result[usize, FsError]
+    val t = tree(fs, ino, uid)
+    val size = read_inode(fs, ino)?.size
+    var last = last_physical(fs, ino)?
+    var made: u32 = 0
+    var mapped = false
+    var done: usize = 0
+    var stopped: Option[FsError] = None
+    var full = false
+    while done < data.len && stopped.is_none() && !full
+        val p = pos + u64(done)
+        val l = p / u64(BLOCK_SIZE)
+        val want = blocks_for(p % u64(BLOCK_SIZE) + u64(data.len - done))
+        lookup(fs, ino, l)? match
+            Mapping.Mapped(b, run, false) ->
+                done += put_run(fs, h, ino, b, smaller(u64(run), want), p, data[done..<data.len], false, size)?
+            _ if made == CHUNK_EXTENTS -> full = true
+            Mapping.Mapped(b, run, true) ->
+                val k = smaller(u64(run), want)
+                convert(fs, h, t, l, u32(k)) match
+                    Ok(_) ->
+                        done += put_run(fs, h, ino, b, k, p, data[done..<data.len], true, size)?
+                        made += 1
+                        mapped = true
+                    Err(e) -> stopped = Some(e)
+            Mapping.Hole ->
+                val gap = next_mapped(fs, ino, l)? - l
+                val ask = smaller(smaller(gap, want), u64(EXTENT_MAX_LEN))
+                alloc_blocks(fs, h, goal_for(fs, ino, last), u32(ask), uid) match
+                    Ok(run) ->
+                        insert(fs, h, t, Extent(l, run.len, run.first, false)) match
+                            Ok(_) ->
+                                done += put_run(fs, h, ino, run.first, u64(run.len), p, data[done..<data.len], true, size)?
+                                last = run.first + u64(run.len) - 1
+                                made += 1
+                                mapped = true
+                            Err(e) ->
+                                free_blocks(fs, h, run.first, run.len)?
+                                stopped = Some(e)
+                    Err(e) -> stopped = Some(e)
+        stopped match
+            Some(FsError.NoSpace) -> ()
+            Some(FsError.TooBig) -> ()
+            Some(e) -> return Err(e)
+            None -> ()
+    if done == 0
+        return stopped match
+            Some(e) -> Err(e)
+            None -> Err(FsError.Bug)
+    val reach = pos + u64(done)
+    val now = fs.plat.now()
+    val strip = uid != 0
+    change_inode(fs, h, ino, (n) ->
+        if reach > n.size then n.size = reach
+        set_mtime(n, now)
+        set_ctime(n, now)
+        if strip then n.mode = n.mode & ~(S_ISUID | S_ISGID))?
+    if mapped || reach > size then note_change(fs, ino, h.seq, true)
+    Ok(done)
+
+// Copy the bytes from `src` that fall in `k` blocks from physical `b` (logical block `p / 4096` on),
+// starting at byte `p % 4096` of the first; answers how many. `fresh` blocks — mapped by this chunk —
+// start from zeros, others from their newest bytes. `size` is the file's size before the chunk.
+private put_run[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, b: u64, k: u64, p: u64, src: []const u8, fresh: bool, size: u64) -> Result[usize, FsError]
+    val bs = u64(BLOCK_SIZE)
+    var used: usize = 0
+    var off = usize(p % bs)
+    var j: u64 = 0
+    while j < k && used < src.len
+        val piece = usize(smaller(bs - u64(off), u64(src.len - used)))
+        val past = (p / bs + j) * bs + u64(off + piece) > size
+        put_block(fs, h, ino, b + j, off, src[used..<used + piece], fresh, past)?
+        used += piece
+        off = 0
+        j += 1
+    Ok(used)
+
+// Write `bytes` at `off` in data block `b`. A block this transaction maps goes home before the commit,
+// as does an overwrite inside the file. A block mapped before it that the write extends past the end
+// of the file — the old last block — goes home after the commit (`write_data_after`): the bytes past
+// the committed size must not land before a commit covers them, or a crash would leave them in the
+// tail section 8 keeps zero.
+private put_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, b: u64, off: usize, bytes: []const u8, fresh: bool, past: bool) -> Result[unit, FsError]
+    var blk = block_buf()
+    if !fresh && !(off == 0 && bytes.len == BLOCK_SIZE) then fs.read_data(b, blk.view())?
+    for i in 0..<bytes.len
+        blk[off + i] = bytes[i]
+    if fresh || fs.maps_fresh(b)
+        fs.write_new_data(h, b, blk.view())?
+    else if past
+        fs.write_data_after(h, b, blk.view())?
+    else
+        fs.write_data(h, b, blk.view())?
+    note_dirty(fs, ino, b)
+    Ok(())
+
+// Zero bytes [from, to) of logical block `l`, as ordered data of `h`, when a written extent maps it (a
+// hole or an unwritten block reads as zeros already).
+private zero_in_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, l: u64, from: usize, to: usize) -> Result[unit, FsError]
+    lookup(fs, ino, l)? match
+        Mapping.Mapped(b, _, false) ->
+            var blk = block_buf()
+            fs.read_data(b, blk.view())?
+            for i in from..<to
+                blk[i] = 0
+            fs.write_data(h, b, blk.view())?
+            note_dirty(fs, ino, b)
+            Ok(())
+        _ -> Ok(())
+
+// -- truncate -----------------------------------------------------------------------------------------
+
+// Set regular file `ino`'s size (section 18, `truncate`). Growing is one transaction and leaves a hole.
+// Shrinking zeroes the tail of the new last block and sets the size in its first transaction — which
+// also puts the inode on the orphan list when blocks past the new end remain to be freed — then frees
+// them in steps and leaves the list in its last. The same size changes nothing; past 16 TiB is `TooBig`.
+truncate[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, size: u64, uid: u32) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = truncate_locked(fs, ino, size, uid)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private truncate_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, size: u64, uid: u32) -> Result[unit, FsError]
+    val node = regular(fs, ino)?
+    if size > MAX_FILE_SIZE then return Err(FsError.TooBig)
+    if size == node.size then return Ok(())
+    val now = fs.plat.now()
+    if size > node.size
+        var h = fs.start("truncate", C_INODE)
+        val r = resize(fs, &h, ino, size, now)
+        fs.stop(&h)
+        return r
+    val keep = blocks_for(size)
+    val remains = last_extent(fs, ino)? match
+        Some(e) -> e.logical + u64(e.len) > keep
+        None -> false
+    // An inode already on the list — open and unlinked — is there for its delete, which frees
+    // everything anyway: its truncation needs no entry of its own.
+    val listed = on_orphan_list(fs, ino)
+    var h = fs.start("truncate", C_INODE + C_SB)
+    val r = shrink_first(fs, &h, ino, size, now, remains && !listed)
+    fs.stop(&h)
+    r?
+    if !remains then return Ok(())
+    if listed then remove_steps(fs, ino, keep, LOGICAL_BLOCKS, C_TRUNCATE_STEP, "truncate", 0) else cut_from(fs, ino, keep, "truncate")
+
+private resize[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, size: u64, now: Time) -> Result[unit, FsError]
+    change_inode(fs, h, ino, (n) ->
+        n.size = size
+        set_mtime(n, now)
+        set_ctime(n, now))?
+    note_change(fs, ino, h.seq, true)
+    Ok(())
+
+// A shrink's first transaction: the zeroed tail (ordered data), the size and times, the orphan list.
+private shrink_first[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, size: u64, now: Time, orphan: bool) -> Result[unit, FsError]
+    val tail = usize(size % u64(BLOCK_SIZE))
+    if tail != 0 then zero_in_block(fs, h, ino, size / u64(BLOCK_SIZE), tail, BLOCK_SIZE)?
+    resize(fs, h, ino, size, now)?
+    if orphan then orphan_add(fs, h, ino)?
+    Ok(())
+
+// Free every block from logical block `keep` on in steps, then take the inode off the orphan list: the
+// rest of a shrinking truncate, at once or at the next mount.
+cut_from[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, keep: u64, op: string) -> Result[unit, FsError]
+    remove_steps(fs, ino, keep, LOGICAL_BLOCKS, C_TRUNCATE_STEP, op, 0)?
+    var h = fs.start(op, C_INODE + C_SB)
+    val r = orphan_remove(fs, &h, ino)
+    fs.stop(&h)
+    r
+
+// Unmap [a, b) in steps of at most STEP_EXTENTS extents, one handle of `credits` each, from the end down.
+private remove_steps[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, a: u64, b: u64, credits: u32, op: string, uid: u32) -> Result[unit, FsError]
+    var hi = b
+    while hi > a
+        var h = fs.start(op, credits)
+        val r = remove(fs, &h, tree(fs, ino, uid), a, hi, STEP_EXTENTS)
+        if r.is_ok() then note_change(fs, ino, h.seq, true)
+        fs.stop(&h)
+        hi = r?
+    Ok(())
+
+// -- fallocate ----------------------------------------------------------------------------------------
+
+// fallocate on regular file `ino` over [offset, offset + len) (section 18). `Allocate` and `KeepSize`
+// map every hole of the range as unwritten extents, in chunks as a write does; `Allocate` then sets the
+// size in the last chunk if the range reaches past it. `PunchHole` zeroes the partial blocks at the
+// edges and unmaps the whole blocks between in steps, keeping the size, past the end of the file too;
+// it uses no orphan list. A length of 0 is `Invalid`; past 16 TiB is `TooBig`.
+fallocate[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, mode: Falloc, offset: u64, len: u64, uid: u32) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = falloc_locked(fs, ino, mode, offset, len, uid)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private falloc_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, mode: Falloc, offset: u64, len: u64, uid: u32) -> Result[unit, FsError]
+    regular(fs, ino)?
+    if len == 0 then return Err(FsError.Invalid)
+    if offset >= MAX_FILE_SIZE || len > MAX_FILE_SIZE - offset then return Err(FsError.TooBig)
+    mode match
+        Falloc.PunchHole -> punch(fs, ino, offset, offset + len, uid)
+        Falloc.Allocate -> preallocate(fs, ino, offset, offset + len, true, uid)
+        Falloc.KeepSize -> preallocate(fs, ino, offset, offset + len, false, uid)
+
+private preallocate[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, from: u64, to: u64, sets_size: bool, uid: u32) -> Result[unit, FsError]
+    var l = from / u64(BLOCK_SIZE)
+    val stop_at = blocks_for(to)
+    loop
+        var h = fs.start("fallocate", C_WRITE_CHUNK)
+        val r = prealloc_step(fs, &h, ino, l, stop_at, to, sets_size, uid)
+        fs.stop(&h)
+        l = r?
+        if l >= stop_at then return Ok(())
+
+// One chunk, and in the last one the size and times.
+private prealloc_step[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, from: u64, stop_at: u64, to: u64, sets_size: bool, uid: u32) -> Result[u64, FsError]
+    val next = prealloc_chunk(fs, h, ino, from, stop_at, uid)?
+    if next >= stop_at then finish_prealloc(fs, h, ino, to, sets_size)?
+    Ok(next)
+
+// Map up to CHUNK_EXTENTS holes from logical block `l` toward `stop_at` as unwritten extents; answers
+// where the chunk stopped.
+private prealloc_chunk[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, from: u64, stop_at: u64, uid: u32) -> Result[u64, FsError]
+    val t = tree(fs, ino, uid)
+    var last = last_physical(fs, ino)?
+    var l = from
+    var made: u32 = 0
+    var full = false
+    while l < stop_at && !full
+        lookup(fs, ino, l)? match
+            Mapping.Mapped(_, run, _) -> l += smaller(u64(run), stop_at - l)
+            Mapping.Hole if made == CHUNK_EXTENTS -> full = true
+            Mapping.Hole ->
+                val gap = next_mapped(fs, ino, l)? - l
+                val ask = smaller(smaller(gap, stop_at - l), u64(EXTENT_MAX_LEN))
+                val run = alloc_blocks(fs, h, goal_for(fs, ino, last), u32(ask), uid)?
+                insert(fs, h, t, Extent(l, run.len, run.first, true)) match
+                    Ok(_) -> ()
+                    Err(e) ->
+                        free_blocks(fs, h, run.first, run.len)?
+                        return Err(e)
+                note_change(fs, ino, h.seq, true)
+                last = run.first + u64(run.len) - 1
+                l += u64(run.len)
+                made += 1
+    Ok(l)
+
+private finish_prealloc[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, to: u64, sets_size: bool) -> Result[unit, FsError]
+    val node = read_inode(fs, ino)?
+    val grows = sets_size && to > node.size
+    val now = fs.plat.now()
+    change_inode(fs, h, ino, (n) ->
+        if grows
+            n.size = to
+            set_mtime(n, now)
+        set_ctime(n, now))?
+    if grows then note_change(fs, ino, h.seq, true)
+    Ok(())
+
+// Punch [from, to): the edges zeroed as ordered data of the first step, which also sets `mtime` and
+// `ctime`; then the whole blocks unmapped in steps.
+private punch[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, from: u64, to: u64, uid: u32) -> Result[unit, FsError]
+    val bs = u64(BLOCK_SIZE)
+    val a = blocks_for(from)
+    val b = to / bs
+    val now = fs.plat.now()
+    var h = fs.start("punch", C_PUNCH_STEP)
+    val first = punch_first(fs, &h, ino, from, to, a, b, now, uid)
+    fs.stop(&h)
+    val hi = first?
+    if hi > a then remove_steps(fs, ino, a, hi, C_PUNCH_STEP, "punch", uid) else Ok(())
+
+private punch_first[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, from: u64, to: u64, a: u64, b: u64, now: Time, uid: u32) -> Result[u64, FsError]
+    val bs = u64(BLOCK_SIZE)
+    val head = usize(from % bs)
+    val tail = usize(to % bs)
+    if from / bs == (to - 1) / bs
+        if head != 0 || tail != 0 then zero_in_block(fs, h, ino, from / bs, head, usize((to - 1) % bs) + 1)?
+    else
+        if head != 0 then zero_in_block(fs, h, ino, from / bs, head, BLOCK_SIZE)?
+        if tail != 0 then zero_in_block(fs, h, ino, to / bs, 0, tail)?
+    change_inode(fs, h, ino, (n) ->
+        set_mtime(n, now)
+        set_ctime(n, now))?
+    if a >= b then return Ok(a)
+    val hi = remove(fs, h, tree(fs, ino, uid), a, b, STEP_EXTENTS)?
+    note_change(fs, ino, h.seq, true)
+    Ok(hi)
+
+// -- fsync, fdatasync ---------------------------------------------------------------------------------
+
+// Make inode `ino` durable (section 18): when a transaction that changed it has not committed, force the
+// commit (which writes its data first); otherwise write its pending data blocks home and flush.
+fsync[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError] = sync_file(fs, ino, false)
+
+// As `fsync`, but a commit is forced only for a change of the size or the mapping, not of times alone.
+fdatasync[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError] = sync_file(fs, ino, true)
+
+private sync_file[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, data_only: bool) -> Result[unit, FsError]
+    fs.plat.lock(LockId.Inode(ino))
+    val r = sync_locked(fs, ino, data_only)
+    fs.plat.unlock(LockId.Inode(ino))
+    r
+
+private sync_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, data_only: bool) -> Result[unit, FsError]
+    slot_of(fs, ino)?
+    val i = core_of(fs, ino)
+    val c = fs.incore[i]
+    val seq = if data_only then c.map_seq else c.meta_seq
+    if fs.uncommitted(seq)
+        fs.commit()?
+    else
+        var blk = block_buf()
+        for b in c.dirty.view()
+            if fs.read_data(b, blk.view())? then fs.dev.write(b, blk.view())?
+        fs.dev.flush()?
+    fs.incore[i].dirty.clear()
+    Ok(())
+
+// -- delete -------------------------------------------------------------------------------------------
+
+// Free inode `ino`, which has no links and is on the orphan list (section 18, "Delete"): truncate it to
+// nothing in steps, then one transaction frees its xattr block (with its revoke), takes it off the list
+// and frees the slot. A crash at any step leaves it on the list for the next mount. Under its lock.
+delete_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[unit, FsError]
+    val node = read_inode(fs, ino)?
+    if has_tree(node.mode, node.flags) then remove_steps(fs, ino, 0, LOGICAL_BLOCKS, C_TRUNCATE_STEP, "delete", 0)?
+    var h = fs.start("delete", C_DELETE_LAST)
+    val r = delete_last(fs, &h, ino, node.xattr_block)
+    fs.stop(&h)
+    r?
+    forget_core(fs, ino)
+    Ok(())
+
+private delete_last[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, xattr: u64) -> Result[unit, FsError]
+    orphan_remove(fs, h, ino)?
+    if xattr != 0
+        free_blocks(fs, h, xattr, 1)?
+        fs.revoke(h, xattr)
+    free_inode(fs, h, ino)
