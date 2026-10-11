@@ -189,6 +189,16 @@ crash_append_chunk()
         2)
     assert(t.before > 0 && t.after > 0 && t.middle > 0)
 
+// Inode `ino`'s blocks as the committed image has them: recovered, and not mounted, so nothing more is
+// processed.
+private blocks_recovered(cd: *CrashDevice[RamDevice], ino: u64) -> u64
+    val _ = recovered_head(cd)
+    val m = open(cd).unwrap()
+    val loc = m.inode_location(ino).unwrap()
+    val b = raw(cd, loc.block)
+    val node: *Inode = at(b.view(), loc.offset)
+    node.blocks
+
 // Logical block `l`'s physical block on the image, mounted afresh.
 private phys_of(cd: *CrashDevice[RamDevice], ino: u64, l: u64) -> u64
     var fs = mounted(cd)
@@ -370,6 +380,9 @@ crash_mount_processing()
     cd.mark()
     var states: Buf[Buf[u64]] = buf()
     states.push(outcome(&base, &cd, op, CrashMode.Off, (c) -> state_of(c, 0)))
+    // The clean run finished both: the list is empty, the deleted inode free, the cut file cut.
+    assert(outcome(&base, &cd, op, CrashMode.Off, (c) -> recovered_head(c)) == 0)
+    assert(outcome(&base, &cd, op, CrashMode.Off, (c) -> blocks_recovered(c, ino)) == 2)
     val t = every_crash("mount's orphan processing", &base, op, (c) -> exact(states, c))
     assert(t.before == t.points && t.orphaned > 0)
     assert(ino != 0)
