@@ -144,8 +144,7 @@ private unmap(fs: *HostFs, t: ExtentTree, a: u64, b: u64) -> Result[u64, FsError
         var h = fs.start("punch", C_EXT + C_GROUP)
         val r = remove(fs, &h, t, a, hi, 1)
         fs.stop(&h)
-        // FINDINGS 77: the `Err` arm cannot take the `u64` from the `Ok` arm.
-        val next: u64 = r match
+        val next = r match
             Ok(n) -> n
             Err(e) -> return Err(e)
         if next <= a then return Ok(a)
