@@ -2223,6 +2223,42 @@ four directories at once, then a host `fsck.kfs` of the second image is clean);
 `keel: kfs replayed <n> transactions` on a boot that follows one ended on purpose after a commit and
 before its checkpoint, with the files present and the host `fsck.kfs` clean.
 
+(Stage 11, as built.) **The disks.** `boot-test.sh` attaches three: the old filesystem's, the 32 MiB KFS
+image of the fsroot (8192 blocks, 4 groups, a 1024-block journal), and a 16 MiB KFS image on a drive
+with its write cache off and `config-wce=off`, which offers no `VIRTIO_BLK_F_FLUSH` and so mounts
+read-only (section 2). The driver finds them in slot order (QEMU fills the slots from 31 down, so the
+script lists them in reverse), each with its own interrupt, and moves up to a 4 KiB block per request.
+
+**Making section 2 observable.** QEMU's disk is a host file that keeps every write, so on QEMU a
+missing flush could never be seen. The kernel's KFS device therefore carries the disk's volatile cache
+itself: a write lands in a cache of frames, a read sees it there first, and `flush` writes everything
+cached to the disk (eight sectors per block) and then sends `VIRTIO_BLK_T_FLUSH`. A power cut discards
+the cache: what survives is exactly what the flushes made durable — the subset rule 2 permits that loses
+the most.
+
+**The power cut, and the replay boot.** The pair of boots the old filesystem already uses is the pair:
+boot 1 mounts the fresh image (replaying 0), runs the four-thread test, then — the commit thread
+stopped, commits inline — makes `/replay/target` and fills the rest of its inode-table block with
+`/replay/fill<n>`, checkpoints everything, commits four transactions (`/replay/r0`-`r3`, one file each),
+checkpoints the first, changes the target's mode in a transaction no commit covers, lets the cache trim,
+and cuts the power: the log holds three committed transactions and nothing of the fourth change reached
+the disk. After QEMU exits, `fsck.kfs -n` (which replays a log in memory) must say it replayed 3 and
+find the image clean. Boot 2's mount replays the three; the four files must be whole and the target's
+mode 0644; it removes `/replay`, runs the four-thread test again and unmounts, after which `fsck.kfs -n`
+is clean with an empty log and the file each thread kept reads back through `kfsdump get`.
+
+**Sharing the package's state between cores** needed its tables reached without copies — see
+`table.sysl` and the kernel platform's notes (`kernel/keel/kfs/`): indexing a `Buf` of records copies a
+record, and copying retains its counted fields with ordinary, non-atomic counts. The buffer and inode
+tables are `Table`s whose records never move; a buffer's bytes are a raw address. **The caches' rules**:
+a buffer or an inode record is dropped only when no running operation can hold its index — each lookup
+stamps the record with the platform's clock of operations (`Platform.stamp`), and only a record stamped
+before the oldest running operation began goes (`Fs.drop_clean`, `drop_idle_core`); a buffer only when
+clean (neither pinned nor waiting for its checkpoint write), which the cache asks the commit thread for
+when dirty buffers hold it over its target; an inode record only when idle (no holder, off the orphan
+list, no data an `fsync` has not covered, everything that changed it committed). `Fs.commit_through`
+and `sync` wait for the commit thread where there is one, instead of committing beside it.
+
 ### Stage 12 — The switch
 
 Builds: keel's file calls (`openat`, `read`/`write`/`pread64`/`readv`/`writev`, `lseek`,

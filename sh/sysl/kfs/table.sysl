@@ -45,7 +45,9 @@ struct Table[T]
         if n >= self.limit then return None
         val k = n / CHUNK
         if n % CHUNK == 0
-            val chunk = buf_with_capacity(CHUNK, v)
+            // A table smaller than a chunk takes only the room it may come to.
+            val room = if self.limit - n < CHUNK then self.limit - n else CHUNK
+            val chunk = buf_with_capacity(room, v)
             chunk.push(v)
             self.chunks[k] = as_mut_ptr(chunk.view())
             self.owners.push(chunk)
@@ -54,8 +56,10 @@ struct Table[T]
         self.count = n + 1
         Some(n)
 
-private const CHUNK: usize = 1024
-private const CHUNKS: usize = 64
+// Few chunks of many records, so a `Table` — and the `Fs` holding three — stays small: an unoptimized
+// build copies an `Fs` into the frame of every function that builds one.
+private const CHUNK: usize = 4096
+private const CHUNKS: usize = 16
 
 // The most records a table holds: 65,536.
 const TABLE_MAX: usize = CHUNK * CHUNKS
