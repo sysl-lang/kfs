@@ -292,15 +292,19 @@ struct Fs[D: BlockDevice, P: Platform]
         *self.buffers.at(id) = empty_slot()
         self.plat.unlock(LockId.Cache)
 
+    // The record accessors take the filesystem by address. Their argument is often the call that made
+    // the record (`fs.bytes(fs.buffer(b)?)`, `fs.core(core_of(fs, ino))`), and a receiver taken by value
+    // is copied before its arguments run, so the copy's table would not hold the record yet.
+
     // Buffer `id`'s record.
-    private[kfs] slot(self, id: usize) -> *Buffer = self.buffers.at(id)
+    private[kfs] slot(*self, id: usize) -> *Buffer = self.buffers.at(id)
 
     // A buffer's block number and bytes. The bytes are read and written under the buffer's lock.
-    block_of(self, id: usize) -> u64 = self.buffers.at(id).block
-    bytes(self, id: usize) -> []u8 = self.buffers.at(id).data[0..<BLOCK_SIZE]
+    block_of(*self, id: usize) -> u64 = self.buffers.at(id).block
+    bytes(*self, id: usize) -> []u8 = self.buffers.at(id).data[0..<BLOCK_SIZE]
 
     // Whether buffer `id` is pinned by an uncommitted transaction.
-    pinned(self, id: usize) -> bool = self.buffers.at(id).pinned()
+    pinned(*self, id: usize) -> bool = self.buffers.at(id).pinned()
 
     // How many slots the buffer table has, and how many hold a buffer.
     slots(self) -> usize = self.buffers.len()
@@ -311,8 +315,8 @@ struct Fs[D: BlockDevice, P: Platform]
         n
 
     // Whether slot `id` holds a buffer, and when it was last looked up.
-    holds(self, id: usize) -> bool = self.buffers.at(id).valid
-    stamped(self, id: usize) -> u64 = self.buffers.at(id).used
+    holds(*self, id: usize) -> bool = self.buffers.at(id).valid
+    stamped(*self, id: usize) -> u64 = self.buffers.at(id).used
 
     // Evict buffer `id`: refused (false) while it is pinned; a committed buffer not yet checkpointed is
     // written home first (a checkpoint write, section 14). Call it only where no id is held across the
@@ -591,13 +595,13 @@ struct Fs[D: BlockDevice, P: Platform]
         InodeLoc(self.geo.inode_table(self.inode_group(ino)) + i / 16, usize(i % 16) * INODE_SIZE)
 
     // Blocks pending free in group `g`.
-    pending_in(self, g: u32) -> u32 = self.groups.at(usize(g)).pending_blocks
+    pending_in(*self, g: u32) -> u32 = self.groups.at(usize(g)).pending_blocks
 
     // Group `g`'s record, under its lock.
-    private[kfs] group(self, g: u32) -> *GroupState = self.groups.at(usize(g))
+    private[kfs] group(*self, g: u32) -> *GroupState = self.groups.at(usize(g))
 
     // In-memory inode `i`'s record (inode.sysl).
-    private[kfs] core(self, i: usize) -> *InCore = self.incore.at(i)
+    private[kfs] core(*self, i: usize) -> *InCore = self.incore.at(i)
 
 // Set bits `set` and clear bits `clear` of the superblock's `state` on the disk, directly, and flush;
 // everything else in block 1 stays as it is there. Only while the log is empty (section 5).
