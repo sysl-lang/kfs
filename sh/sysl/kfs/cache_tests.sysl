@@ -28,24 +28,25 @@ table_records_never_move()
     var first: Buf[usize] = buf()
     for k in 0..<3000u64
         assert_eq(t.add(Rec(k, buf())).unwrap(), usize(k))
-        if k < 3 || k == 1023 || k == 1024 then first.push(usize(t.at(usize(k))))
+        if k < 3 || k == 1023 || k == 1024 then first.push(usize(&t[usize(k)]))
     assert_eq(t.len(), 3000)
     // The records the first chunk and the start of the second held are where they were.
-    assert_eq(first[0], usize(t.at(0)))
-    assert_eq(first[1], usize(t.at(1)))
-    assert_eq(first[2], usize(t.at(2)))
-    assert_eq(first[3], usize(t.at(1023)))
-    assert_eq(first[4], usize(t.at(1024)))
+    assert_eq(first[0], usize(&t[0]))
+    assert_eq(first[1], usize(&t[1]))
+    assert_eq(first[2], usize(&t[2]))
+    assert_eq(first[3], usize(&t[1023]))
+    assert_eq(first[4], usize(&t[1024]))
     for k in 0..<t.len()
-        assert_eq(t.at(k).n, u64(k))
-    // Writing through an address changes the record, and replacing a whole record works through it.
-    t.at(7).n = 70
-    t.at(7).tag.push(1)
-    assert_eq(t.at(7).n, 70)
-    assert_eq(t.at(7).tag.len(), 1)
-    *t.at(7) = Rec(71, buf())
-    assert_eq(t.at(7).n, 71)
-    assert_eq(t.at(7).tag.len(), 0)
+        assert_eq(t[k].n, u64(k))
+    // A subscript is the record in place: writing a field changes the record, and a whole record is
+    // replaced by assigning to it.
+    t[7].n = 70
+    t[7].tag.push(1)
+    assert_eq(t[7].n, 70)
+    assert_eq(t[7].tag.len(), 1)
+    t[7] = Rec(71, buf())
+    assert_eq(t[7].n, 71)
+    assert_eq(t[7].tag.len(), 0)
 
 @test("a table with a limit takes that many records and refuses the next; past TABLE_MAX a limit is TABLE_MAX")
 table_limit()

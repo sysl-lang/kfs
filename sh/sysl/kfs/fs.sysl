@@ -262,17 +262,16 @@ struct Fs[D: BlockDevice, P: Platform]
     // A free slot for `bf`, or a new one; None when the table is full. Under the cache lock.
     private place(*self, bf: Buffer) -> Option[usize]
         for i in 0..<self.buffers.len()
-            val s = self.buffers.at(i)
+            val s = &self.buffers[i]
             if !s.valid
                 *s = bf
                 return Some(i)
         self.buffers.add(bf)
 
-    // The buffer holding `b`, stamped `now`. Under the cache lock. By address: a method taking the
-    // filesystem by value is handed a copy of it, which retains every counted field it holds.
+    // The buffer holding `b`, stamped `now`. Under the cache lock.
     private cached(*self, b: u64, now: u64) -> Option[usize]
         for i in 0..<self.buffers.len()
-            val s = self.buffers.at(i)
+            val s = &self.buffers[i]
             if s.valid && s.block == b
                 if now > s.used then s.used = now
                 return Some(i)
@@ -289,7 +288,7 @@ struct Fs[D: BlockDevice, P: Platform]
     // Drop buffer `id` from the cache. Its id may then name another block.
     private[kfs] forget(*self, id: usize)
         self.plat.lock(LockId.Cache)
-        *self.buffers.at(id) = empty_slot()
+        self.buffers[id] = empty_slot()
         self.plat.unlock(LockId.Cache)
 
     // The record accessors take the filesystem by address. Their argument is often the call that made
@@ -297,32 +296,32 @@ struct Fs[D: BlockDevice, P: Platform]
     // is copied before its arguments run, so the copy's table would not hold the record yet.
 
     // Buffer `id`'s record.
-    private[kfs] slot(*self, id: usize) -> *Buffer = self.buffers.at(id)
+    private[kfs] slot(*self, id: usize) -> *Buffer = &self.buffers[id]
 
     // A buffer's block number and bytes. The bytes are read and written under the buffer's lock.
-    block_of(*self, id: usize) -> u64 = self.buffers.at(id).block
-    bytes(*self, id: usize) -> []u8 = self.buffers.at(id).data[0..<BLOCK_SIZE]
+    block_of(*self, id: usize) -> u64 = self.buffers[id].block
+    bytes(*self, id: usize) -> []u8 = self.buffers[id].data[0..<BLOCK_SIZE]
 
     // Whether buffer `id` is pinned by an uncommitted transaction.
-    pinned(*self, id: usize) -> bool = self.buffers.at(id).pinned()
+    pinned(*self, id: usize) -> bool = self.buffers[id].pinned()
 
     // How many slots the buffer table has, and how many hold a buffer.
     slots(self) -> usize = self.buffers.len()
     cached_count(self) -> usize
         var n: usize = 0
         for i in 0..<self.buffers.len()
-            if self.buffers.at(i).valid then n += 1
+            if self.buffers[i].valid then n += 1
         n
 
     // Whether slot `id` holds a buffer, and when it was last looked up.
-    holds(*self, id: usize) -> bool = self.buffers.at(id).valid
-    stamped(*self, id: usize) -> u64 = self.buffers.at(id).used
+    holds(*self, id: usize) -> bool = self.buffers[id].valid
+    stamped(*self, id: usize) -> u64 = self.buffers[id].used
 
     // Evict buffer `id`: refused (false) while it is pinned; a committed buffer not yet checkpointed is
     // written home first (a checkpoint write, section 14). Call it only where no id is held across the
     // call, since the slot is reused: on one thread. Several cores use `drop_clean`.
     evict(*self, id: usize) -> Result[bool, FsError]
-        val s = self.buffers.at(id)
+        val s = &self.buffers[id]
         val b = s.block
         self.plat.lock(LockId.Buffer(b))
         self.plat.lock(LockId.Journal)
@@ -355,7 +354,7 @@ struct Fs[D: BlockDevice, P: Platform]
     // lookup takes too, so a lookup either finds the buffer before it goes or reads the block again.
     drop_clean(*self, id: usize, before: u64) -> bool
         self.plat.lock(LockId.Cache)
-        val s = self.buffers.at(id)
+        val s = &self.buffers[id]
         val gone = s.valid && s.clean() && s.used < before
         if gone then *s = empty_slot()
         self.plat.unlock(LockId.Cache)
@@ -374,7 +373,7 @@ struct Fs[D: BlockDevice, P: Platform]
             var victim: Option[usize] = None
             var oldest = before
             for i in 0..<self.buffers.len()
-                val s = self.buffers.at(i)
+                val s = &self.buffers[i]
                 if s.valid && s.clean() && s.used < oldest
                     oldest = s.used
                     victim = Some(i)
@@ -391,7 +390,7 @@ struct Fs[D: BlockDevice, P: Platform]
         var pinned: usize = 0
         var dirty: usize = 0
         for i in 0..<self.buffers.len()
-            val s = self.buffers.at(i)
+            val s = &self.buffers[i]
             if s.valid
                 if s.pinned() then pinned += 1 elif s.cp != 0 then dirty += 1 else clean += 1
         (clean, pinned, dirty)
@@ -595,13 +594,13 @@ struct Fs[D: BlockDevice, P: Platform]
         InodeLoc(self.geo.inode_table(self.inode_group(ino)) + i / 16, usize(i % 16) * INODE_SIZE)
 
     // Blocks pending free in group `g`.
-    pending_in(*self, g: u32) -> u32 = self.groups.at(usize(g)).pending_blocks
+    pending_in(*self, g: u32) -> u32 = self.groups[usize(g)].pending_blocks
 
     // Group `g`'s record, under its lock.
-    private[kfs] group(*self, g: u32) -> *GroupState = self.groups.at(usize(g))
+    private[kfs] group(*self, g: u32) -> *GroupState = &self.groups[usize(g)]
 
     // In-memory inode `i`'s record (inode.sysl).
-    private[kfs] core(*self, i: usize) -> *InCore = self.incore.at(i)
+    private[kfs] core(*self, i: usize) -> *InCore = &self.incore[i]
 
 // Set bits `set` and clear bits `clear` of the superblock's `state` on the disk, directly, and flush;
 // everything else in block 1 stays as it is there. Only while the log is empty (section 5).

@@ -6,22 +6,17 @@ import sysl.slices.as_mut_ptr
 // A table of records that several cores read and write at once, each record under the lock that guards
 // it (kfs/SPEC.md section 19): the buffer cache, the in-memory inodes, the groups.
 //
-// **Why not a plain `Buf[T]`.** Indexing a `Buf` answers a copy of the element, and copying a record that
-// holds a counted value — a buffer's frozen copy, an inode's list of dirty blocks — retains that value and
-// releases it again. The count is an ordinary integer, not an atomic one, so two cores reading
-// `buffers[id].block` at once, under two different locks, can lose an update to the count of a field
-// neither of them asked for and free it while it is still in use. `view()` is worse: it retains the
-// table's whole storage, one count every core shares. And a `Buf` that grows moves its elements, under
-// the feet of a core reading one. (FINDINGS.md 79 has the measurements.)
+// **`t[i]` is the record in place**, as a `Buf` element is: reading a field through it is a load and
+// writing one is a store, so the only counts touched are those of a counted field itself, when it is read
+// whole or replaced — and that happens under the lock guarding the record. A copy of a record would
+// retain every counted field it holds (a buffer's frozen copy, an inode's list of dirty blocks) with an
+// ordinary, non-atomic count, which two cores reading one record under two different locks would race on
+// (FINDINGS.md 79). Assigning a whole record (`t[i] = r`) releases the old one and retains the new.
 //
-// **What this does instead.** `at(i)` answers the record's address. Reading a field through it is a load
-// and writing one is a store, so the only counts touched are those of a counted field itself, when it is
-// read whole or replaced — and that happens under the lock guarding the record. Assigning a whole record
-// through the address releases the old one and retains the new, as assigning a `Buf` element does.
-//
-// **Records never move.** They live in chunks of CHUNK, each chunk's room taken whole when it is made,
-// so an address from `at` stays good for the table's life while records are added beside it. `add` is
-// called under the lock that guards the table (the cache's, the inode table's); `at` needs none.
+// **Why not a plain `Buf[T]`: records never move.** A `Buf` that grows moves its elements under the feet
+// of a core reading one. Here they live in chunks of CHUNK, each chunk's room taken whole when it is made,
+// so an address `&t[i]` stays good for the table's life while records are added beside it. `add` is
+// called under the lock that guards the table (the cache's, the inode table's); indexing needs none.
 struct Table[T]
     private chunks: [CHUNKS]*T
     private owners: Buf[Buf[T]]
@@ -33,11 +28,6 @@ struct Table[T]
 
     // How many records the table may come to.
     room(self) -> usize = self.limit
-
-    // Record `i`'s address. An index past the end is a bug in KFS.
-    at(self, i: usize) -> *T
-        if i >= self.count then panic("keel.kfs: a table index past its records")
-        &self.chunks[i / CHUNK][i % CHUNK]
 
     // Add `v` as a new record and answer its index; None when the table is at its limit.
     add(*self, v: T) -> Option[usize]
@@ -55,6 +45,13 @@ struct Table[T]
             self.owners[k].push(v)
         self.count = n + 1
         Some(n)
+
+// `t[i]` is record `i` in place: a field read through it is a load, a field written a store, and the
+// record itself is never copied. An index past the end is a bug in KFS.
+impl[T] IndexPlace[usize, T] for Table[T]
+    index_place(*self, i: usize) -> *T
+        if i >= self.count then panic("keel.kfs: a table index past its records")
+        &self.chunks[i / CHUNK][i % CHUNK]
 
 // Few chunks of many records, so a `Table` — and the `Fs` holding three — stays small: an unoptimized
 // build copies an `Fs` into the frame of every function that builds one.

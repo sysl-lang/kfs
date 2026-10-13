@@ -1593,8 +1593,8 @@ takes no inode lock, so a step waiting for a commit cannot deadlock against it.
 
 **`orphan_next` and `ORPHAN` belong to `orphans.lock`, not to the inode's lock.** Removing an inode
 from the list rewrites its *predecessor's* `orphan_next`, an inode some other core may be changing
-under its own lock at that moment. So both fields live in the in-memory list, not the in-memory inode,
-and whoever serialises an inode into its inode-table block copies them from the list under
+under its own lock at that moment. So both fields, and the in-memory list's links, belong to the list's
+lock even where they are stored in the in-memory inode record, and whoever serialises an inode into its inode-table block copies them from the list under
 `orphans.lock` (rule 5, before `buffer.lock`); no other code writes them. Without this, an inode
 written back from a stale in-memory copy would silently drop a list link and leak every inode behind
 it.
@@ -1605,6 +1605,15 @@ the fields it means to. So nothing writes back a stale copy, and `orphan_next`, 
 `orphan_head` are written only by the orphan list's add and remove, under `orphans.lock`. The file
 operations take `inode.lock` themselves (`LockId.Inode`, rank 3) and hold it across every handle of a
 split operation; `icache.lock` (a leaf) guards the in-memory inode table.
+
+**Locks are named, not wrapped around records.** One record's fields divide by owner: an in-memory
+inode's number and stamp belong to `icache.lock`, its orphan links to `orphans.lock`, its open count and
+dirty list to its `inode.lock`; a buffer's block number and stamp to `cache.lock`, its bytes to its
+`buffer.lock`, its journal fields to that lock and `journal.lock` together. And most locks guard a
+protocol over data that lives elsewhere: `inode.lock` the inode's fields, which are bytes of an
+inode-table buffer, `group[g].lock` the bitmap buffers. So the package names a lock (`LockId`) and the
+platform keeps it, rather than storing each record beside one lock that would own all of it; a lock for
+each of 2^64 blocks costs nothing until it is taken.
 
 (Stage 8.) The namespace operations name rules 1 and 2 too: `LockId.Rename` and `LockId.Dir(ino)`, the
 latter the same `inode.lock` as `LockId.Inode(ino)`, named for the rule it is taken under. A rename takes
