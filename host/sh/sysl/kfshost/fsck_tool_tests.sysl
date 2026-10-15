@@ -1,8 +1,8 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @tests
 @requires(os)
 
-import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, INODE_SIZE, STATE_ERROR, Superblock, at, block_buf, open, seal_superblock}
+import sh.sysl.kfs.{BLOCK_SIZE, BlockDevice, INODE_SIZE, STATE_ERROR, Superblock, at, block_buf, open, seal_superblock}
 import sysl.buf.{Buf, buf}
 import sysl.fs
 import sysl.text.Search

@@ -1,8 +1,8 @@
-// mkfs.kfs: format a disk image as a KFS filesystem (kfs/SPEC.md). Built to scratch/mkfs.kfs.
+// mkfs.kfs: format a disk image as a KFS filesystem (SPEC.md).
 
 package {
   name    = "mkfs-kfs"
-  version = "0.0.1"
+  version = "0.1.0"
 }
 
 dependencies {

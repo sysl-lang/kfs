@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // The constants and limits of kfs/SPEC.md section 3, and the magic numbers and flag bits of the
 // structures that follow it.

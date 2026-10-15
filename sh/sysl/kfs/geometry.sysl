@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // Where everything goes: the group arithmetic of kfs/SPEC.md section 4. `geometry` chooses the shape of a
 // filesystem from its size and the formatter's options (and refuses sizes that cannot hold one);

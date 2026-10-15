@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // CRC32C (Castagnoli, reflected polynomial 0x82F63B78), table-driven, as kfs/SPEC.md section 2 says.
 //

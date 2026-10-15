@@ -1,9 +1,9 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @requires(os)
 
-import kfs.keel.kfs.{BlockDevice, Caller, DeviceError, DeviceNumbers, Fs, FsError, HostPlatform, ROOT_INO}
-import kfs.keel.kfs.{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG}
-import kfs.keel.kfs.{create, errno, host_platform, lookup_name, mkdir, mknod, mount, no_change, read, setattr, stat, symlink, truncate, unlink, write}
+import sh.sysl.kfs.{BlockDevice, Caller, DeviceError, DeviceNumbers, Fs, FsError, HostPlatform, ROOT_INO}
+import sh.sysl.kfs.{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG}
+import sh.sysl.kfs.{create, errno, host_platform, lookup_name, mkdir, mknod, mount, no_change, read, setattr, stat, symlink, truncate, unlink, write}
 import sysl.buf.{Buf, buf}
 import sysl.fs
 import sysl.text.{parse_long, parse_long_base}

@@ -2,10 +2,10 @@
 //
 //   mkfs.kfs <image> <blocks> [-i bytes-per-inode] [-m reserved-percent] [-g blocks-per-group] [-j journal-blocks]
 //
-// The image is created (or emptied) at <blocks> 4 KiB blocks and formatted: the defaults of kfs/SPEC.md
+// The image is created (or emptied) at <blocks> 4 KiB blocks and formatted: the defaults of SPEC.md
 // section 4 unless an option says otherwise. -g and -j exist for tests.
 
-import kfshost.keel.kfshost.{host_entropy, host_now, run_mkfs}
+import sh.sysl.kfshost.{host_entropy, host_now, run_mkfs}
 
 main(args: []string)
     val entropy = host_entropy() match

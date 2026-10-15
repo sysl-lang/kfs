@@ -1,8 +1,8 @@
-// fsck.kfs: check and repair a KFS disk image (kfs/SPEC.md section 23). Built to scratch/fsck.kfs.
+// fsck.kfs: check and repair a KFS disk image (SPEC.md section 23).
 
 package {
   name    = "fsck-kfs"
-  version = "0.0.1"
+  version = "0.1.0"
 }
 
 dependencies {

@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // Bit access to a bitmap block (kfs/SPEC.md section 7): bit `i` is bit `i % 8` of byte `i / 8`.
 

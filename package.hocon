@@ -1,8 +1,14 @@
-// KFS, keel's filesystem (kfs/SPEC.md): the format and every algorithm over it. The same source is
-// compiled for aarch64-freestanding inside the kernel and for the host inside the tools and the tests,
-// so nothing here may need an operating system, a float, or an allocator beyond `Buf`.
+// KFS, a journaled filesystem (SPEC.md): the format and every algorithm over it. The same source is
+// compiled for aarch64-freestanding inside keel's kernel and for the host inside the tools and the
+// tests, so nothing here may need an operating system, a float, or an allocator beyond `Buf`.
+//
+// The workspace around the package:
+//   host                                    kfshost: the image-file block device, entropy and clock
+//   tools/mkfs-kfs, tools/kfsdump, tools/fsck-kfs   the host programs mkfs.kfs, kfsdump, fsck.kfs
 
 package {
   name    = "kfs"
-  version = "0.0.1"
+  version = "0.1.0"
 }
+
+workspace = ["host", "tools/*"]

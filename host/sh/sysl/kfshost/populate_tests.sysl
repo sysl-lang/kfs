@@ -1,4 +1,4 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @tests
 @requires(os)
 
@@ -6,8 +6,8 @@ module keel.kfshost
 // <directory> -o <spec file>`, `kfsdump get` and `kfsdump put`. Every image a test makes is checked with
 // `fsck.kfs -n` (exit 0), and every file is compared byte for byte after it has been through the image.
 
-import kfs.keel.kfs.{DeviceNumbers, INODE_INLINE, Inode, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG}
-import kfs.keel.kfs.{device_numbers, host_platform, mount, readlink, stat}
+import sh.sysl.kfs.{DeviceNumbers, INODE_INLINE, Inode, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG}
+import sh.sysl.kfs.{device_numbers, host_platform, mount, readlink, stat}
 import sysl.buf.{Buf, buf}
 import sysl.fs
 import sysl.text.{Search, repeat}

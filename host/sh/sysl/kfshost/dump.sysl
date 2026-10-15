@@ -1,9 +1,9 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @requires(os)
 
-import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, DirLeafHeader, DirRecordHeader, ExtentIndex, ExtentLeaf, GroupDesc, Inode}
-import kfs.keel.kfs.{Mounted, NodeHeader, Superblock, TAIL_OFFSET, at, block_buf, verify_inode, verify_owned_block}
-import kfs.keel.kfs.{DIR_LEAF_MAGIC, EXTENT_MAGIC, INODE_INDEXED, INODE_INLINE, INODE_ORPHAN, STATE_CLEAN, STATE_ERROR}
+import sh.sysl.kfs.{BLOCK_SIZE, BlockDevice, DirLeafHeader, DirRecordHeader, ExtentIndex, ExtentLeaf, GroupDesc, Inode}
+import sh.sysl.kfs.{Mounted, NodeHeader, Superblock, TAIL_OFFSET, at, block_buf, verify_inode, verify_owned_block}
+import sh.sysl.kfs.{DIR_LEAF_MAGIC, EXTENT_MAGIC, INODE_INDEXED, INODE_INLINE, INODE_ORPHAN, STATE_CLEAN, STATE_ERROR}
 import sysl.fmt.hex
 
 // What `kfsdump` prints, as text: the superblock, the group descriptors, and any inode with its raw extent

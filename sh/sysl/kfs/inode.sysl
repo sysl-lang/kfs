@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 import sysl.buf.{Buf, buf}
 
@@ -79,7 +79,7 @@ core_of[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> usize
         Some(i) -> i
         None ->
             fs.plat.fatal(Fatal.TableFull("inode cache"))
-            panic("keel.kfs: the in-memory inode table is full")
+            panic("sh.sysl.kfs: the in-memory inode table is full")
 
 // A new record for `ino`, in a free slot or a new one; None when the table is full. Under `icache.lock`.
 private place_core[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, now: u64) -> Option[usize]

@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // A block device over a heap buffer: the fixture every filesystem test stands on. It models the device
 // of kfs/SPEC.md section 2 as far as a flat buffer can, and records what a crash harness needs: it counts

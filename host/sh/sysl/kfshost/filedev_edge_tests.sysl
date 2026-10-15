@@ -1,4 +1,4 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @tests
 @requires(os)
 
@@ -6,7 +6,7 @@ module keel.kfshost
 // which error each refusal answers, and an image that cannot be opened for writing, does not exist, shrank
 // under the device, or whose device was closed.
 
-import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
+import sh.sysl.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
 import sysl.buf.{Buf, buf}
 import sysl.fs
 

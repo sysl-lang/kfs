@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // The platform: what KFS needs from whoever runs it, besides a block device (kfs/SPEC.md section 27,
 // "Where things live"). Three things, kept as small as the algorithms allow:

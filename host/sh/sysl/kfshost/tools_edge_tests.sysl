@@ -1,11 +1,11 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @tests
 @requires(os)
 
 // mkfs.kfs and kfsdump at their edges: every option at zero, at its largest and one past, numbers that are
 // not numbers, a refusal that must leave an existing file alone, and a dump of a damaged leaf.
 
-import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice}
+import sh.sysl.kfs.{BLOCK_SIZE, BlockDevice}
 import sysl.buf.{Buf, buf}
 import sysl.fs
 import sysl.text.Search

@@ -1,7 +1,7 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @requires(os)
 
-import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
+import sh.sysl.kfs.{BLOCK_SIZE, BlockDevice, DeviceError}
 import sysl.buf.{Buf, buf}
 import sysl.fs
 import sysl.io.Reader

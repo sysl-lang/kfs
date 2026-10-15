@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // Seal and verify: every checksum of kfs/SPEC.md, over the bytes exactly as the spec gives them.
 //

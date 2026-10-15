@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 import sysl.buf.{Buf, buf, buf_with_capacity}
 import sysl.slices.as_mut_ptr
@@ -50,7 +50,7 @@ struct Table[T]
 // record itself is never copied. An index past the end is a bug in KFS.
 impl[T] IndexPlace[usize, T] for Table[T]
     index_place(*self, i: usize) -> *T
-        if i >= self.count then panic("keel.kfs: a table index past its records")
+        if i >= self.count then panic("sh.sysl.kfs: a table index past its records")
         &self.chunks[i / CHUNK][i % CHUNK]
 
 // Few chunks of many records, so a `Table` — and the `Fs` holding three — stays small: an unoptimized

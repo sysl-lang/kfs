@@ -1,8 +1,8 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @requires(os)
 
-import kfs.keel.kfs.{BlockDevice, FormatError, GeometryError, Mounted, OpenError, Options, RESERVED_DEFAULT, default_options}
-import kfs.keel.kfs.{find_backup, format, geometry, open}
+import sh.sysl.kfs.{BlockDevice, FormatError, GeometryError, Mounted, OpenError, Options, RESERVED_DEFAULT, default_options}
+import sh.sysl.kfs.{find_backup, format, geometry, open}
 import sysl.buf.{Buf, buf}
 
 // The programs `mkfs.kfs` and `kfsdump` as functions of their arguments, so the tests run exactly what the

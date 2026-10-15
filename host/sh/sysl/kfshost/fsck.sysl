@@ -1,7 +1,7 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @requires(os)
 
-import kfs.keel.kfs.{FSCK_CLEAN, FSCK_FAILED, FSCK_FIXED, FSCK_LEFT, FSCK_USAGE, FsckMode, describe, fsck, host_platform}
+import sh.sysl.kfs.{FSCK_CLEAN, FSCK_FAILED, FSCK_FIXED, FSCK_LEFT, FSCK_USAGE, FsckMode, describe, fsck, host_platform}
 
 // The program `fsck.kfs` as a function of its arguments (kfs/SPEC.md section 23), so the tests run exactly
 // what the command line runs: the text to print and the exit code, e2fsck's.

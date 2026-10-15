@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // The block device every part of KFS is written against: whole 4 KiB blocks, read and written by number,
 // and a flush that makes everything written before it durable (kfs/SPEC.md section 2, "The device model").

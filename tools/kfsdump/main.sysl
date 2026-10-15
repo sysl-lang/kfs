@@ -7,7 +7,7 @@
 //
 // Nothing is written to the image.
 
-import kfshost.keel.kfshost.run_dump
+import sh.sysl.kfshost.run_dump
 
 main(args: []string)
     run_dump(args[1..]) match

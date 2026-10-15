@@ -1,9 +1,9 @@
 // KFS on the host: the block device over an image file, and the host's randomness and clock for the
-// formatter. Used by the host tools (mkfs.kfs, kfsdump) and by nothing in the kernel.
+// formatter. Used by the host tools (mkfs.kfs, kfsdump, fsck.kfs) and by nothing in a kernel.
 
 package {
   name    = "kfshost"
-  version = "0.0.1"
+  version = "0.1.0"
 }
 
 dependencies {

@@ -1,8 +1,8 @@
-module keel.kfshost
+module sh.sysl.kfshost
 @tests
 @requires(os)
 
-import kfs.keel.kfs.{BLOCK_SIZE, BlockDevice, SUPER_MAGIC}
+import sh.sysl.kfs.{BLOCK_SIZE, BlockDevice, SUPER_MAGIC}
 import sysl.buf.{Buf, buf}
 import sysl.fs
 import sysl.fmt.hex

@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // The checker's passes 3 and 4 (kfs/SPEC.md section 23), over the census pass 2 takes while it reads
 // every directory: how many names name each inode, how many of a directory's names name directories, and

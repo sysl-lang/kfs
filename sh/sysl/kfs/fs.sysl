@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 import sysl.buf.{Buf, buf}
 import sysl.slices.as_mut_ptr

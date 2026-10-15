@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 @tests
 @requires(heap)
 

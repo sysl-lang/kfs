@@ -8,7 +8,7 @@
 // The exit code is e2fsck's: 0 clean, 1 errors corrected, 4 errors left uncorrected, 8 an operational
 // error, 16 a usage error.
 
-import kfshost.keel.kfshost.run_fsck
+import sh.sysl.kfshost.run_fsck
 
 main(args: []string)
     val r = run_fsck(args[1..])

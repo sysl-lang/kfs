@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 // The namespace operations of kfs/SPEC.md section 18 — create, mknod, mkdir, symlink, readlink, link,
 // unlink, rmdir and rename — over the directory code (dir.sysl), the inode layer (inode.sysl), the

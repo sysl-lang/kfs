@@ -6,8 +6,8 @@ hard and symbolic links, device nodes, nanosecond times, unlinking a file that i
 as run: every structure is small enough to hold in one's head, and every rule that exists to survive a
 crash says which crash it survives.
 
-The format is defined once, in the shared sysl package `kfs/` (module `keel.kfs`), which is compiled
-into the kernel (aarch64-freestanding) and into the host tools (`mkfs.kfs`, `fsck.kfs`, `kfsdump`).
+The format is defined once, in the sysl package `kfs` (`github.com/sysl-lang/kfs`, module
+`sh.sysl.kfs`), which is compiled into keel's kernel (aarch64-freestanding) and into the host tools (`mkfs.kfs`, `fsck.kfs`, `kfsdump`).
 This document is the specification that package implements; where the two disagree, the package is
 wrong.
 
@@ -1975,16 +1975,20 @@ leaves the old filesystem working until stage 12 retires it.
 
 **Where things live.**
 
-- `kfs/` — workspace member `kfs`, module `keel.kfs`: the format and every algorithm, compiled into
-  both the kernel (aarch64-freestanding) and the host tools, as `ondisk/` is today. It is written
+- The repository `github.com/sysl-lang/kfs` (it began inside keel and was split out after stage 11,
+  history kept). Its root is the package `kfs`, module `sh.sysl.kfs`: the format and every algorithm,
+  compiled into both keel's kernel (aarch64-freestanding, a coordinate dependency) and the host tools,
+  as keel's `ondisk/` is today. It is written
   against a small **platform** interface supplied by its user: a block device (`read`, `write`,
   `flush`, `blocks`), a clock, the locks of section 19, and a hook to run the committer. On the host
   the locks are trivial and the committer runs inline; in the kernel they are `keel.sched`'s. Its
-  tests are `@tests` files run by `sysl test kfs` on the host.
-- `kfs/SPEC.md` — this document.
-- `tools/mkfs-kfs`, `tools/fsck-kfs`, `tools/kfsdump` — host programs built to `scratch/mkfs.kfs`,
-  `scratch/fsck.kfs`, `scratch/kfsdump`.
-- `kernel/keel/kfs/` — the kernel's glue: the buffer cache with pinning, the commit thread, the inode
+  tests are `@tests` files run by `sysl test .` on the host.
+- `SPEC.md` — this document.
+- `host/` — the workspace member `kfshost`, module `sh.sysl.kfshost`: the image-file block device, the
+  host's entropy and clock, and each tool's engine as a function of its arguments.
+- `tools/mkfs-kfs`, `tools/fsck-kfs`, `tools/kfsdump` — the host programs `mkfs.kfs`, `fsck.kfs` and
+  `kfsdump` (keel's boot test builds them into its `scratch/`).
+- keel's `kernel/keel/kfs/` — the kernel's glue: the buffer cache with pinning, the commit thread, the inode
   cache, the VFS-facing calls.
 
 **Test fixtures shared by every stage from 5 on.**
@@ -1996,7 +2000,7 @@ leaves the old filesystem working until stage 12 retires it.
   rest lost); **reorder** (at the crash, an arbitrary seeded subset of the writes since the last flush
   is lost). After the crash, the test remounts the surviving image, which must recover, and runs the
   package's **checker**, which must report clean.
-- **The checker** (`keel.kfs.check`) is fsck's read-only half. Stage 5 creates it with passes 0 and 5
+- **The checker** (`check.sysl` in `sh.sysl.kfs`) is fsck's read-only half. Stage 5 creates it with passes 0 and 5
   (superblock, descriptors, journal, bitmaps and counts) and pass 1 for what exists then; each later
   stage adds the checks for the structures it introduces, in the same commit, so the crash harness
   always checks everything that exists. Stage 9 adds repair, the host program, and the corruption

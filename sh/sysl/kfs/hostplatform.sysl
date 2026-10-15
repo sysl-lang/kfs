@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 import sysl.buf.{Buf, buf}
 
@@ -70,9 +70,9 @@ impl Platform for HostPlatform
             val hr = self.held_rank[i]
             val hk = self.held_key[i]
             // `Dir(n)` and `Inode(n)` are one lock: taking it twice is a deadlock.
-            if (hr == 2 || hr == 3) && (r == 2 || r == 3) && hk == k then panic("keel.kfs: an inode's lock taken while it is held")
+            if (hr == 2 || hr == 3) && (r == 2 || r == 3) && hk == k then panic("sh.sysl.kfs: an inode's lock taken while it is held")
             val together = (hr == 2 && r == 2) || (hr == 3 && r == 3 && hk < k)
-            if hr >= r && !together then panic("keel.kfs: a lock taken out of section 19's order")
+            if hr >= r && !together then panic("sh.sysl.kfs: a lock taken out of section 19's order")
         self.held_rank.push(r)
         self.held_key.push(k)
         if r == 6
@@ -93,7 +93,7 @@ impl Platform for HostPlatform
                 self.held_rank.remove(i)
                 self.held_key.remove(i)
                 found = true
-        if !found then panic("keel.kfs: a lock released that was not held")
+        if !found then panic("sh.sysl.kfs: a lock released that was not held")
 
     now(*self) -> Time
         self.clock += 1
@@ -109,7 +109,7 @@ impl Platform for HostPlatform
         !self.committer_thread
 
     wait_for_commit(*self)
-        panic("keel.kfs: a blocking start with a simulated commit thread; use try_start")
+        panic("sh.sysl.kfs: a blocking start with a simulated commit thread; use try_start")
 
     override stamp(*self) -> u64 = self.ops
     override buffer_slots(self) -> usize = self.buffer_limit
@@ -125,8 +125,8 @@ impl Platform for HostPlatform
             Fatal.TableFull(_) -> 5
         if !self.record_fatal
             f match
-                Fatal.CreditOverrun(_, _) -> panic("keel.kfs: a handle went past its credits")
-                Fatal.RevokeOverrun(_, _) -> panic("keel.kfs: a handle revoked past its credits")
-                Fatal.Deadlock(_) -> panic("keel.kfs: a handle waits for log room nothing can make")
-                Fatal.LogOverrun(_) -> panic("keel.kfs: a transaction overran the log")
-                Fatal.TableFull(_) -> panic("keel.kfs: a table of records is full")
+                Fatal.CreditOverrun(_, _) -> panic("sh.sysl.kfs: a handle went past its credits")
+                Fatal.RevokeOverrun(_, _) -> panic("sh.sysl.kfs: a handle revoked past its credits")
+                Fatal.Deadlock(_) -> panic("sh.sysl.kfs: a handle waits for log room nothing can make")
+                Fatal.LogOverrun(_) -> panic("sh.sysl.kfs: a transaction overran the log")
+                Fatal.TableFull(_) -> panic("sh.sysl.kfs: a table of records is full")

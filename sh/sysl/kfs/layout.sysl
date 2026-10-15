@@ -1,4 +1,4 @@
-module keel.kfs
+module sh.sysl.kfs
 
 import sysl.slices.as_mut_ptr
 
@@ -10,7 +10,7 @@ import sysl.slices.as_mut_ptr
 // A struct inside a block's bytes: `T` at `offset`. The caller keeps the bytes alive and aligned for
 // `T`; the bounds are checked here.
 at[T](bytes: []u8, offset: usize) -> *T
-    if offset + sizeof(T) > bytes.len then panic("keel.kfs: a structure past the end of its block")
+    if offset + sizeof(T) > bytes.len then panic("sh.sysl.kfs: a structure past the end of its block")
     ptr_cast(usize(as_mut_ptr(bytes)) + offset)
 
 // The capacities of the blocks that hold arrays of entries, against where each block's tail or checksum
