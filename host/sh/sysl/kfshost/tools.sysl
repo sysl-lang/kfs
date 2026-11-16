@@ -20,7 +20,7 @@ private number(text: string) -> Option[u64]
         v = v * 10 + u64(c - u8('0'))
     Some(v)
 
-private option_value(args: []string, at: usize, flag: string) -> Result[u32, string]
+private option_value(args: []const string, at: usize, flag: string) -> Result[u32, string]
     if at >= args.len then return Err(s"mkfs.kfs: ${flag} needs a number")
     val v = number(args[at]) match
         Some(n) -> n
@@ -28,7 +28,7 @@ private option_value(args: []string, at: usize, flag: string) -> Result[u32, str
     if v > 0xFFFF_FFFE then return Err(s"mkfs.kfs: ${args[at]} is too large for ${flag}")
     Ok(u32(v))
 
-private text_value(args: []string, at: usize, flag: string) -> Result[string, string]
+private text_value(args: []const string, at: usize, flag: string) -> Result[string, string]
     if at >= args.len then return Err(s"mkfs.kfs: ${flag} needs a name")
     Ok(args[at])
 
@@ -66,7 +66,7 @@ open_message(e: OpenError) -> string
         UnknownFeatures -> "the filesystem uses an incompatible feature this tool does not know"
 
 // `mkfs.kfs <image> <blocks> [options]`: make a zeroed image file of that many blocks and format it.
-run_mkfs(args: []string, entropy: []const u8, now: i64) -> Result[string, string]
+run_mkfs(args: []const string, entropy: []const u8, now: i64) -> Result[string, string]
     if args.len < 2 then return Err(MKFS_USAGE)
     val path = args[0]
     val blocks = number(args[1]) match
@@ -119,7 +119,7 @@ run_mkfs(args: []string, entropy: []const u8, now: i64) -> Result[string, string
 // `kfsdump <image> [super | groups | inode <number>]`: print what is asked about an image. With nothing
 // asked, the superblock and the descriptors. A primary superblock that fails its check is reported with
 // the backup the search finds.
-run_dump(args: []string) -> Result[string, string]
+run_dump(args: []const string) -> Result[string, string]
     if args.len < 1 then return Err(DUMP_USAGE)
     if args[0] == "get" then return run_get(args[1..])
     if args[0] == "put" then return run_put(args[1..])
@@ -130,7 +130,7 @@ run_dump(args: []string) -> Result[string, string]
     dev.close()
     result
 
-private dump_opened[D: BlockDevice](dev: *D, args: []string) -> Result[string, string]
+private dump_opened[D: BlockDevice](dev: *D, args: []const string) -> Result[string, string]
     var m = open(dev) match
         Ok(m) -> m
         Err(e) ->

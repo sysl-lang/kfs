@@ -129,7 +129,7 @@ private target_of(img: string, path: string) -> Buf[u8]
     var out: Buf[u8] = buf()
     for _ in 0..<4096
         out.push(0)
-    val n = readlink(&vol, ino, out.view()) match
+    val n = readlink(&vol, ino, out.view_mut()) match
         Ok(n) -> n
         Err(_) -> panic("readlink failed")
     dev.close()

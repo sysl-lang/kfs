@@ -96,7 +96,7 @@ host_entropy() -> Option[Buf[u8]]
     var bytes: Buf[u8] = buf()
     for _ in 0..<32
         bytes.push(0)
-    val got = f.read(bytes.view())
+    val got = f.read(bytes.view_mut())
     f.close()
     if got.len != 32 then return None
     Some(bytes)

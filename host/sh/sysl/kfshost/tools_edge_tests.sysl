@@ -143,13 +143,13 @@ dump_corrupt_leaf()
     var leaf: Buf[u8] = buf()
     for _ in 0..<BLOCK_SIZE
         leaf.push(0)
-    assert(d.read(69, leaf.view()).is_ok())
-    leaf.view()[16] = u8(4056 & 0xFF)
-    leaf.view()[17] = u8(4056 >> 8)
-    leaf.view()[4064] = 12
-    leaf.view()[4072] = 16
-    leaf.view()[4074] = 255
-    leaf.view()[4075] = 8
+    assert(d.read(69, leaf.view_mut()).is_ok())
+    leaf.view_mut()[16] = u8(4056 & 0xFF)
+    leaf.view_mut()[17] = u8(4056 >> 8)
+    leaf.view_mut()[4064] = 12
+    leaf.view_mut()[4072] = 16
+    leaf.view_mut()[4074] = 255
+    leaf.view_mut()[4075] = 8
     assert(d.write(69, leaf.view()).is_ok())
     assert(d.close())
     val text = dump_ok([path, "inode", "2"])

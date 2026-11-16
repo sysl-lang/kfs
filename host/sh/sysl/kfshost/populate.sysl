@@ -298,7 +298,7 @@ fill_image[D: BlockDevice](dev: *D, now: i64, dir: Option[string], spec: Option[
 
 // `kfsdump get <image> <path> <host-file>`: copy a regular file out of the image. A directory, a symbolic
 // link or a device node is refused: there is no one file to copy.
-run_get(args: []string) -> Result[string, string]
+run_get(args: []const string) -> Result[string, string]
     if args.len != 3 then return Err(GET_USAGE)
     var dev = open_image(args[0]) match
         Ok(d) -> d
@@ -325,7 +325,7 @@ private get_from[D: BlockDevice](dev: *D, path: string, host: string) -> Result[
     var data: Buf[u8] = buf()
     for _ in 0..<usize(node.size)
         data.push(0)
-    val got = made(read(&vol, ino, 0, data.view()), path) match
+    val got = made(read(&vol, ino, 0, data.view_mut()), path) match
         Ok(n) -> n
         Err(why) -> return Err(s"kfsdump: ${why}")
     if got != data.len() then return Err(s"kfsdump: ${path}: short read")
@@ -338,7 +338,7 @@ private get_from[D: BlockDevice](dev: *D, path: string, host: string) -> Result[
 // replaced (it keeps its inode, owner and mode); a name that is not there is made 0o644, or 0o755 when the
 // host file is executable. The directory above has to exist. A copy that runs out of space removes a file
 // it made, and leaves a replaced one as far as it got.
-run_put(args: []string) -> Result[string, string]
+run_put(args: []const string) -> Result[string, string]
     if args.len != 3 then return Err(PUT_USAGE)
     val data = fs.read_bytes(args[1]) match
         Ok(b) -> b

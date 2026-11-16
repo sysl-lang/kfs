@@ -16,7 +16,7 @@ private usage(why: string) -> FsckOutcome = FsckOutcome(s"fsck.kfs: ${why}\n${FS
 
 // `fsck.kfs [-n | -y [--rebuild-corrupt]] <image>`: with neither flag, or `-n`, check and write nothing;
 // `-y` repair what is safe; `--rebuild-corrupt` (which implies `-y`) also clear what fails its checksum.
-run_fsck(args: []string) -> FsckOutcome
+run_fsck(args: []const string) -> FsckOutcome
     var no = false
     var yes = false
     var rebuild = false
