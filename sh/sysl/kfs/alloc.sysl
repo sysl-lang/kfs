@@ -350,7 +350,7 @@ private blocks_in_group_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *H
     for k in 0..<BLOCK_SIZE
         usable[k] = fs.bytes(bb)[k]
     for p in fs.group(g).pending.view()
-        bit_set_range(usable.view(), usize(p.first - first), usize(p.first - first) + usize(p.len))
+        bit_set_range(usable.view_mut(), usize(p.first - first), usize(p.first - first) + usize(p.len))
 
     val found = find_run(usable.view(), lo, hi, start, usize(n)) match
         Some(s) -> s

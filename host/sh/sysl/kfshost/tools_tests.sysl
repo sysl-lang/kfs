@@ -147,7 +147,7 @@ dump_finds_the_backup()
         Err(_) -> panic("no image")
     var junk: Buf[u8] = buf()
     for i in 0..<BLOCK_SIZE
-        junk.push(u8(i))
+        junk.push(u8.wrap(i))
     assert(d.write(1, junk.view()).is_ok())
     assert(d.close())
     val why = dump_failure([path])

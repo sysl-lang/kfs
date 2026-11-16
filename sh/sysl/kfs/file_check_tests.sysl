@@ -17,8 +17,8 @@ private edit_disk_inode(dev: *RamDevice, ino: u64, edit: &Fn(*Inode) -> unit)
         Err(_) -> panic("the image did not open")
     val loc = m.inode_location(ino).unwrap()
     var b = raw(dev, loc.block)
-    edit(at(b.view(), loc.offset))
-    seal_inode(m.seed, ino, b.view()[loc.offset..<loc.offset + INODE_SIZE])
+    edit(at(b.view_mut(), loc.offset))
+    seal_inode(m.seed, ino, b.view_mut()[loc.offset..<loc.offset + INODE_SIZE])
     raw_put(dev, loc.block, b.view())
 
 // A file of `n` bytes of pattern on `dev`, unmounted: answers it and its first data block.
@@ -41,9 +41,9 @@ written_past_end()
     // The same inode on the orphan list is a truncation in progress: legal.
     edit_disk_inode(&dev, ino, (n) -> n.flags = n.flags | INODE_ORPHAN)
     var b = raw(&dev, 1)
-    val sb: *Superblock = at(b.view(), 0)
+    val sb: *Superblock = at(b.view_mut(), 0)
     sb.orphan_head = ino
-    seal_superblock(b.view())
+    seal_superblock(b.view_mut())
     raw_put(&dev, 1, b.view())
     checked_clean(&dev)
 
@@ -109,9 +109,9 @@ unlinked_inode()
     assert(has_problem(rep, Problem.Unlinked(ino)) && rep.problems.len() == 1)
     edit_disk_inode(&dev, ino, (n) -> n.flags = n.flags | INODE_ORPHAN)
     var b = raw(&dev, 1)
-    val sb: *Superblock = at(b.view(), 0)
+    val sb: *Superblock = at(b.view_mut(), 0)
     sb.orphan_head = ino
-    seal_superblock(b.view())
+    seal_superblock(b.view_mut())
     raw_put(&dev, 1, b.view())
     checked_clean(&dev)
     // And mount finishes it.

@@ -9,7 +9,7 @@ module sh.sysl.kfs
 @test("the superblock round-trips through bytes, field by field")
 superblock_round_trip()
     var blk = new_block()
-    val sb = at[Superblock](blk.view(), 0)
+    val sb = at[Superblock](blk.view_mut(), 0)
     sb.magic = SUPER_MAGIC
     sb.version = 1
     sb.block_size = 4096
@@ -90,7 +90,7 @@ superblock_round_trip()
     assert_eq(le32(v, 224), 0xCAFE_F00D)
     assert_eq(le32(v, 508), 0x0BAD_CAFE)
     var copy = copy_of(v)
-    val sb2 = at[Superblock](copy.view(), 0)
+    val sb2 = at[Superblock](copy.view_mut(), 0)
     assert_eq(sb2.blocks, 0x1111_2222_3333)
     assert_eq(sb2.format_time, -5)
     assert_eq(sb2.hash_seed[15], 0x4F)
@@ -100,7 +100,7 @@ superblock_round_trip()
 @test("a group descriptor round-trips through bytes")
 group_desc_round_trip()
     var blk = new_block()
-    val g = at[GroupDesc](blk.view(), 64)
+    val g = at[GroupDesc](blk.view_mut(), 64)
     g.block_bitmap = 0x10_0000_0001
     g.inode_bitmap = 0x10_0000_0002
     g.inode_table = 0x10_0000_0003
@@ -123,14 +123,14 @@ group_desc_round_trip()
     assert_eq(le32(v, 108), 0x1122_3344)
     assert_eq(le32(v, 124), 0x5566_7788)
     var copy = copy_of(v)
-    val g2 = at[GroupDesc](copy.view(), 64)
+    val g2 = at[GroupDesc](copy.view_mut(), 64)
     assert_eq(g2.inode_table, 0x10_0000_0003)
     assert_eq(g2.directories, 13)
 
 @test("an inode round-trips through bytes, and its data field is 128 bytes at 112")
 inode_round_trip()
     var blk = new_block()
-    val n = at[Inode](blk.view(), 3 * INODE_SIZE)
+    val n = at[Inode](blk.view_mut(), 3 * INODE_SIZE)
     n.mode = 0o100644
     n.links = 3
     n.uid = 1000
@@ -178,7 +178,7 @@ inode_round_trip()
     assert_eq(v[base + 239], 0xD7)
     assert_eq(le32(v, base + 252), 0x0102_0304)
     var copy = copy_of(v)
-    val n2 = at[Inode](copy.view(), base)
+    val n2 = at[Inode](copy.view_mut(), base)
     assert_eq(n2.size, 0x1_0000_0001)
     assert_eq(n2.atime_sec, -1)
     assert_eq(n2.data[127], 0xD7)
@@ -186,20 +186,20 @@ inode_round_trip()
 @test("extent entries, the node header and the block tail round-trip, and the tail is the block's last 16 bytes")
 extent_round_trip()
     var blk = new_block()
-    val h = at[NodeHeader](blk.view(), 0)
+    val h = at[NodeHeader](blk.view_mut(), 0)
     h.magic = EXTENT_MAGIC
     h.count = 2
     h.max = 254
     h.depth = 1
-    val leaf = at[ExtentLeaf](blk.view(), 16)
+    val leaf = at[ExtentLeaf](blk.view_mut(), 16)
     leaf.logical = 0x1000
     leaf.len = 32768
     leaf.flags = EXTENT_UNWRITTEN
     leaf.physical = 0x20_0000_0000
-    val idx = at[ExtentIndex](blk.view(), 32)
+    val idx = at[ExtentIndex](blk.view_mut(), 32)
     idx.logical = 0x2000
     idx.child = 0x30_0000_0000
-    val t = at[BlockTail](blk.view(), TAIL_OFFSET)
+    val t = at[BlockTail](blk.view_mut(), TAIL_OFFSET)
     t.owner = 0x1234_5678_9ABC
     t.generation = 5
     t.crc = 0xFEED_FACE
@@ -220,17 +220,17 @@ extent_round_trip()
     assert_eq(le32(v, 4088), 5)
     assert_eq(le32(v, 4092), 0xFEED_FACE)
     var copy = copy_of(v)
-    assert_eq(at[ExtentLeaf](copy.view(), 16).physical, 0x20_0000_0000)
-    assert_eq(at[ExtentIndex](copy.view(), 32).child, 0x30_0000_0000)
-    assert_eq(at[BlockTail](copy.view(), TAIL_OFFSET).owner, 0x1234_5678_9ABC)
+    assert_eq(at[ExtentLeaf](copy.view_mut(), 16).physical, 0x20_0000_0000)
+    assert_eq(at[ExtentIndex](copy.view_mut(), 32).child, 0x30_0000_0000)
+    assert_eq(at[BlockTail](copy.view_mut(), TAIL_OFFSET).owner, 0x1234_5678_9ABC)
 
 @test("a directory leaf: header, and a packed record whose name begins at offset 12")
 dir_leaf_round_trip()
     var blk = new_block()
-    val h = at[DirLeafHeader](blk.view(), 0)
+    val h = at[DirLeafHeader](blk.view_mut(), 0)
     h.magic = DIR_LEAF_MAGIC
     h.count = 1
-    val r = at[DirRecordHeader](blk.view(), 8)
+    val r = at[DirRecordHeader](blk.view_mut(), 8)
     r.ino = 0x1_0000_0002
     r.rec_len = 4072
     r.name_len = 3
@@ -243,7 +243,7 @@ dir_leaf_round_trip()
     assert_eq(v[18], 3)
     assert_eq(v[19], 4)
     var copy = copy_of(v)
-    val r2 = at[DirRecordHeader](copy.view(), 8)
+    val r2 = at[DirRecordHeader](copy.view_mut(), 8)
     assert_eq(r2.ino, 0x1_0000_0002)
     assert_eq(r2.rec_len, 4072)
     assert_eq(r2.file_type, DT_DIR)
@@ -251,15 +251,15 @@ dir_leaf_round_trip()
 @test("an index block: header and entries")
 dir_index_round_trip()
     var blk = new_block()
-    val h = at[IndexHeader](blk.view(), 0)
+    val h = at[IndexHeader](blk.view_mut(), 0)
     h.magic = DIR_INDEX_MAGIC
     h.count = 2
     h.max = 254
     h.level = 2
-    val e = at[IndexEntry](blk.view(), 16)
+    val e = at[IndexEntry](blk.view_mut(), 16)
     e.key = 0
     e.child = 1
-    val f = at[IndexEntry](blk.view(), 32)
+    val f = at[IndexEntry](blk.view_mut(), 32)
     f.key = 0x8000_0000_0000_0001
     f.child = 0xFFFF_FFFF
     val v = blk.view()
@@ -270,17 +270,17 @@ dir_index_round_trip()
     assert_eq(le64(v, 32), 0x8000_0000_0000_0001)
     assert_eq(le32(v, 40), 0xFFFF_FFFF)
     var copy = copy_of(v)
-    assert_eq(at[IndexEntry](copy.view(), 32).key, 0x8000_0000_0000_0001)
-    assert_eq(at[IndexHeader](copy.view(), 0).level, 2)
+    assert_eq(at[IndexEntry](copy.view_mut(), 32).key, 0x8000_0000_0000_0001)
+    assert_eq(at[IndexHeader](copy.view_mut(), 0).level, 2)
 
 @test("an xattr block header and record header round-trip")
 xattr_round_trip()
     var blk = new_block()
-    val h = at[XattrHeader](blk.view(), 0)
+    val h = at[XattrHeader](blk.view_mut(), 0)
     h.magic = XATTR_MAGIC
     h.count = 1
     h.used = 12
-    val r = at[XattrRecordHeader](blk.view(), 8)
+    val r = at[XattrRecordHeader](blk.view_mut(), 8)
     r.namespace = XATTR_SECURITY
     r.name_len = 5
     r.value_len = 300
@@ -292,12 +292,12 @@ xattr_round_trip()
     assert_eq(v[9], 5)
     assert_eq(le16(v, 10), 300)
     var copy = copy_of(v)
-    assert_eq(at[XattrRecordHeader](copy.view(), 8).value_len, 300)
+    assert_eq(at[XattrRecordHeader](copy.view_mut(), 8).value_len, 300)
 
 @test("the journal superblock round-trips through bytes")
 journal_super_round_trip()
     var blk = new_block()
-    val j = at[JournalSuper](blk.view(), 0)
+    val j = at[JournalSuper](blk.view_mut(), 0)
     j.header.magic = JOURNAL_MAGIC
     j.header.kind = JOURNAL_SUPER
     j.header.sequence = 0
@@ -324,22 +324,22 @@ journal_super_round_trip()
     assert_eq(le32(v, 56), 256)
     assert_eq(le32(v, 508), 0x1357_9BDF)
     var copy = copy_of(v)
-    assert_eq(at[JournalSuper](copy.view(), 0).start_seq, 0x1_0000_0000)
-    assert_eq(at[JournalSuper](copy.view(), 0).header.kind, JOURNAL_SUPER)
+    assert_eq(at[JournalSuper](copy.view_mut(), 0).start_seq, 0x1_0000_0000)
+    assert_eq(at[JournalSuper](copy.view_mut(), 0).header.kind, JOURNAL_SUPER)
 
 @test("descriptor and revoke blocks: headers, tags, revoked numbers and the trailing checksum")
 descriptor_revoke_round_trip()
     var blk = new_block()
-    val d = at[DescriptorHeader](blk.view(), 0)
+    val d = at[DescriptorHeader](blk.view_mut(), 0)
     d.header.magic = JOURNAL_MAGIC
     d.header.kind = JOURNAL_DESCRIPTOR
     d.header.sequence = 42
     d.count = 2
-    val t0 = at[Tag](blk.view(), 24)
+    val t0 = at[Tag](blk.view_mut(), 24)
     t0.block = 0x77
     t0.flags = TAG_ESCAPED
     t0.crc = 0xAAAA_0001
-    val t1 = at[Tag](blk.view(), 24 + 16)
+    val t1 = at[Tag](blk.view_mut(), 24 + 16)
     t1.block = 0x78
     t1.flags = 0
     t1.crc = 0xAAAA_0002
@@ -353,13 +353,13 @@ descriptor_revoke_round_trip()
     assert_eq(le64(v, 40), 0x78)
     assert_eq(le32(v, 52), 0xAAAA_0002)
     var rb = new_block()
-    val r = at[RevokeHeader](rb.view(), 0)
+    val r = at[RevokeHeader](rb.view_mut(), 0)
     r.header.magic = JOURNAL_MAGIC
     r.header.kind = JOURNAL_REVOKE
     r.header.sequence = 43
     r.count = 508
-    put_le64(rb.view(), 24, 0x55)
-    put_le64(rb.view(), 24 + 507 * 8, 0x56)
+    put_le64(rb.view_mut(), 24, 0x55)
+    put_le64(rb.view_mut(), 24 + 507 * 8, 0x56)
     assert_eq(le32(rb.view(), 4), 3)
     assert_eq(le32(rb.view(), 16), 508)
     assert_eq(le64(rb.view(), 4080), 0x56)
@@ -367,7 +367,7 @@ descriptor_revoke_round_trip()
 @test("a commit block round-trips through bytes")
 commit_round_trip()
     var blk = new_block()
-    val c = at[Commit](blk.view(), 0)
+    val c = at[Commit](blk.view_mut(), 0)
     c.header.magic = JOURNAL_MAGIC
     c.header.kind = JOURNAL_COMMIT
     c.header.sequence = 7
@@ -383,10 +383,10 @@ commit_round_trip()
     assert_eq(le32(v, 28), 31)
     assert_eq(le32(v, 508), 0x2468_ACE0)
     var copy = copy_of(v)
-    assert_eq(at[Commit](copy.view(), 0).commit_nsec, 123_456_789)
+    assert_eq(at[Commit](copy.view_mut(), 0).commit_nsec, 123_456_789)
 
 @test("reading a structure past the end of its block is refused", should_trap: "past the end")
 at_past_the_end_traps()
     var blk = new_block()
-    val bad = at[Inode](blk.view(), BLOCK_SIZE - 16)
+    val bad = at[Inode](blk.view_mut(), BLOCK_SIZE - 16)
     assert(bad != null)

@@ -101,9 +101,9 @@ check_superblock(sb: *Superblock, device_blocks: u64) -> Result[unit, OpenError]
 // descriptor puts its group's bitmaps and inode table where the layout does.
 open[D: BlockDevice](dev: *D) -> Result[Mounted, OpenError]
     var blk = block_buf()
-    dev.read(1, blk.view())?
+    dev.read(1, blk.view_mut())?
     if !verify_superblock(blk.view()) then return Err(OpenError.BadChecksum)
-    val sb: *Superblock = at(blk.view(), 0)
+    val sb: *Superblock = at(blk.view_mut(), 0)
     check_superblock(sb, dev.blocks())?
     val g = geometry_of(sb)
     val seed = sb.csum_seed
@@ -111,10 +111,10 @@ open[D: BlockDevice](dev: *D) -> Result[Mounted, OpenError]
     var descs: Buf[GroupDesc] = buf()
     var table = block_buf()
     for i in 0..<g.group_count
-        if i % 64 == 0 then dev.read(2 + u64(i / 64), table.view())?
+        if i % 64 == 0 then dev.read(2 + u64(i / 64), table.view_mut())?
         val off = usize(i % 64) * 64
         if !verify_group_desc(seed, i, table.view()[off..<off + 64]) then return Err(OpenError.BadDescriptor(i))
-        val d: *GroupDesc = at(table.view(), off)
+        val d: *GroupDesc = at(table.view_mut(), off)
         if d.block_bitmap != g.block_bitmap(i) || d.inode_bitmap != g.inode_bitmap(i) || d.inode_table != g.inode_table(i)
             return Err(OpenError.MisplacedGroup(i))
         descs.push(*d)
@@ -130,8 +130,8 @@ find_backup[D: BlockDevice](dev: *D) -> Option[Backup]
     var b = BLOCKS_PER_GROUP_MIN
     while b <= BLOCKS_PER_GROUP_MAX
         val at_block = 1 + u64(b)
-        if at_block < dev.blocks() && dev.read(at_block, blk.view()).is_ok()
-            val sb: *Superblock = at(blk.view(), 0)
+        if at_block < dev.blocks() && dev.read(at_block, blk.view_mut()).is_ok()
+            val sb: *Superblock = at(blk.view_mut(), 0)
             if verify_superblock(blk.view()) && sb.magic == SUPER_MAGIC && copy_at(sb, b)
                 return Some(Backup(at_block, *sb))
         b = b * 2

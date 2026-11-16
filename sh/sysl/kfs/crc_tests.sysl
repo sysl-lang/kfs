@@ -60,5 +60,5 @@ crc_is_sensitive()
     val base = crc32c(0xFFFF_FFFF, m.view())
     assert(crc32c(0xFFFF_FFFE, m.view()) != base)
     var flipped = copy_of(m.view())
-    flipped.view()[3] = flipped.view()[3] ^ 4
+    flipped.view_mut()[3] = flipped.view()[3] ^ 4
     assert(crc32c(0xFFFF_FFFF, flipped.view()) != base)

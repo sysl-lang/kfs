@@ -18,7 +18,7 @@ private edit_desc(dev: *RamDevice, g: u32, free_delta: i64, directories: Option[
     val tb = 2 + u64(g / 64)
     var blk = raw(dev, tb)
     val off = usize(g % 64) * 64
-    val d: *GroupDesc = at(blk.view(), off)
+    val d: *GroupDesc = at(blk.view_mut(), off)
     d.free_blocks = u32(i64(d.free_blocks) + free_delta)
     directories match
         Some(n) -> d.directories = n
@@ -26,7 +26,7 @@ private edit_desc(dev: *RamDevice, g: u32, free_delta: i64, directories: Option[
     bitmap match
         Some(bm) -> d.block_bitmap_crc = bitmap_crc(sb.csum_seed, g, bm.view())
         None -> ()
-    seal_group_desc(sb.csum_seed, g, blk.view()[off..<off + 64])
+    seal_group_desc(sb.csum_seed, g, blk.view_mut()[off..<off + 64])
     raw_put(dev, tb, blk.view())
 
 // Set or clear block `b`'s bit in group 0's block bitmap, keeping the descriptor's count and checksum
@@ -36,7 +36,7 @@ private flip_block_bit(dev: *RamDevice, b: u64, set: bool)
     val g = geometry_of(&sb)
     var bm = raw(dev, g.block_bitmap(0))
     val i = usize(b - g.group_first(0))
-    if set then bit_set(bm.view(), i) else bit_clear(bm.view(), i)
+    if set then bit_set(bm.view_mut(), i) else bit_clear(bm.view_mut(), i)
     raw_put(dev, g.block_bitmap(0), bm.view())
     edit_desc(dev, 0, if set then -1 else 1, None, Some(bm))
 
@@ -50,7 +50,7 @@ private edit_inode(dev: *RamDevice, ino: u64, at_byte: usize, v: u64, width: usi
     val off = usize((ino - 1) % 16) * INODE_SIZE
     for i in 0..<width
         blk[off + at_byte + i] = u8((v >> u64(8 * i)) & 0xFF)
-    if seal then seal_inode(sb.csum_seed, ino, blk.view()[off..<off + INODE_SIZE])
+    if seal then seal_inode(sb.csum_seed, ino, blk.view_mut()[off..<off + INODE_SIZE])
     raw_put(dev, b, blk.view())
 
 private root_leaf(dev: *RamDevice) -> u64
@@ -121,7 +121,7 @@ log_audit()
     val log = log_contents(&dev)
     val cp = log.copies[1]
     var blk = raw(&dev, log_pos(super_of(&dev), cp.pos))
-    put_le32(blk.view(), 0, JOURNAL_MAGIC)
+    put_le32(blk.view_mut(), 0, JOURNAL_MAGIC)
     raw_put(&dev, log_pos(super_of(&dev), cp.pos), blk.view())
     val bad = check(&dev)
     assert(has(bad, Problem.LogAudit(cp.pos)))
@@ -200,9 +200,9 @@ pass1_node_blocks()
         for b in clean.claimed.view()
             if node == 0 && b != root_leaf(&dev) then node = b
         var blk = raw(&dev, node)
-        if which == 0 then put_le64(blk.view(), TAIL_OFFSET, ino + 1)
-        if which == 1 then put_le32(blk.view(), TAIL_OFFSET + 8, 7)
-        if which < 2 then seal_block(fs.seed, blk.view()) else blk[100] = blk[100] ^ 4
+        if which == 0 then put_le64(blk.view_mut(), TAIL_OFFSET, ino + 1)
+        if which == 1 then put_le32(blk.view_mut(), TAIL_OFFSET + 8, 7)
+        if which < 2 then seal_block(fs.seed, blk.view_mut()) else blk[100] = blk[100] ^ 4
         raw_put(&dev, node, blk.view())
         val want = if which == 0 then NodeFault.Owner else if which == 1 then NodeFault.Generation else NodeFault.Checksum
         assert(has(check(&dev), Problem.Extent(ino, node, want)))
@@ -240,7 +240,7 @@ pass5_problems()
     var bm = raw(&e, g.block_bitmap(1))
     // A free block past group 1's journal.
     assert(!bit_test(bm.view(), 1900))
-    bit_set(bm.view(), 1900)
+    bit_set(bm.view_mut(), 1900)
     raw_put(&e, g.block_bitmap(1), bm.view())
     val re = check(&e)
     assert(has(re, Problem.BlockBitmapCrc(1)))
@@ -251,16 +251,16 @@ pass5_problems()
     var fsb = super_of(&f)
     val fg = geometry_of(&fsb)
     var ib = raw(&f, fg.inode_bitmap(0))
-    bit_clear(ib.view(), 4)
+    bit_clear(ib.view_mut(), 4)
     raw_put(&f, fg.inode_bitmap(0), ib.view())
     assert(has(check(&f), Problem.InodeBit(5, true)))
 
     // The superblock's totals, checked only while CLEAN says they are exact.
     var t = small_device()
     var tb = raw(&t, 1)
-    val tsb: *Superblock = at(tb.view(), 0)
+    val tsb: *Superblock = at(tb.view_mut(), 0)
     tsb.free_blocks = tsb.free_blocks + 1
-    seal_superblock(tb.view())
+    seal_superblock(tb.view_mut())
     raw_put(&t, 1, tb.view())
     assert(has(check(&t), Problem.Totals))
     var fs = mounted(&t)

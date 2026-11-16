@@ -64,19 +64,19 @@ struct DirName
     hash: u64
     name: Buf[u8]
 
-private rec_at(bytes: []u8, off: usize) -> Rec
-    val r: *DirRecordHeader = at(bytes, off)
+private rec_at(bytes: []const u8, off: usize) -> Rec
+    val r = read_at[DirRecordHeader](bytes, off)
     Rec(off, r.ino, usize(r.rec_len), usize(r.name_len), r.file_type)
 
 // Record `r`'s name.
-rec_name(bytes: []u8, r: Rec) -> []u8 = bytes[r.off + 12..<r.off + 12 + r.name_len]
+rec_name(bytes: []const u8, r: Rec) -> []const u8 = bytes[r.off + 12..<r.off + 12 + r.name_len]
 
 // The records of the leaf in `bytes`, in the order they lie, checked against section 10's rules: the
 // magic, the reserved bytes, records tiling the area exactly, each `rec_len` a multiple of 8 and at least
 // 16, a live record's name non-empty and inside its `rec_len`, a free record only first, and `count` the
 // live records. The checksum and the tail are the caller's.
-leaf_records(bytes: []u8) -> Result[Buf[Rec], DirFault]
-    val head: *DirLeafHeader = at(bytes, 0)
+leaf_records(bytes: []const u8) -> Result[Buf[Rec], DirFault]
+    val head = read_at[DirLeafHeader](bytes, 0)
     if head.magic != DIR_LEAF_MAGIC then return Err(DirFault.Magic)
     if head.reserved != 0 then return Err(DirFault.Header)
     var out: Buf[Rec] = buf()
@@ -152,7 +152,7 @@ place_record(bytes: []u8, r: Rec, n: DirName)
 
 // What a directory block's checksum and tail say is wrong with it, if anything: it must verify and
 // name directory `owner` at `generation`.
-dir_block_fault(seed: u32, bytes: []u8, owner: u64, generation: u32) -> Option[DirFault]
+dir_block_fault(seed: u32, bytes: []const u8, owner: u64, generation: u32) -> Option[DirFault]
     if !verify_block(seed, bytes) then return Some(DirFault.Checksum)
     if le64(bytes, TAIL_OFFSET) != owner then return Some(DirFault.Owner)
     if le32(bytes, TAIL_OFFSET + 8) != generation then return Some(DirFault.Generation)
@@ -222,8 +222,8 @@ key_follows(a: u64, b: u64) -> bool = b > a || (b == a && b & 1 == 1)
 // The index block in `bytes`, checked: the magic, 1 <= `max` <= 254, 1 <= `count` <= `max`, `level`
 // below DIR_MAX_LEVELS, reserved bytes zero, every entry's reserved word zero, and keys in order
 // (`key_follows`). The checksum, the tail, the level its place gives and entry 0's key are the caller's.
-index_block(bytes: []u8) -> Result[IndexBlock, DirFault]
-    val head: *IndexHeader = at(bytes, 0)
+index_block(bytes: []const u8) -> Result[IndexBlock, DirFault]
+    val head = read_at[IndexHeader](bytes, 0)
     if head.magic != DIR_INDEX_MAGIC then return Err(DirFault.Magic)
     if head.max == 0 || usize(head.max) > DIR_INDEX_SLOTS || head.count == 0 || head.count > head.max then return Err(DirFault.Header)
     if usize(head.level) >= DIR_MAX_LEVELS then return Err(DirFault.Header)
@@ -231,10 +231,10 @@ index_block(bytes: []u8) -> Result[IndexBlock, DirFault]
         if head.reserved[k] != 0 then return Err(DirFault.Header)
     var entries: Buf[IndexEntry] = buf()
     for i in 0..<usize(head.count)
-        val e: *IndexEntry = at(bytes, sizeof(IndexHeader) + i * sizeof(IndexEntry))
+        val e = read_at[IndexEntry](bytes, sizeof(IndexHeader) + i * sizeof(IndexEntry))
         if e.reserved != 0 then return Err(DirFault.Keys)
         if i > 0 && !key_follows(entries[i - 1].key, e.key) then return Err(DirFault.Keys)
-        entries.push(*e)
+        entries.push(e)
     Ok(IndexBlock(head.level, head.max, entries))
 
 // Make the header and entry area of `bytes` an index block; unused entry slots are zero. The tail is the

@@ -26,8 +26,8 @@ private example() -> Sparse = sparse_formatted(8192, default_options())
 private with_superblock(dev: *Sparse, change: &Fn(*Superblock) -> unit) -> i64
     val good = block_of(dev, 1)
     var bad = copy_of(good.view())
-    change(at[Superblock](bad.view(), 0))
-    seal_superblock(bad.view())
+    change(at[Superblock](bad.view_mut(), 0))
+    seal_superblock(bad.view_mut())
     assert(dev.write(1, bad.view()).is_ok())
     val answer = failure(open(dev))
     assert(dev.write(1, good.view()).is_ok())
@@ -40,13 +40,13 @@ open_checksum_refusals()
     val good = block_of(&dev, 1)
     for i in [0, 100, 507, 508, 511]
         var bad = copy_of(good.view())
-        bad.view()[usize(i)] ^= 0x10
+        bad.view_mut()[usize(i)] ^= 0x10
         assert(dev.write(1, bad.view()).is_ok())
         assert_eq(failure(open(&dev)), 1)
     // Past the sector, nothing is checked.
     var tail = copy_of(good.view())
-    tail.view()[512] ^= 0x10
-    tail.view()[4095] ^= 0x10
+    tail.view_mut()[512] ^= 0x10
+    tail.view_mut()[4095] ^= 0x10
     assert(dev.write(1, tail.view()).is_ok())
     assert_eq(failure(open(&dev)), 0)
 
@@ -158,8 +158,8 @@ private with_descriptor(dev: *Sparse, g: u32, change: &Fn(*GroupDesc) -> unit) -
     val good = block_of(dev, tb)
     var bad = copy_of(good.view())
     val off = usize(g % 64) * 64
-    change(at[GroupDesc](bad.view(), off))
-    seal_group_desc(seed, g, bad.view()[off..<off + 64])
+    change(at[GroupDesc](bad.view_mut(), off))
+    seal_group_desc(seed, g, bad.view_mut()[off..<off + 64])
     assert(dev.write(tb, bad.view()).is_ok())
     val answer = failure(open(dev))
     assert(dev.write(tb, good.view()).is_ok())
@@ -172,14 +172,14 @@ open_descriptor_checksums()
     for g in [0, 2, 3]
         for at_byte in [0, 59, 60, 63]
             var bad = copy_of(good.view())
-            bad.view()[usize(g) * 64 + usize(at_byte)] ^= 4
+            bad.view_mut()[usize(g) * 64 + usize(at_byte)] ^= 4
             assert(dev.write(2, bad.view()).is_ok())
             assert_eq(failure(open(&dev)), 100 + i64(g))
     // A descriptor moved to another group's slot fails, its group number being part of its checksum.
     var swapped = copy_of(good.view())
     for i in 0..<64
-        swapped.view()[64 + i] = good.view()[128 + i]
-        swapped.view()[128 + i] = good.view()[64 + i]
+        swapped.view_mut()[64 + i] = good.view()[128 + i]
+        swapped.view_mut()[128 + i] = good.view()[64 + i]
     assert(dev.write(2, swapped.view()).is_ok())
     assert_eq(failure(open(&dev)), 101)
     assert(dev.write(2, good.view()).is_ok())
@@ -205,13 +205,13 @@ open_second_table_block()
     assert_eq(with_descriptor(&dev, 63, (d) -> d.inode_bitmap += 1), 263)
     val second = block_of(&dev, 3)
     var bad = copy_of(second.view())
-    bad.view()[5] ^= 1
+    bad.view_mut()[5] ^= 1
     assert(dev.write(3, bad.view()).is_ok())
     assert_eq(failure(open(&dev)), 164)
     assert(dev.write(3, second.view()).is_ok())
     // An entry past the last group in that block is not checked.
     var tail = copy_of(second.view())
-    tail.view()[64 + 7] ^= 1
+    tail.view_mut()[64 + 7] ^= 1
     assert(dev.write(3, tail.view()).is_ok())
     assert_eq(failure(open(&dev)), 0)
 
@@ -242,7 +242,7 @@ backup_every_group_size()
     while bpg <= 32768
         val end = 1 + u64(bpg) + 5 + 1024 + 64
         var dev = sparse_formatted(end, Options(1_073_741_824, RESERVED_DEFAULT, bpg, 1024))
-        val primary = block_of(&dev, 1)
+        var primary = block_of(&dev, 1)
         junk_at(&dev, 1)
         val found = find_backup(&dev) match
             Some(b) -> b
@@ -251,7 +251,7 @@ backup_every_group_size()
         assert_eq(found.sb.blocks_per_group, bpg)
         assert_eq(found.sb.group_count, 2)
         // The copy is the primary, field for field.
-        val p = at[Superblock](primary.view(), 0)
+        val p = at[Superblock](primary.view_mut(), 0)
         assert_eq(found.sb.blocks, p.blocks)
         assert_eq(found.sb.csum_seed, p.csum_seed)
         assert_eq(found.sb.journal_start, p.journal_start)
@@ -316,8 +316,8 @@ backup_skips_unreadable_and_foreign()
     assert_eq(backup_block(&dev), 1 + 2 * 2048)
     dev.failing = 0
     var foreign = block_of(&dev, 1 + 2048)
-    put_le32(foreign.view(), 0, JOURNAL_MAGIC)
-    seal_superblock(foreign.view())
+    put_le32(foreign.view_mut(), 0, JOURNAL_MAGIC)
+    seal_superblock(foreign.view_mut())
     assert(dev.write(1 + 2048, foreign.view()).is_ok())
     assert_eq(backup_block(&dev), 1 + 2 * 2048)
 

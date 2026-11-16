@@ -40,7 +40,7 @@ private state_of(cd: *CrashDevice[RamDevice], skip: u64) -> Buf[u64]
     val rep = checked_clean(cd)
     var out: Buf[u64] = buf()
     var sb = raw(cd, 1)
-    mask_mount_fields(sb.view())
+    mask_mount_fields(sb.view_mut())
     out.push(digest(sb.view()))
     val g = fs.geo
     for t in 0..<u64(g.gdt_blocks)
@@ -140,9 +140,9 @@ digest_sees_inodes()
     val loc = fs.inode_location(ino)
     val a = raw(&dev, loc.block)
     var b = raw(&dev, loc.block)
-    val node: *Inode = at(b.view(), loc.offset)
+    val node: *Inode = at(b.view_mut(), loc.offset)
     node.size = 12345
-    seal_inode(fs.seed, ino, b.view()[loc.offset..<loc.offset + INODE_SIZE])
+    seal_inode(fs.seed, ino, b.view_mut()[loc.offset..<loc.offset + INODE_SIZE])
     // A sealed slot's content drops out of a CRC32C over the block: the old digest was blind to it.
     assert(!same(a.view(), b.view()))
     assert(crc32c(0xFFFF_FFFF, a.view()) == crc32c(0xFFFF_FFFF, b.view()))
@@ -195,8 +195,8 @@ private blocks_recovered(cd: *CrashDevice[RamDevice], ino: u64) -> u64
     val _ = recovered_head(cd)
     val m = open(cd).unwrap()
     val loc = m.inode_location(ino).unwrap()
-    val b = raw(cd, loc.block)
-    val node: *Inode = at(b.view(), loc.offset)
+    var b = raw(cd, loc.block)
+    val node: *Inode = at(b.view_mut(), loc.offset)
     node.blocks
 
 // Logical block `l`'s physical block on the image, mounted afresh.

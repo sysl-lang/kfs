@@ -297,7 +297,7 @@ private dt_of(t: u16) -> u8
 
 // -- Pass 0: the log ----------------------------------------------------------------------------------
 
-private begins_with_magic(b: []u8) -> bool = le32(b, 0) == JOURNAL_MAGIC
+private begins_with_magic(b: []const u8) -> bool = le32(b, 0) == JOURNAL_MAGIC
 
 private audit_log[D: BlockDevice](dev: *D, sb: Superblock, st: JournalState, rep: Report)
     val sc = scan_log(dev, sb, st) match
@@ -311,15 +311,15 @@ private audit_log[D: BlockDevice](dev: *D, sb: Superblock, st: JournalState, rep
     for t in sc.txns.view()
         var pos = t.first
         while pos != t.commit
-            if dev.read(sb.journal_start + u64(pos), blk.view()).is_err()
+            if dev.read(sb.journal_start + u64(pos), blk.view_mut()).is_err()
                 rep.add(Problem.LogAudit(pos))
                 return
-            val h: *JournalHeader = at(blk.view(), 0)
+            val h: *JournalHeader = at(blk.view_mut(), 0)
             if h.kind == JOURNAL_DESCRIPTOR
-                val d: *DescriptorHeader = at(blk.view(), 0)
+                val d: *DescriptorHeader = at(blk.view_mut(), 0)
                 for i in 0..<usize(d.count)
                     val cp = log_advance(jb, pos, u32(i) + 1)
-                    if dev.read(sb.journal_start + u64(cp), copy.view()).is_err() || begins_with_magic(copy.view()) || !verify_tag(sb.csum_seed, t.seq, tag_at(blk.view(), i), copy.view())
+                    if dev.read(sb.journal_start + u64(cp), copy.view_mut()).is_err() || begins_with_magic(copy.view()) || !verify_tag(sb.csum_seed, t.seq, tag_at(blk.view_mut(), i), copy.view())
                         rep.add(Problem.LogAudit(cp))
                 pos = log_advance(jb, pos, 1 + d.count)
             else
@@ -348,13 +348,13 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
     var ibm = block_buf()
     var table = block_buf()
     for grp in 0..<g.group_count
-        dev.read(g.inode_bitmap(grp), ibm.view())?
+        dev.read(g.inode_bitmap(grp), ibm.view_mut())?
         for i in 0..<g.inodes_per_group
-            if i % 16 == 0 then dev.read(g.inode_table(grp) + u64(i / 16), table.view())?
+            if i % 16 == 0 then dev.read(g.inode_table(grp) + u64(i / 16), table.view_mut())?
             val ino = u64(grp) * u64(g.inodes_per_group) + u64(i) + 1
             val off = usize(i % 16) * INODE_SIZE
             val slot = table.view()[off..<off + INODE_SIZE]
-            val node: *Inode = at(table.view(), off)
+            val node: *Inode = at(table.view_mut(), off)
             if !bit_test(ibm.view(), usize(i))
                 if node.mode != 0 then rep.warnings.push(Problem.FreeInodeInUse(ino))
                 continue
@@ -395,14 +395,14 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
             c.count = 0
             c.extents.clear()
             if t == S_IFREG || t == S_IFDIR || (t == S_IFLNK && f & INODE_INLINE == 0)
-                val head: *NodeHeader = at(table.view(), off + 112)
+                val head: *NodeHeader = at(table.view_mut(), off + 112)
                 var fault: Option[Problem] = None
                 if head.magic != EXTENT_MAGIC || head.max == 0 || usize(head.max) > EXTENT_ROOT_SLOTS || head.count > head.max || !reserved_zero(head)
                     fault = Some(Problem.Extent(ino, 0, if head.magic != EXTENT_MAGIC then NodeFault.Magic else NodeFault.Header))
                 else if usize(head.depth) > EXTENT_MAX_DEPTH || (head.depth > 0 && head.count == 0)
                     fault = Some(Problem.Extent(ino, 0, if head.depth > 0 && head.count == 0 then NodeFault.Header else NodeFault.Depth))
                 else
-                    fault = walk_node(dev, c, rep, ino, node.generation, table.view(), off + 112, 0, LOGICAL_BLOCKS)?
+                    fault = walk_node(dev, c, rep, ino, node.generation, table.view_mut(), off + 112, 0, LOGICAL_BLOCKS)?
                 fault match
                     Some(p) ->
                         rep.add(p)
@@ -423,8 +423,8 @@ private pass1[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
                     claim(c, rep, node.xattr_block, ino)
                     c.count += 1
                     var xb = block_buf()
-                    dev.read(node.xattr_block, xb.view())?
-                    if !verify_owned_block(seed, xb.view(), ino, node.generation) || xattr_records(xb.view()).is_none() then rep.add(Problem.Xattr(ino))
+                    dev.read(node.xattr_block, xb.view_mut())?
+                    if !verify_owned_block(seed, xb.view(), ino, node.generation) || xattr_records(xb.view_mut()).is_none() then rep.add(Problem.Xattr(ino))
             if node.blocks != c.count then rep.add(Problem.BlockCount(ino, node.blocks, c.count))
     // A directory pass 1 found unsound is not read by pass 2, so its names go uncounted.
     var dirs: u64 = 0
@@ -454,7 +454,7 @@ private past_end[D: BlockDevice](dev: *D, c: *Checker, rep: Report, ino: u64, no
     for e in c.extents.view()
         if u64(e.logical) <= l && l < u64(e.logical) + u64(e.len) && e.flags & EXTENT_UNWRITTEN == 0
             var blk = block_buf()
-            dev.read(e.physical + (l - u64(e.logical)), blk.view())?
+            dev.read(e.physical + (l - u64(e.logical)), blk.view_mut())?
             for i in tail..<BLOCK_SIZE
                 if blk[i] != 0
                     rep.add(Problem.TailNotZero(ino))
@@ -468,9 +468,7 @@ private reserved_zero(head: *NodeHeader) -> bool
         if head.reserved[k] != 0 then return false
     true
 
-private entry_at(bytes: []u8, base: usize, i: usize) -> ExtentLeaf
-    val p: *ExtentLeaf = at(bytes, base + sizeof(NodeHeader) + i * sizeof(ExtentLeaf))
-    *p
+private entry_at(bytes: []const u8, base: usize, i: usize) -> ExtentLeaf = read_at(bytes, base + sizeof(NodeHeader) + i * sizeof(ExtentLeaf))
 
 // The entries of the node at `base` in `bytes` (its header already checked), which its parent allows
 // [lo, hi): section 9's rules for each entry, then each child read and checked in turn. Claims every
@@ -516,8 +514,8 @@ private walk_node[D: BlockDevice](dev: *D, c: *Checker, rep: Report, ino: u64, g
             c.count += 1
             val child_hi = if i + 1 < count then u64(entries[i + 1].logical) else hi
             var cb = block_buf()
-            dev.read(e.physical, cb.view())?
-            val cv = cb.view()
+            dev.read(e.physical, cb.view_mut())?
+            val cv = cb.view_mut()
             var f: Option[NodeFault] = None
             val ch: *NodeHeader = at(cv, 0)
             if !verify_block(c.m.seed, cv) then f = Some(NodeFault.Checksum)
@@ -553,8 +551,8 @@ private pass5[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result[unit,
     var free_inodes: u64 = 0
     for grp in 0..<g.group_count
         val d = c.m.desc(grp)
-        dev.read(g.block_bitmap(grp), bb.view())?
-        dev.read(g.inode_bitmap(grp), ib.view())?
+        dev.read(g.block_bitmap(grp), bb.view_mut())?
+        dev.read(g.inode_bitmap(grp), ib.view_mut())?
         val first = g.group_first(grp)
         val len = usize(g.group_len(grp))
         val meta = usize(g.meta_blocks(grp))
@@ -601,8 +599,8 @@ private orphan_walk[D: BlockDevice](dev: *D, c: *Checker, rep: Report) -> Result
         reached[usize(ino)] = true
         val grp = u32((ino - 1) / u64(g.inodes_per_group))
         val i = (ino - 1) % u64(g.inodes_per_group)
-        dev.read(g.inode_table(grp) + i / 16, table.view())?
-        val node: *Inode = at(table.view(), usize(i % 16) * INODE_SIZE)
+        dev.read(g.inode_table(grp) + i / 16, table.view_mut())?
+        val node: *Inode = at(table.view_mut(), usize(i % 16) * INODE_SIZE)
         ino = node.orphan_next
     for k in FIRST_INO..<(count + 1)
         if c.flagged[usize(k)] && !reached[usize(k)] then rep.add(Problem.OrphanFlag(k))

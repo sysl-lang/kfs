@@ -83,7 +83,7 @@ struct CrashDevice[D: BlockDevice]
     private put(*self, b: u64, data: []const u8) -> Result[unit, DeviceError]
         if !touched(self.undo_blocks, b) || !touched(self.flushed_blocks, b)
             var old = block_buf()
-            self.inner.read(b, old.view())?
+            self.inner.read(b, old.view_mut())?
             if !touched(self.undo_blocks, b)
                 self.undo_blocks.push(b)
                 self.undo_data.extend(old.view())
@@ -97,10 +97,10 @@ struct CrashDevice[D: BlockDevice]
     // The power fails after a reorder: every block touched since the flush goes back to its bytes at
     // the flush, then the writes that survive are applied again in order.
     private reorder_loss(*self, seed: u64) -> Result[unit, DeviceError]
-        var x = seed * 0x9E37_79B9_7F4A_7C15 + 0x2545_F491_4F6C_DD1D
+        var x = seed *% 0x9E37_79B9_7F4A_7C15 +% 0x2545_F491_4F6C_DD1D
         var keep: Buf[bool] = buf()
         for _ in 0..<self.since_blocks.len()
-            x = x * 6364136223846793005 + 1442695040888963407
+            x = x *% 6364136223846793005 +% 1442695040888963407
             val survives = (x >> 63) == 1
             keep.push(survives)
             if !survives then self.lost += 1
@@ -147,7 +147,7 @@ impl[D: BlockDevice] BlockDevice for CrashDevice[D]
                 if n < at then return self.put(b, data)
                 if n > at then return self.fail()
                 var torn = block_buf()
-                self.inner.read(b, torn.view())?
+                self.inner.read(b, torn.view_mut())?
                 for k in 0..<SECTORS_PER_BLOCK
                     if (sectors >> u8(k)) & 1 == 1
                         for i in k * SECTOR_SIZE..<(k + 1) * SECTOR_SIZE

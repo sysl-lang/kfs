@@ -129,7 +129,7 @@ private reach(rep: Report, d: DirSeen, maps: Buf[Mapped], l: u64) -> Option[u64]
     if maps[i].reached
         problem(rep, Problem.DirReach(d.ino, l))
         return None
-    maps.view()[i].reached = true
+    maps.view_mut()[i].reached = true
     Some(maps[i].phys)
 
 // Read block `l` and check its checksum and tail; None (with the problem reported) when they fail.
@@ -138,7 +138,7 @@ private owned_block[D: BlockDevice](dev: *D, c: *Checker, rep: Report, d: DirSee
         Some(p) -> p
         None -> return Ok(None)
     var blk = block_buf()
-    dev.read(phys, blk.view())?
+    dev.read(phys, blk.view_mut())?
     dir_block_fault(c.m.seed, blk.view(), d.ino, d.generation) match
         Some(f) ->
             problem(rep, Problem.DirBlock(d.ino, l, f))

@@ -931,7 +931,7 @@ node_no_space()
 
 private read_dev(dev: *RamDevice, b: u64) -> Buf[u8]
     var out = new_block()
-    assert(dev.read(b, out.view()).is_ok())
+    assert(dev.read(b, out.view_mut()).is_ok())
     out
 
 private write_dev(dev: *RamDevice, b: u64, bytes: []const u8)
@@ -1036,10 +1036,10 @@ private corrupt(d: Damage) -> i64
         val b = if on_index then built.index else built.leaf
         // A key is checked against the child it leads to, so that child is the block named.
         val named = if d == Damage.KeyNotFirst then built.next_leaf else b
-        val bytes = read_dev(&dev, b)
+        var bytes = read_dev(&dev, b)
         apply(d, bytes)
         var fs = mounted_fs(&dev)
-        if d != Damage.FlipByte then seal_block(fs.seed, bytes.view())
+        if d != Damage.FlipByte then seal_block(fs.seed, bytes.view_mut())
         write_dev(&dev, b, bytes.view())
         var again = mounted_fs(&dev)
         val t = extent_tree(built.ino, 0)
@@ -1120,10 +1120,10 @@ refused_entry()
 private rewrite_inode(dev: *RamDevice, ino: u64, offset: usize, bytes: []const u8)
     var fs = mounted_fs(dev)
     val loc = fs.inode_location(ino)
-    val block = read_dev(dev, loc.block)
+    var block = read_dev(dev, loc.block)
     for k in 0..<bytes.len
         block[loc.offset + offset + k] = bytes[k]
-    seal_inode(fs.seed, ino, block.view()[loc.offset..<loc.offset + INODE_SIZE])
+    seal_inode(fs.seed, ino, block.view_mut()[loc.offset..<loc.offset + INODE_SIZE])
     write_dev(dev, loc.block, block.view())
 
 private le_bytes(v: u64, n: usize) -> Buf[u8]
@@ -1196,10 +1196,10 @@ private struct Rng
     state: u64
 
     next(*self) -> u64
-        self.state += 0x9E37_79B9_7F4A_7C15
+        self.state +%= 0x9E37_79B9_7F4A_7C15
         var z = self.state
-        z = (z ^ (z >> 30)) * 0xBF58_476D_1CE4_E5B9
-        z = (z ^ (z >> 27)) * 0x94D0_49BB_1331_11EB
+        z = (z ^ (z >> 30)) *% 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) *% 0x94D0_49BB_1331_11EB
         z ^ (z >> 31)
 
     below(*self, n: u64) -> u64 = self.next() % n

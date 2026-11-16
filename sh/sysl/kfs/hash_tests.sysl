@@ -49,7 +49,7 @@ hash_is_keyed_siphash13()
     assert_eq(dir_hash(seed.view(), name.view()),
         hash_of_raw(siphash13(0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908, name.view())))
     var other = copy_of(seed.view())
-    other.view()[15] = 0xAA
+    other.view_mut()[15] = 0xAA
     assert(dir_hash(other.view(), name.view()) != dir_hash(seed.view(), name.view()))
 
 @test("over many names the hash is never odd and never outside [8, 2^64 - 4]")

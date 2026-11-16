@@ -381,7 +381,7 @@ private next_leaf[D: BlockDevice, P: Platform](fs: *Fs[D, P], d: Dir, path: Buf[
         val hop = path[k]
         if hop.slot + 1 < hop.entries.len()
             path.truncate(k + 1)
-            path.view()[k].slot = hop.slot + 1
+            path.view_mut()[k].slot = hop.slot + 1
             down_first(fs, d, path)?
             return Ok(true)
     Ok(false)
@@ -559,7 +559,7 @@ private split_leaf[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Di
     while rising
         val hop = path[k]
         hop.entries.insert(hop.slot + 1, entry)
-        path.view()[k].dirty = true
+        path.view_mut()[k].dirty = true
         val c = hop.entries.len()
         if c <= usize(hop.max)
             rising = false
@@ -575,7 +575,7 @@ private split_leaf[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Di
             hop.entries.clear()
             hop.entries.push(IndexEntry(0, u32(a.logical), 0))
             hop.entries.push(IndexEntry(hi[0].key, u32(b.logical), 0))
-            path.view()[0].level = hop.level + 1
+            path.view_mut()[0].level = hop.level + 1
             rising = false
         else
             val b = fresh[used]
@@ -706,7 +706,7 @@ private shrink[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Dir, p
         if names_bytes(rest) + names_bytes(right.names) <= LEAF_HALF
             write_leaf(fs, h, d, leaf.phys, joined(rest, right.names))?
             frees.push(Placed(right.logical, right.phys))
-            path.view()[k].slot = hop.slot + 1
+            path.view_mut()[k].slot = hop.slot + 1
             drop_entry(fs, h, d, path, k, frees)?
             write_path(fs, h, d, path)?
             return Ok(false)
@@ -731,11 +731,11 @@ private drop_entry[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, d: Di
         val hop = path[at]
         val old = hop.entries[hop.slot]
         hop.entries.remove(hop.slot)
-        path.view()[at].dirty = true
+        path.view_mut()[at].dirty = true
         if hop.entries.len() == 0
             if at == 0 then return Ok(true)
             frees.push(Placed(hop.logical, hop.phys))
-            path.view()[at].dirty = false
+            path.view_mut()[at].dirty = false
             at -= 1
         else
             if hop.slot == 0
@@ -853,5 +853,5 @@ private read_dir_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], dir: u64, po
         None -> DIR_POS_END
     if ls.stopped.is_some() && ls.items.len() == 0 then return Err(FsError.Invalid)
     for i in 0..<ls.items.len()
-        ls.items.view()[i].next = if i + 1 < ls.items.len() then ls.items[i + 1].pos else next
+        ls.items.view_mut()[i].next = if i + 1 < ls.items.len() then ls.items[i + 1].pos else next
     Ok(Listing(ls.items, next))

@@ -1,6 +1,7 @@
 module sh.sysl.kfs
 
-import sysl.slices.as_mut_ptr
+import sysl.raw.ptr_cast
+import sysl.slices.{as_mut_ptr, as_ptr}
 
 // Every on-disk structure of kfs/SPEC.md sections 5-14, as a struct whose size and every field's offset
 // is pinned by an `@assert`. Each is read and written in place through a pointer into a block's bytes
@@ -12,6 +13,13 @@ import sysl.slices.as_mut_ptr
 at[T](bytes: []u8, offset: usize) -> *T
     if offset + sizeof(T) > bytes.len then panic("sh.sysl.kfs: a structure past the end of its block")
     ptr_cast(usize(as_mut_ptr(bytes)) + offset)
+
+// A copy of the struct inside a block's bytes: `T` at `offset`, for a reader that changes nothing and so
+// holds the bytes read-only. The same alignment and bounds as `at`.
+read_at[T](bytes: []const u8, offset: usize) -> T
+    if offset + sizeof(T) > bytes.len then panic("sh.sysl.kfs: a structure past the end of its block")
+    val p: *T = ptr_cast(usize(as_ptr(bytes)) + offset)
+    *p
 
 // The capacities of the blocks that hold arrays of entries, against where each block's tail or checksum
 // begins.

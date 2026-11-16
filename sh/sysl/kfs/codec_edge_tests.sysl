@@ -52,14 +52,14 @@ crc_every_table_entry()
     var one: Buf[u8] = buf()
     one.push(0)
     for i in 0..<256
-        one.view()[0] = u8(i)
+        one.view_mut()[0] = u8(i)
         assert_eq(crc32c(0, one.view()), crc_bitwise(0, one.view()))
     // The entries the reflected polynomial pins by hand: 0, 128 (the polynomial itself) and 1.
-    one.view()[0] = 0
+    one.view_mut()[0] = 0
     assert_eq(crc32c(0, one.view()), 0)
-    one.view()[0] = 128
+    one.view_mut()[0] = 128
     assert_eq(crc32c(0, one.view()), 0x82F63B78)
-    one.view()[0] = 1
+    one.view_mut()[0] = 1
     assert_eq(crc32c(0, one.view()), 0xF26B8303)
 
 @test("a single byte: the standard CRC32C of \"a\" is 0xC1D04330, and of 0x00 and 0xFF their reference values")
@@ -67,10 +67,10 @@ crc_one_byte()
     var one: Buf[u8] = buf()
     one.push(u8('a'))
     assert_eq(crc32c_standard(one.view()), 0xC1D04330)
-    one.view()[0] = 0
+    one.view_mut()[0] = 0
     assert_eq(crc32c_standard(one.view()), ~crc_bitwise(0xFFFF_FFFF, one.view()))
     assert_eq(crc32c_standard(one.view()), 0x527D5351)
-    one.view()[0] = 0xFF
+    one.view_mut()[0] = 0xFF
     assert_eq(crc32c_standard(one.view()), ~crc_bitwise(0xFFFF_FFFF, one.view()))
 
 @test("every length from 1 to 64, at every starting offset 0 to 7, under four seeds, agrees with the bitwise CRC")
@@ -140,7 +140,7 @@ hash_clamp_odd_values()
     assert_eq(hash_of_raw(0x7FFF_FFFF_FFFF_FFFF), 0x7FFF_FFFF_FFFF_FFFE)
     assert_eq(hash_of_raw(0x8000_0000_0000_0001), 0x8000_0000_0000_0000)
     for r in 0..<u64(64)
-        val raw = 0x0123_4567_89AB_CDEF ^ (r * 0x9E37_79B9_7F4A_7C15)
+        val raw = 0x0123_4567_89AB_CDEF ^ (r *% 0x9E37_79B9_7F4A_7C15)
         val h = hash_of_raw(raw | 1)
         assert_eq(h, hash_of_raw(raw & ~u64(1)))
         assert(h & 1 == 0)
@@ -161,24 +161,24 @@ hash_hook_edges()
 bitmap_edge_bits()
     var b = new_block()
     for i in [0, 7, 8, 32767]
-        bit_set(b.view(), usize(i))
+        bit_set(b.view_mut(), usize(i))
         assert(bit_test(b.view(), usize(i)))
         assert_eq(b.view()[usize(i) / 8], u8(1) << u8(usize(i) % 8))
         assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), u32(BLOCK_SIZE * 8 - 1))
-        bit_clear(b.view(), usize(i))
+        bit_clear(b.view_mut(), usize(i))
         assert(!bit_test(b.view(), usize(i)))
         assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), u32(BLOCK_SIZE * 8))
 
 @test("an empty range sets nothing, a range of one sets one bit, and count_clear of no bits is 0")
 bitmap_empty_ranges()
     var b = new_block()
-    bit_set_range(b.view(), 100, 100)
+    bit_set_range(b.view_mut(), 100, 100)
     assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), u32(BLOCK_SIZE * 8))
     assert_eq(count_clear(b.view(), 0), 0)
-    bit_set_range(b.view(), 100, 101)
+    bit_set_range(b.view_mut(), 100, 101)
     assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), u32(BLOCK_SIZE * 8 - 1))
     assert(bit_test(b.view(), 100) && !bit_test(b.view(), 99) && !bit_test(b.view(), 101))
-    bit_set_range(b.view(), 0, BLOCK_SIZE * 8)
+    bit_set_range(b.view_mut(), 0, BLOCK_SIZE * 8)
     assert_eq(count_clear(b.view(), BLOCK_SIZE * 8), 0)
     for x in b.view()
         assert_eq(x, 0xFF)
@@ -186,8 +186,8 @@ bitmap_empty_ranges()
 @test("clearing a bit leaves its seven neighbours in the byte set")
 bitmap_clear_one_of_eight()
     var b = new_block()
-    bit_set_range(b.view(), 8, 16)
-    bit_clear(b.view(), 13)
+    bit_set_range(b.view_mut(), 8, 16)
+    bit_clear(b.view_mut(), 13)
     assert_eq(b.view()[1], 0xDF)
     assert_eq(b.view()[0], 0)
     assert_eq(b.view()[2], 0)
@@ -205,7 +205,7 @@ dirleaf_live_bytes()
 
 private leaf_holding(name: []const u8, ino: u64, file_type: u8) -> Buf[u8]
     var blk = new_block()
-    single_entry_leaf(blk.view(), 0x5EED_0003, 0x1_0000_0002, 7, ino, file_type, name)
+    single_entry_leaf(blk.view_mut(), 0x5EED_0003, 0x1_0000_0002, 7, ino, file_type, name)
     blk
 
 @test("a single-entry leaf with a one-byte name and with a 255-byte name: header, record, name, zero slack, tail")
@@ -268,51 +268,51 @@ checksum_coverage_boundaries()
     val seed: u32 = 0x5EED_0005
     var blk = filled_block(25)
     // The superblock: 507 covered, 512 outside (508..511 is the crc).
-    seal_superblock(blk.view())
-    blk.view()[507] ^= 0x80
+    seal_superblock(blk.view_mut())
+    blk.view_mut()[507] ^= 0x80
     assert(!verify_superblock(blk.view()))
-    blk.view()[507] ^= 0x80
-    blk.view()[512] ^= 0x80
+    blk.view_mut()[507] ^= 0x80
+    blk.view_mut()[512] ^= 0x80
     assert(verify_superblock(blk.view()))
     // A sector-sealed journal block: the same boundaries under csum_seed.
-    seal_sector(seed, blk.view())
-    blk.view()[507] ^= 1
+    seal_sector(seed, blk.view_mut())
+    blk.view_mut()[507] ^= 1
     assert(!verify_sector(seed, blk.view()))
-    blk.view()[507] ^= 1
-    blk.view()[512] ^= 1
+    blk.view_mut()[507] ^= 1
+    blk.view_mut()[512] ^= 1
     assert(verify_sector(seed, blk.view()))
     // A descriptor at 64 in its table block: 64 + 59 covered, 64 + 64 belongs to the next descriptor.
-    seal_group_desc(seed, 1, blk.view()[64..<128])
-    blk.view()[64 + 59] ^= 1
+    seal_group_desc(seed, 1, blk.view_mut()[64..<128])
+    blk.view_mut()[64 + 59] ^= 1
     assert(!verify_group_desc(seed, 1, blk.view()[64..<128]))
-    blk.view()[64 + 59] ^= 1
-    blk.view()[128] ^= 1
-    blk.view()[63] ^= 1
+    blk.view_mut()[64 + 59] ^= 1
+    blk.view_mut()[128] ^= 1
+    blk.view_mut()[63] ^= 1
     assert(verify_group_desc(seed, 1, blk.view()[64..<128]))
     // An inode at 256: 256 + 251 covered, 512 is the next inode.
-    seal_inode(seed, 2, blk.view()[256..<512])
-    blk.view()[256 + 251] ^= 1
+    seal_inode(seed, 2, blk.view_mut()[256..<512])
+    blk.view_mut()[256 + 251] ^= 1
     assert(!verify_inode(seed, 2, blk.view()[256..<512]))
-    blk.view()[256 + 251] ^= 1
-    blk.view()[512] ^= 1
-    blk.view()[255] ^= 1
+    blk.view_mut()[256 + 251] ^= 1
+    blk.view_mut()[512] ^= 1
+    blk.view_mut()[255] ^= 1
     assert(verify_inode(seed, 2, blk.view()[256..<512]))
     // An owned block: 4091 is the generation's last byte, covered; there is nothing outside.
-    set_tail(blk.view(), 9, 9)
-    seal_block(seed, blk.view())
-    blk.view()[4091] ^= 1
+    set_tail(blk.view_mut(), 9, 9)
+    seal_block(seed, blk.view_mut())
+    blk.view_mut()[4091] ^= 1
     assert(!verify_block(seed, blk.view()))
 
 @test("a structure sealed with one seed fails under the seed of a filesystem with another uuid")
 checksum_seed_from_uuid()
     var a = counting(16)
     var b = counting(16)
-    b.view()[0] = 0xFF
+    b.view_mut()[0] = 0xFF
     val sa = csum_seed_of(a.view())
     val sb = csum_seed_of(b.view())
     assert(sa != sb)
     var blk = filled_block(26)
-    seal_inode(sa, 11, blk.view()[0..<256])
+    seal_inode(sa, 11, blk.view_mut()[0..<256])
     assert(verify_inode(sa, 11, blk.view()[0..<256]))
     assert(!verify_inode(sb, 11, blk.view()[0..<256]))
 
@@ -321,23 +321,23 @@ checksum_seed_from_uuid()
 @test("a copy whose first three bytes are the magic's but whose fourth is not is logged as it is")
 escape_three_of_four()
     var copy = filled_block(27)
-    put_le32(copy.view(), 0, JOURNAL_MAGIC)
-    copy.view()[3] = copy.view()[3] ^ 0x01
+    put_le32(copy.view_mut(), 0, JOURNAL_MAGIC)
+    copy.view_mut()[3] = copy.view()[3] ^ 0x01
     val before = copy_of(copy.view())
-    assert_eq(escape_copy(copy.view()), 0)
+    assert_eq(escape_copy(copy.view_mut()), 0)
     for i in 0..<BLOCK_SIZE
         assert_eq(copy.view()[i], before.view()[i])
     // And one whose last three bytes are the magic's but whose first is not.
-    put_le32(copy.view(), 0, JOURNAL_MAGIC ^ 0xFF)
-    assert_eq(escape_copy(copy.view()), 0)
+    put_le32(copy.view_mut(), 0, JOURNAL_MAGIC ^ 0xFF)
+    assert_eq(escape_copy(copy.view_mut()), 0)
     assert_eq(le32(copy.view(), 0), JOURNAL_MAGIC ^ 0xFF)
 
 @test("the magic anywhere but at byte 0 is not escaped")
 escape_only_at_the_start()
     var copy = new_block()
-    put_le32(copy.view(), 4, JOURNAL_MAGIC)
-    put_le32(copy.view(), 4092, JOURNAL_MAGIC)
-    assert_eq(escape_copy(copy.view()), 0)
+    put_le32(copy.view_mut(), 4, JOURNAL_MAGIC)
+    put_le32(copy.view_mut(), 4092, JOURNAL_MAGIC)
+    assert_eq(escape_copy(copy.view_mut()), 0)
     assert_eq(le32(copy.view(), 4), JOURNAL_MAGIC)
     assert_eq(le32(copy.view(), 0), 0)
 
@@ -345,12 +345,12 @@ escape_only_at_the_start()
 escape_round_trip_with_tag()
     val seed: u32 = 0x5EED_0006
     var copy = filled_block(28)
-    put_le32(copy.view(), 0, JOURNAL_MAGIC)
+    put_le32(copy.view_mut(), 0, JOURNAL_MAGIC)
     val original = copy_of(copy.view())
     var tagblk = new_block()
-    val tag = at[Tag](tagblk.view(), 24)
+    val tag = at[Tag](tagblk.view_mut(), 24)
     tag.block = 77
-    tag.flags = escape_copy(copy.view())
+    tag.flags = escape_copy(copy.view_mut())
     assert_eq(tag.flags, TAG_ESCAPED)
     assert_eq(le32(copy.view(), 0), 0)
     for i in 4..<BLOCK_SIZE
@@ -359,12 +359,12 @@ escape_round_trip_with_tag()
     // The tag covers the logged (zeroed) bytes, not the home bytes.
     assert(verify_tag(seed, 5, tag, copy.view()))
     assert(!verify_tag(seed, 5, tag, original.view()))
-    unescape_copy(copy.view(), tag.flags)
+    unescape_copy(copy.view_mut(), tag.flags)
     for i in 0..<BLOCK_SIZE
         assert_eq(copy.view()[i], original.view()[i])
     // A copy logged unescaped is left alone on replay, whatever its first word is.
     var plain = new_block()
-    unescape_copy(plain.view(), 0)
+    unescape_copy(plain.view_mut(), 0)
     assert_eq(le32(plain.view(), 0), 0)
-    unescape_copy(plain.view(), 0xFFFF_FFFE)
+    unescape_copy(plain.view_mut(), 0xFFFF_FFFE)
     assert_eq(le32(plain.view(), 0), 0)

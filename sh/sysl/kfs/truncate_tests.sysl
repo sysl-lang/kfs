@@ -116,7 +116,7 @@ truncate_to_zero()
     assert(n.size == 0 && n.blocks == 0 && must_u16(depth_of(&fs, ino)) == 0)
     assert(last_extent(&fs, ino).is_ok())
     var out = zeros(10)
-    assert(must_n(read(&fs, ino, 0, out.view())) == 0)
+    assert(must_n(read(&fs, ino, 0, out.view_mut())) == 0)
     settled_clean(&fs)
 
 @test("a shrink frees unwritten extents past the new end too")

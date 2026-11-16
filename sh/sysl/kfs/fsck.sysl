@@ -255,37 +255,37 @@ private restore_super[D: BlockDevice](dev: *D, e: OpenError, out: FsckReport) ->
         val b = backup match
             Some(x) -> x
             None -> return false
-        if dev.read(b.block, blk.view()).is_err() then return false
+        if dev.read(b.block, blk.view_mut()).is_err() then return false
         // Its static fields are the filesystem's; its totals are stale (so not CLEAN) and its orphan list
         // is not the list.
-        val sb: *Superblock = at(blk.view(), 0)
+        val sb: *Superblock = at(blk.view_mut(), 0)
         sb.state = sb.state & ~STATE_CLEAN
         sb.orphan_head = 0
-        seal_superblock(blk.view())
+        seal_superblock(blk.view_mut())
         if dev.write(1, blk.view()).is_err() || dev.flush().is_err() then return false
         out.note(s"the primary superblock was restored from the backup at block ${b.block}")
     else
-        if dev.read(1, blk.view()).is_err() then return false
-    val sb: *Superblock = at(blk.view(), 0)
+        if dev.read(1, blk.view_mut()).is_err() then return false
+    val sb: *Superblock = at(blk.view_mut(), 0)
     if check_superblock(sb, dev.blocks()).is_err() then return false
     val g = geometry_of(sb)
     val seed = sb.csum_seed
     var table = block_buf()
     var spare = block_buf()
     for t in 0..<u64(g.gdt_blocks)
-        if dev.read(2 + t, table.view()).is_err() then return false
+        if dev.read(2 + t, table.view_mut()).is_err() then return false
         var changed = false
         for k in 0..<64
             val grp = u32(t) * 64 + u32(k)
             if grp >= g.group_count then break
             val off = usize(k) * 64
-            val d: *GroupDesc = at(table.view(), off)
+            val d: *GroupDesc = at(table.view_mut(), off)
             if verify_group_desc(seed, grp, table.view()[off..<off + 64]) && d.block_bitmap == g.block_bitmap(grp) && d.inode_bitmap == g.inode_bitmap(grp) && d.inode_table == g.inode_table(grp)
                 continue
             var from_backup = false
             backup match
                 Some(b) ->
-                    if dev.read(b.block + 1 + t, spare.view()).is_ok() && verify_group_desc(seed, grp, spare.view()[off..<off + 64])
+                    if dev.read(b.block + 1 + t, spare.view_mut()).is_ok() && verify_group_desc(seed, grp, spare.view()[off..<off + 64])
                         for i in off..<off + 64
                             table[i] = spare[i]
                         from_backup = true
@@ -296,7 +296,7 @@ private restore_super[D: BlockDevice](dev: *D, e: OpenError, out: FsckReport) ->
                 d.block_bitmap = g.block_bitmap(grp)
                 d.inode_bitmap = g.inode_bitmap(grp)
                 d.inode_table = g.inode_table(grp)
-                seal_group_desc(seed, grp, table.view()[off..<off + 64])
+                seal_group_desc(seed, grp, table.view_mut()[off..<off + 64])
             changed = true
             out.note(if from_backup then s"group ${grp}'s descriptor was restored from the backup" else s"group ${grp}'s descriptor was rebuilt from the geometry")
         if changed
@@ -309,8 +309,8 @@ private empty_journal[D: BlockDevice](dev: *D, sb: Superblock) -> Result[unit, D
     var blk = block_buf()
     var top: u64 = 0
     for p in 1..<sb.journal_blocks
-        dev.read(sb.journal_start + u64(p), blk.view())?
-        val h: *JournalHeader = at(blk.view(), 0)
+        dev.read(sb.journal_start + u64(p), blk.view_mut())?
+        val h: *JournalHeader = at(blk.view_mut(), 0)
         if h.magic == JOURNAL_MAGIC && h.sequence > top then top = h.sequence
     write_journal_super(dev, sb, JournalState(0, top + 1, 0))?
     dev.flush()
@@ -341,14 +341,14 @@ private stamp[D: BlockDevice, P: Platform](dev: *D, plat: P) -> Result[unit, Dev
         inodes += u64(d.free_inodes)
     var p = plat
     var blk = block_buf()
-    dev.read(1, blk.view())?
-    val sb: *Superblock = at(blk.view(), 0)
+    dev.read(1, blk.view_mut())?
+    val sb: *Superblock = at(blk.view_mut(), 0)
     sb.state = (sb.state | STATE_CLEAN) & ~STATE_ERROR
     sb.free_blocks = blocks
     sb.free_inodes = inodes
     sb.check_time = p.now().sec
     sb.mount_count = 0
-    seal_superblock(blk.view())
+    seal_superblock(blk.view_mut())
     dev.write(1, blk.view())?
     dev.flush()
 
@@ -452,8 +452,8 @@ private put_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64
 // A copy of inode `ino` as the cache has it, its checksum unexamined.
 private inode_now[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64) -> Result[Inode, FsError]
     val loc = fs.inode_location(ino)
-    val b = block_now(fs, loc.block)?
-    val n: *Inode = at(b.view(), loc.offset)
+    var b = block_now(fs, loc.block)?
+    val n: *Inode = at(b.view_mut(), loc.offset)
     Ok(*n)
 
 private one_of(xs: Buf[u64], x: u64) -> bool
@@ -635,11 +635,12 @@ private fix_bitmaps[D: BlockDevice, P: Platform](fs: *Fs[D, P], c: Checker, rep:
     val sbr = block_now(fs, 1)
     var r: Result[bool, FsError] = Ok(false)
     sbr match
-        Ok(sbb) ->
-            val sb: *Superblock = at(sbb.view(), 0)
+        Ok(b) ->
+            var sbb = b
+            val sb: *Superblock = at(sbb.view_mut(), 0)
             sb.free_blocks = free_blocks
             sb.free_inodes = free_inodes
-            seal_superblock(sbb.view())
+            seal_superblock(sbb.view_mut())
             r = put_block(fs, &h, 1, sbb.view())
         Err(e) -> r = Err(e)
     fs.stop(&h)
@@ -667,23 +668,23 @@ private group_counts[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, c: 
         val b = first + u64(i)
         val journal = b >= g.journal_start && b < g.journal_start + u64(g.journal_blocks)
         val want = i < meta || i >= len || journal || (b < u64(c.owner.len()) && c.owner[usize(b)] != 0)
-        if want then bit_set(bb.view(), i) else if !keep_set then bit_clear(bb.view(), i)
+        if want then bit_set(bb.view_mut(), i) else if !keep_set then bit_clear(bb.view_mut(), i)
     val ipg = usize(g.inodes_per_group)
     for i in 0..<(BLOCK_SIZE * 8)
         val ino = u64(grp) * u64(g.inodes_per_group) + u64(i) + 1
-        if i >= ipg || ino < FIRST_INO then bit_set(ib.view(), i)
+        if i >= ipg || ino < FIRST_INO then bit_set(ib.view_mut(), i)
     var changed = put_block(fs, h, g.block_bitmap(grp), bb.view())?
     if put_block(fs, h, g.inode_bitmap(grp), ib.view())? then changed = true
     val db = fs.desc_block(grp)
     val off = fs.desc_offset(grp)
     var table = block_now(fs, db)?
-    val d: *GroupDesc = at(table.view(), off)
+    val d: *GroupDesc = at(table.view_mut(), off)
     d.free_blocks = count_clear(bb.view(), len)
     d.free_inodes = count_clear(ib.view(), ipg)
     d.directories = c.dirs[usize(grp)]
     d.block_bitmap_crc = bitmap_crc(seed, grp, bb.view())
     d.inode_bitmap_crc = bitmap_crc(seed, grp, ib.view())
-    seal_group_desc(seed, grp, table.view()[off..<off + 64])
+    seal_group_desc(seed, grp, table.view_mut()[off..<off + 64])
     if put_block(fs, h, db, table.view())? then changed = true
     Ok(GroupCounts(u64(d.free_blocks), u64(d.free_inodes), changed))
 
@@ -746,18 +747,18 @@ private shares(shared: Buf[u64], first: u64, len: u64) -> bool
 // The node at `base` in block `block` (the inode's slot when `in_inode`) and everything under it: each
 // leaf extent holding a shared block copied to a new run, and its entry pointed there.
 private copy_in[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, generation: u32, block: u64, base: usize, in_inode: bool, shared: Buf[u64], out: FsckReport) -> Result[u32, FsError]
-    val bytes = block_now(fs, block)?
-    val head: *NodeHeader = at(bytes.view(), base)
+    var bytes = block_now(fs, block)?
+    val head: *NodeHeader = at(bytes.view_mut(), base)
     val count = usize(head.count)
     val leaf = head.depth == 0
     var n: u32 = 0
     for i in 0..<count
         val off = base + sizeof(NodeHeader) + i * sizeof(ExtentLeaf)
         if !leaf
-            val x: *ExtentIndex = at(bytes.view(), off)
+            val x: *ExtentIndex = at(bytes.view_mut(), off)
             n += copy_in(fs, ino, generation, x.child, 0, false, shared, out)?
             continue
-        val e: *ExtentLeaf = at(bytes.view(), off)
+        val e: *ExtentLeaf = at(bytes.view_mut(), off)
         val ext = *e
         if !shares(shared, ext.physical, u64(ext.len)) then continue
         var h = fs.start("fsck: copy", C_ALLOC + C_INODE + 1)
@@ -784,7 +785,7 @@ private copy_extent[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino:
     if ext.flags & EXTENT_UNWRITTEN == 0
         var blk = block_buf()
         for k in 0..<u64(ext.len)
-            fs.dev.read(ext.physical + k, blk.view())?
+            fs.dev.read(ext.physical + k, blk.view_mut())?
             fs.write_new_data(h, run.first + k, blk.view())?
     val seed = fs.seed
     val loc = fs.inode_location(ino)

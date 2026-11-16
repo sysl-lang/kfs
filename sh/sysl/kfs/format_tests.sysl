@@ -25,7 +25,7 @@ private formatted(blocks: u64) -> Formatted = formatted_with(blocks, default_opt
 
 private read_block(dev: *RamDevice, b: u64) -> Buf[u8]
     var out = new_block()
-    assert(dev.read(b, out.view()).is_ok())
+    assert(dev.read(b, out.view_mut()).is_ok())
     out
 
 private mounted(dev: *RamDevice) -> Mounted
@@ -220,9 +220,9 @@ format_root_directory()
     val loc = m.inode_location(2) match
         Some(l) -> l
         None -> panic("no inode 2")
-    val blk = read_block(&f.dev, loc.block)
+    var blk = read_block(&f.dev, loc.block)
     assert(verify_inode(m.seed, 2, blk.view()[loc.offset..<loc.offset + 256]))
-    val root: *Inode = at(blk.view(), loc.offset)
+    val root: *Inode = at(blk.view_mut(), loc.offset)
     assert_eq(root.mode, 0o040755)
     assert_eq(root.links, 3)
     assert_eq(root.uid, 0)
@@ -236,12 +236,12 @@ format_root_directory()
     assert_eq(root.orphan_next, 0)
     assert_eq(root.crtime_sec, 1_700_000_000)
     assert_eq(root.mtime_sec, 1_700_000_000)
-    val head: *NodeHeader = at(blk.view(), loc.offset + 112)
+    val head: *NodeHeader = at(blk.view_mut(), loc.offset + 112)
     assert_eq(head.magic, EXTENT_MAGIC)
     assert_eq(head.count, 1)
     assert_eq(head.max, 7)
     assert_eq(head.depth, 0)
-    val ext: *ExtentLeaf = at(blk.view(), loc.offset + 112 + 16)
+    val ext: *ExtentLeaf = at(blk.view_mut(), loc.offset + 112 + 16)
     assert_eq(ext.logical, 0)
     assert_eq(ext.len, 1)
     assert_eq(ext.flags, 0)
@@ -254,9 +254,9 @@ format_lost_and_found()
     val loc = m.inode_location(11) match
         Some(l) -> l
         None -> panic("no inode 11")
-    val blk = read_block(&f.dev, loc.block)
+    var blk = read_block(&f.dev, loc.block)
     assert(verify_inode(m.seed, 11, blk.view()[loc.offset..<loc.offset + 256]))
-    val lf: *Inode = at(blk.view(), loc.offset)
+    val lf: *Inode = at(blk.view_mut(), loc.offset)
     assert_eq(lf.mode, 0o040700)
     assert_eq(lf.links, 2)
     assert_eq(lf.size, 0)
@@ -264,17 +264,17 @@ format_lost_and_found()
     assert_eq(lf.parent, 2)
     assert_eq(lf.generation, 1)
     assert_eq(lf.flags, 0)
-    val head: *NodeHeader = at(blk.view(), loc.offset + 112)
+    val head: *NodeHeader = at(blk.view_mut(), loc.offset + 112)
     assert_eq(head.magic, EXTENT_MAGIC)
     assert_eq(head.count, 0)
     assert_eq(head.max, 7)
     // The root's leaf.
-    val leaf = read_block(&f.dev, f.geo.data_start(0))
+    var leaf = read_block(&f.dev, f.geo.data_start(0))
     assert(verify_owned_block(m.seed, leaf.view(), 2, 1))
-    val lh: *DirLeafHeader = at(leaf.view(), 0)
+    val lh: *DirLeafHeader = at(leaf.view_mut(), 0)
     assert_eq(lh.magic, DIR_LEAF_MAGIC)
     assert_eq(lh.count, 1)
-    val rec: *DirRecordHeader = at(leaf.view(), 8)
+    val rec: *DirRecordHeader = at(leaf.view_mut(), 8)
     assert_eq(rec.ino, 11)
     assert_eq(rec.rec_len, 4072)
     assert_eq(rec.name_len, 10)
@@ -309,9 +309,9 @@ format_inode_locations()
 format_empty_journal()
     var f = formatted(8192)
     val m = mounted(&f.dev)
-    val blk = read_block(&f.dev, m.sb.journal_start)
+    var blk = read_block(&f.dev, m.sb.journal_start)
     assert(verify_sector(m.seed, blk.view()))
-    val js: *JournalSuper = at(blk.view(), 0)
+    val js: *JournalSuper = at(blk.view_mut(), 0)
     assert_eq(js.header.magic, JOURNAL_MAGIC)
     assert_eq(js.header.kind, JOURNAL_SUPER)
     assert_eq(js.header.sequence, 0)
@@ -474,16 +474,16 @@ open_refusals()
     var f = formatted(8192)
     // A flipped byte in group 2's descriptor.
     var table = read_block(&f.dev, 2)
-    table.view()[2 * 64 + 5] ^= 1
+    table.view_mut()[2 * 64 + 5] ^= 1
     assert(f.dev.write(2, table.view()).is_ok())
     assert_eq(open_failure(open(&f.dev)), 102)
     // A descriptor that is sealed correctly but puts group 1's bitmap elsewhere.
     var moved = read_block(&f.dev, 2)
-    moved.view()[2 * 64 + 5] ^= 1
+    moved.view_mut()[2 * 64 + 5] ^= 1
     val seed = mounted_seed(&f.dev)
-    val d: *GroupDesc = at(moved.view(), 64)
+    val d: *GroupDesc = at(moved.view_mut(), 64)
     d.block_bitmap += 1
-    seal_group_desc(seed, 1, moved.view()[64..<128])
+    seal_group_desc(seed, 1, moved.view_mut()[64..<128])
     assert(f.dev.write(2, moved.view()).is_ok())
     assert_eq(open_failure(open(&f.dev)), 201)
 
@@ -492,30 +492,30 @@ open_superblock_refusals()
     var f = formatted(8192)
     val good = read_block(&f.dev, 1)
     var bad = copy_of(good.view())
-    val sb: *Superblock = at(bad.view(), 0)
+    val sb: *Superblock = at(bad.view_mut(), 0)
     sb.magic = 0
-    seal_superblock(bad.view())
+    seal_superblock(bad.view_mut())
     assert(f.dev.write(1, bad.view()).is_ok())
     assert_eq(open_failure(open(&f.dev)), 2)
 
     bad = copy_of(good.view())
-    val v: *Superblock = at(bad.view(), 0)
+    val v: *Superblock = at(bad.view_mut(), 0)
     v.version = 2
-    seal_superblock(bad.view())
+    seal_superblock(bad.view_mut())
     assert(f.dev.write(1, bad.view()).is_ok())
     assert_eq(open_failure(open(&f.dev)), 3)
 
     bad = copy_of(good.view())
-    val g: *Superblock = at(bad.view(), 0)
+    val g: *Superblock = at(bad.view_mut(), 0)
     g.group_count = 5
-    seal_superblock(bad.view())
+    seal_superblock(bad.view_mut())
     assert(f.dev.write(1, bad.view()).is_ok())
     assert_eq(open_failure(open(&f.dev)), 4)
 
     bad = copy_of(good.view())
-    val j: *Superblock = at(bad.view(), 0)
+    val j: *Superblock = at(bad.view_mut(), 0)
     j.journal_start += 1
-    seal_superblock(bad.view())
+    seal_superblock(bad.view_mut())
     assert(f.dev.write(1, bad.view()).is_ok())
     assert_eq(open_failure(open(&f.dev)), 4)
 
@@ -526,8 +526,8 @@ open_superblock_refusals()
     assert_eq(open_failure(open(&small)), 4)
 
 private mounted_seed(dev: *RamDevice) -> u32
-    val blk = read_block(dev, 1)
-    val sb: *Superblock = at(blk.view(), 0)
+    var blk = read_block(dev, 1)
+    val sb: *Superblock = at(blk.view_mut(), 0)
     sb.csum_seed
 
 // A device that wraps another and counts what passes through: the shape every wrapper (the crash device

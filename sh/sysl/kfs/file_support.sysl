@@ -100,7 +100,7 @@ put_pattern[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64, offset: u64, n: 
 // Read `n` bytes at `offset`: the bytes read, as many as the file gave.
 got[D: BlockDevice](fs: *Fs[D, HostPlatform], ino: u64, offset: u64, n: usize) -> Buf[u8]
     var out = zeros(n)
-    val k = must_n(read(fs, ino, offset, out.view()))
+    val k = must_n(read(fs, ino, offset, out.view_mut()))
     out.truncate(k)
     out
 

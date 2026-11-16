@@ -256,7 +256,7 @@ private readlink_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, ou
         Mapping.Mapped(b, _, false) -> b
         _ -> return Err(fs.corrupt(Corruption.Inode(ino)))
     var blk = block_buf()
-    fs.read_data(b, blk.view())?
+    fs.read_data(b, blk.view_mut())?
     for k in 0..<n
         out[k] = blk[k]
     Ok(n)

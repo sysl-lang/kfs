@@ -76,7 +76,7 @@ sparse_formatted(blocks: u64, o: Options) -> Sparse
 
 block_of[D: BlockDevice](dev: *D, b: u64) -> Buf[u8]
     var out = new_block()
-    assert(dev.read(b, out.view()).is_ok())
+    assert(dev.read(b, out.view_mut()).is_ok())
     out
 
 private equal(a: []const u8, b: []const u8) -> bool

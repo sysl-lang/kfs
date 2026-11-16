@@ -168,7 +168,7 @@ listing_while_changing()
             pos = l.next
             // Between calls: a few new names, and a few of the churn names out.
             for _ in 0..<3
-                rng = rng * 6364136223846793005 + 1442695040888963407
+                rng = rng *% 6364136223846793005 +% 1442695040888963407
                 if (rng >> 33) % 2 == 0
                     add(&fs, d, name_of("new", next_new, 30, u8('.')).view(), f)
                     next_new += 1

@@ -169,11 +169,11 @@ pass1_xattr_blocks()
         var blk = raw(&dev, b)
         if which == 0 then blk[20] = blk[20] ^ 1
         if which == 1
-            put_le32(blk.view(), 0, 0x1234)
-            seal_block(super_of(&dev).csum_seed, blk.view())
+            put_le32(blk.view_mut(), 0, 0x1234)
+            seal_block(super_of(&dev).csum_seed, blk.view_mut())
         if which == 2
-            put_le64(blk.view(), TAIL_OFFSET, f + 1)
-            seal_block(super_of(&dev).csum_seed, blk.view())
+            put_le64(blk.view_mut(), TAIL_OFFSET, f + 1)
+            seal_block(super_of(&dev).csum_seed, blk.view_mut())
         if which < 3 then raw_put(&dev, b, blk.view()) else edit_super(&dev, 0, 0, 0)
         val rep = check(&dev)
         if which < 3 then assert(has_problem(rep, Problem.Xattr(f))) else assert(has_problem(rep, Problem.XattrFeature(f)))

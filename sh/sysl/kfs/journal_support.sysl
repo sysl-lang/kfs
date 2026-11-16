@@ -121,7 +121,7 @@ digest(bytes: []const u8) -> u64 = siphash(1, 3, 0x6B66_7364_6967_6573, 0x0123_4
 
 raw[D: BlockDevice](dev: *D, b: u64) -> Buf[u8]
     var out = new_block()
-    assert(dev.read(b, out.view()).is_ok())
+    assert(dev.read(b, out.view_mut()).is_ok())
     out
 
 raw_put[D: BlockDevice](dev: *D, b: u64, bytes: []const u8)
@@ -138,8 +138,8 @@ holds[D: BlockDevice](dev: *D, b: u64, salt: u32) -> bool = same(raw(dev, b).vie
 
 // The superblock as it is on the device.
 super_of[D: BlockDevice](dev: *D) -> Superblock
-    val b = raw(dev, 1)
-    val sb: *Superblock = at(b.view(), 0)
+    var b = raw(dev, 1)
+    val sb: *Superblock = at(b.view_mut(), 0)
     *sb
 
 // The journal superblock as it is on the device.
@@ -179,19 +179,19 @@ log_contents[D: BlockDevice](dev: *D) -> LogContents
     for t in sc.txns.view()
         var pos = t.first
         while pos != t.commit
-            val blk = raw(dev, log_pos(sb, pos))
-            val h: *JournalHeader = at(blk.view(), 0)
+            var blk = raw(dev, log_pos(sb, pos))
+            val h: *JournalHeader = at(blk.view_mut(), 0)
             if h.kind == JOURNAL_DESCRIPTOR
                 out.descriptors += 1
-                val d: *DescriptorHeader = at(blk.view(), 0)
+                val d: *DescriptorHeader = at(blk.view_mut(), 0)
                 for i in 0..<usize(d.count)
-                    val tag = tag_at(blk.view(), i)
+                    val tag = tag_at(blk.view_mut(), i)
                     val cp = log_advance(sb.journal_blocks, pos, u32(i) + 1)
                     out.copies.push(LogCopy(t.seq, tag.block, tag.flags, cp, raw(dev, log_pos(sb, cp))))
                 pos = log_advance(sb.journal_blocks, pos, 1 + d.count)
             else
                 out.revoke_blocks += 1
-                val r: *RevokeHeader = at(blk.view(), 0)
+                val r: *RevokeHeader = at(blk.view_mut(), 0)
                 for i in 0..<usize(r.count)
                     out.revoked.push(le64(blk.view(), sizeof(RevokeHeader) + 8 * i))
                 pos = log_advance(sb.journal_blocks, pos, 1)
@@ -251,9 +251,9 @@ impl BlockDevice for NoFlushDevice
 // Rewrite the superblock on the device with `set_state` bits added and the two feature words, resealed.
 edit_super(dev: *RamDevice, set_state: u16, ro_compat: u32, incompat: u32)
     var b = raw(dev, 1)
-    val sb: *Superblock = at(b.view(), 0)
+    val sb: *Superblock = at(b.view_mut(), 0)
     sb.state = sb.state | set_state
     sb.feature_ro_compat = ro_compat
     sb.feature_incompat = incompat
-    seal_superblock(b.view())
+    seal_superblock(b.view_mut())
     raw_put(dev, 1, b.view())

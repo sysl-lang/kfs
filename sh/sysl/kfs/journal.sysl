@@ -282,10 +282,10 @@ revoke_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, b: u64)
         Some(_) -> return
         None -> ()
     if fs.j.aborted then return
-    h.revoked += 1
-    if h.revoked > h.credits
+    if h.revoked >= h.credits
         fs.plat.fatal(Fatal.RevokeOverrun(h.op, h.credits))
         return
+    h.revoked += 1
     val cached = fs.cached_id(b)
     fs.plat.lock(LockId.Journal)
     fs.j.running.outstanding_revokes -= 1
@@ -350,9 +350,9 @@ fresh_data[D: BlockDevice, P: Platform](fs: *Fs[D, P], b: u64) -> bool
 // The lists are reached by address, for `pending_copy`'s reason.
 private copy_from(blocks: *Buf[u64], data: *Buf[u8], b: u64, out: []u8) -> bool
     for k in 0..<blocks.len()
-        if blocks.at(k) == b
+        if blocks[k] == b
             for i in 0..<BLOCK_SIZE
-                out[i] = data.at(k * BLOCK_SIZE + i)
+                out[i] = data[k * BLOCK_SIZE + i]
             return true
     false
 
@@ -481,36 +481,36 @@ finish[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
     var i: u32 = 0
     while i < nbuf
         val n = if nbuf - i < u32(DESCRIPTOR_TAGS) then nbuf - i else u32(DESCRIPTOR_TAGS)
-        zero(desc.view())
-        val d: *DescriptorHeader = at(desc.view(), 0)
+        zero(desc.view_mut())
+        val d: *DescriptorHeader = at(desc.view_mut(), 0)
         d.header.magic = JOURNAL_MAGIC
         d.header.kind = JOURNAL_DESCRIPTOR
         d.header.sequence = t.seq
         d.count = n
         for k in 0..<n
             val id = t.ids[usize(i + k)]
-            copy_for_log(fs, id, copy.view())
-            val tag = tag_at(desc.view(), usize(k))
+            copy_for_log(fs, id, copy.view_mut())
+            val tag = tag_at(desc.view_mut(), usize(k))
             tag.block = fs.block_of(id)
-            tag.flags = escape_copy(copy.view())
+            tag.flags = escape_copy(copy.view_mut())
             seal_tag(seed, t.seq, tag, copy.view())
             io(fs, fs.dev.write(log_block(fs, advance(fs, pos, k + 1)), copy.view()))?
-        seal_journal_block(seed, desc.view())
+        seal_journal_block(seed, desc.view_mut())
         io(fs, fs.dev.write(log_block(fs, pos), desc.view()))?
         pos = advance(fs, pos, 1 + n)
         i += n
     var j: u32 = 0
     while j < nrev
         val n = if nrev - j < u32(REVOKE_ENTRIES) then nrev - j else u32(REVOKE_ENTRIES)
-        zero(desc.view())
-        val r: *RevokeHeader = at(desc.view(), 0)
+        zero(desc.view_mut())
+        val r: *RevokeHeader = at(desc.view_mut(), 0)
         r.header.magic = JOURNAL_MAGIC
         r.header.kind = JOURNAL_REVOKE
         r.header.sequence = t.seq
         r.count = n
         for k in 0..<n
-            put_le64(desc.view(), sizeof(RevokeHeader) + 8 * usize(k), t.revokes[usize(j + k)])
-        seal_journal_block(seed, desc.view())
+            put_le64(desc.view_mut(), sizeof(RevokeHeader) + 8 * usize(k), t.revokes[usize(j + k)])
+        seal_journal_block(seed, desc.view_mut())
         io(fs, fs.dev.write(log_block(fs, pos), desc.view()))?
         pos = advance(fs, pos, 1)
         j += n
@@ -519,8 +519,8 @@ finish[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
     io(fs, fs.dev.flush())?
 
     // Step 6: the commit block, and the flush that makes it durable.
-    zero(desc.view())
-    val c: *Commit = at(desc.view(), 0)
+    zero(desc.view_mut())
+    val c: *Commit = at(desc.view_mut(), 0)
     c.header.magic = JOURNAL_MAGIC
     c.header.kind = JOURNAL_COMMIT
     c.header.sequence = t.seq
@@ -528,7 +528,7 @@ finish[D: BlockDevice, P: Platform](fs: *Fs[D, P]) -> Result[unit, FsError]
     c.commit_sec = when.sec
     c.commit_nsec = when.nsec
     c.blocks = size - 1
-    seal_sector(seed, desc.view())
+    seal_sector(seed, desc.view_mut())
     io(fs, fs.dev.write(log_block(fs, pos), desc.view()))?
     io(fs, fs.dev.flush())?
     pos = advance(fs, pos, 1)

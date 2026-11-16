@@ -48,7 +48,7 @@ names_at_the_edges()
     assert_eq(must_entry(lookup_name(&fs, d, utf8.view())).ino, f)
     // A name one byte different is another name.
     var near = copy_of(longest.view())
-    near.view()[254] = u8('q')
+    near.view_mut()[254] = u8('q')
     assert(!has(&fs, d, near.view()))
     val all = scan_all(&fs, d, 65536)
     assert_eq(all.len(), 5)
@@ -158,10 +158,10 @@ first_name_makes_a_leaf()
     must(add_name(&fs, d, "only".bytes, f, DT_FIFO, 0))
     val node = dir_inode(&fs, d)
     assert(node.size == 4096 && node.blocks == 1 && node.flags & INODE_INDEXED == 0)
-    val b = dir_bytes(&fs, d, 0)
-    val head: *DirLeafHeader = at(b.view(), 0)
+    var b = dir_bytes(&fs, d, 0)
+    val head: *DirLeafHeader = at(b.view_mut(), 0)
     assert(head.magic == DIR_LEAF_MAGIC && head.count == 1 && head.reserved == 0)
-    val rec: *DirRecordHeader = at(b.view(), 8)
+    val rec: *DirRecordHeader = at(b.view_mut(), 8)
     assert(rec.ino == f && rec.rec_len == 4072 && rec.name_len == 4 && rec.file_type == DT_FIFO)
     assert(verify_owned_block(fs.seed, b.view(), d, node.generation))
     // The type comes back from the record, not the inode.
@@ -205,7 +205,7 @@ free_first_record_reused()
     var b = dir_bytes(&fs, d, 0)
     var recs = must_recs(b.view())
     assert(recs[0].ino == 0 && recs[0].rec_len == 24 && recs[1].ino == f)
-    val head: *DirLeafHeader = at(b.view(), 0)
+    val head: *DirLeafHeader = at(b.view_mut(), 0)
     assert_eq(head.count, 1)
     // A 12-byte name needs 24: it takes the free record whole.
     add(&fs, d, "twelve-bytes".bytes, f)
@@ -220,7 +220,7 @@ free_first_record_reused()
     assert(recs[0].ino == 0 && recs.len() == 3 && recs[2].name_len == 13)
     val _ = dir_clean(&fs)
 
-private must_recs(bytes: []u8) -> Buf[Rec]
+private must_recs(bytes: []const u8) -> Buf[Rec]
     leaf_records(bytes) match
         Ok(r) -> r
         Err(_) -> panic("a leaf failed its checks")
@@ -263,8 +263,8 @@ conversion_at_the_boundary()
     assert(has(&fs, d, "a-24-byte".bytes) && has(&fs, d, "one-more".bytes))
     assert_eq(leaf_names_at(&fs, d, 1).len() + leaf_names_at(&fs, d, 2).len(), 255)
     // The root's header.
-    val r = dir_bytes(&fs, d, 0)
-    val head: *IndexHeader = at(r.view(), 0)
+    var r = dir_bytes(&fs, d, 0)
+    val head: *IndexHeader = at(r.view_mut(), 0)
     assert(head.magic == DIR_INDEX_MAGIC && head.level == 0 && head.count == 2 && usize(head.max) == DIR_INDEX_SLOTS)
     val _ = dir_clean(&fs)
 

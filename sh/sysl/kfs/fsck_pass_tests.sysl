@@ -400,8 +400,8 @@ xattr_blocks()
     edit_super(&dev2, 0, 0, 0)
     val _ = repaired(&dev2, Problem.XattrFeature(g))
     assert(super_of(&dev2).feature_ro_compat & RO_COMPAT_XATTR != 0)
-    val backup = raw(&dev2, 2049)
-    val bsb: *Superblock = at(backup.view(), 0)
+    var backup = raw(&dev2, 2049)
+    val bsb: *Superblock = at(backup.view_mut(), 0)
     assert(bsb.feature_ro_compat & RO_COMPAT_XATTR != 0)
 
 // -- Pass 2 ---------------------------------------------------------------------------------------------
@@ -564,7 +564,7 @@ pass5_counts()
         kind match
             0 ->
                 var ib = raw(&dev, g.inode_bitmap(0))
-                bit_clear(ib.view(), 4)
+                bit_clear(ib.view_mut(), 4)
                 raw_put(&dev, g.inode_bitmap(0), ib.view())
                 disk_desc(&dev, 0, (d) -> d.inode_bitmap_crc = bitmap_crc(sb.csum_seed, 0, ib.view()))
             1 -> disk_desc(&dev, 0, (d) -> d.free_blocks = d.free_blocks + 1)

@@ -19,8 +19,8 @@ private disk_list(fs: *RamFs, dev: *RamDevice) -> Buf[u64]
         out.push(ino)
         assert(out.len() < 100)
         val loc = fs.inode_location(ino)
-        val blk = raw(dev, loc.block)
-        val node: *Inode = at(blk.view(), loc.offset)
+        var blk = raw(dev, loc.block)
+        val node: *Inode = at(blk.view_mut(), loc.offset)
         assert(node.flags & INODE_ORPHAN != 0)
         ino = node.orphan_next
     out
@@ -188,9 +188,9 @@ read_only_mount_waits()
 // Write the orphan head (and an inode's `orphan_next`/flags) straight onto the disk, sealed.
 private set_disk_head(dev: *RamDevice, ino: u64)
     var b = raw(dev, 1)
-    val sb: *Superblock = at(b.view(), 0)
+    val sb: *Superblock = at(b.view_mut(), 0)
     sb.orphan_head = ino
-    seal_superblock(b.view())
+    seal_superblock(b.view_mut())
     raw_put(dev, 1, b.view())
 
 private set_disk_link(dev: *RamDevice, ino: u64, next: u64, flag: bool)
@@ -199,10 +199,10 @@ private set_disk_link(dev: *RamDevice, ino: u64, next: u64, flag: bool)
         Err(_) -> panic("the image did not open")
     val loc = m.inode_location(ino).unwrap()
     var b = raw(dev, loc.block)
-    val node: *Inode = at(b.view(), loc.offset)
+    val node: *Inode = at(b.view_mut(), loc.offset)
     node.orphan_next = next
     node.flags = if flag then node.flags | INODE_ORPHAN else node.flags & ~INODE_ORPHAN
-    seal_inode(m.seed, ino, b.view()[loc.offset..<loc.offset + INODE_SIZE])
+    seal_inode(m.seed, ino, b.view_mut()[loc.offset..<loc.offset + INODE_SIZE])
     raw_put(dev, loc.block, b.view())
 
 // Two new files on `dev`, unmounted: answers the first; the second is the next number.

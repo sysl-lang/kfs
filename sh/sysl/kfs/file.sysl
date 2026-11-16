@@ -72,7 +72,7 @@ private read_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, offset
         val dst = out[usize(done)..<usize(done) + piece]
         lookup(fs, ino, p / u64(BLOCK_SIZE))? match
             Mapping.Mapped(b, _, false) ->
-                fs.read_data(b, blk.view())?
+                fs.read_data(b, blk.view_mut())?
                 for k in 0..<piece
                     dst[k] = blk[off + k]
             _ ->
@@ -224,7 +224,7 @@ private put_run[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64
 // tail section 8 keeps zero.
 private put_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, ino: u64, b: u64, off: usize, bytes: []const u8, fresh: bool, past: bool) -> Result[unit, FsError]
     var blk = block_buf()
-    if !fresh && !(off == 0 && bytes.len == BLOCK_SIZE) then fs.read_data(b, blk.view())?
+    if !fresh && !(off == 0 && bytes.len == BLOCK_SIZE) then fs.read_data(b, blk.view_mut())?
     for i in 0..<bytes.len
         blk[off + i] = bytes[i]
     if fresh || fs.maps_fresh(b)
@@ -242,7 +242,7 @@ private zero_in_block[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, in
     lookup(fs, ino, l)? match
         Mapping.Mapped(b, _, false) ->
             var blk = block_buf()
-            fs.read_data(b, blk.view())?
+            fs.read_data(b, blk.view_mut())?
             for i in from..<to
                 blk[i] = 0
             fs.write_data(h, b, blk.view())?
@@ -551,7 +551,7 @@ private sync_locked[D: BlockDevice, P: Platform](fs: *Fs[D, P], ino: u64, data_o
     else
         var blk = block_buf()
         for b in c.dirty.view()
-            if fs.read_data(b, blk.view())? then fs.dev.write(b, blk.view())?
+            if fs.read_data(b, blk.view_mut())? then fs.dev.write(b, blk.view())?
         fs.dev.flush()?
     c.dirty.clear()
     Ok(())

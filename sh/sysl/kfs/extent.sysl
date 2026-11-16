@@ -281,7 +281,7 @@ private merge_at(entries: Buf[ExtentLeaf], k: usize)
         entries[k] = extent_entry(u64(a.logical), u64(a.len) + u64(b.len), a.physical, a.flags)
         entries.remove(k + 1)
 
-private mark(p: Path, k: usize) = p.nodes.view()[k].dirty = true
+private mark(p: Path, k: usize) = p.nodes.view_mut()[k].dirty = true
 
 private check_tree(t: ExtentTree) -> Result[unit, FsError]
     if t.node_max < 2 || usize(t.node_max) > EXTENT_NODE_SLOTS then return Err(FsError.Invalid)
@@ -452,7 +452,7 @@ private settle[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, t: Extent
         val c = n.entries.len()
         if c == 0
             freed.push(n.block)
-            p.nodes.view()[k].dirty = false
+            p.nodes.view_mut()[k].dirty = false
             parent.entries.remove(s)
             mark(p, k - 1)
         else
@@ -490,9 +490,9 @@ private settle[D: BlockDevice, P: Platform](fs: *Fs[D, P], h: *Handle, t: Extent
             from += size
         root.entries.clear()
         root.entries.extend(moved.view())
-        p.nodes.view()[0].depth = root.depth + 1
+        p.nodes.view_mut()[0].depth = root.depth + 1
     else if rcount == 0
-        p.nodes.view()[0].depth = 0
+        p.nodes.view_mut()[0].depth = 0
     else
         collapse(fs, p, made, freed)?
     if used != needed
@@ -546,7 +546,7 @@ private collapse[D: BlockDevice, P: Platform](fs: *Fs[D, P], p: Path, made: Buf[
         if c.entries.len() > usize(root.max) then return Ok(())
         root.entries.clear()
         root.entries.extend(c.entries.view())
-        p.nodes.view()[0].depth = c.depth
+        p.nodes.view_mut()[0].depth = c.depth
         freed.push(c.block)
 
 // Declare buffer `id` (block `b`) to `h`, under the buffer's lock.

@@ -236,8 +236,8 @@ six_hundred_copies()
 // A block beginning with the journal magic: `kind` after it, then `filled_block(salt)`'s bytes.
 private magic_block(kind: u32, salt: u32) -> Buf[u8]
     var b = filled_block(salt)
-    put_le32(b.view(), 0, JOURNAL_MAGIC)
-    put_le32(b.view(), 4, kind)
+    put_le32(b.view_mut(), 0, JOURNAL_MAGIC)
+    put_le32(b.view_mut(), 4, kind)
     b
 
 @test("every copy beginning with the journal magic is logged escaped and replayed with the magic restored")
@@ -249,12 +249,12 @@ escaped_copies()
         contents.push(magic_block(kind, 60 + kind))
     // A valid descriptor of the very transaction it is logged in, checksum and all.
     var forged = new_block()
-    val d: *DescriptorHeader = at(forged.view(), 0)
+    val d: *DescriptorHeader = at(forged.view_mut(), 0)
     d.header.magic = JOURNAL_MAGIC
     d.header.kind = JOURNAL_DESCRIPTOR
     d.header.sequence = fs.running()
     d.count = 1
-    seal_journal_block(fs.seed, forged.view())
+    seal_journal_block(fs.seed, forged.view_mut())
     contents.push(forged)
     // A control: the magic's bytes one off.
     var near = magic_block(2, 70)

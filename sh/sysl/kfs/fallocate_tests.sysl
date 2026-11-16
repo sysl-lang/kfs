@@ -37,7 +37,7 @@ preallocate_keep_size()
     assert(before(t0.ctime_sec, t0.ctime_nsec, n.ctime_sec, n.ctime_nsec))
     assert(!unwritten_at(&fs, ino, 0) && unwritten_at(&fs, ino, 9))
     var out = zeros(100)
-    assert(must_n(read(&fs, ino, 10, out.view())) == 0)
+    assert(must_n(read(&fs, ino, 10, out.view_mut())) == 0)
     // Grown over the preallocation, the file reads zeros there.
     must(truncate(&fs, ino, 5 * bs(), 0))
     val back = got(&fs, ino, 0, 5 * BLOCK_SIZE)

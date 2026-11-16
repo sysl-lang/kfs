@@ -27,7 +27,7 @@ private visible(cd: *CrashDevice[RamDevice]) -> Buf[u64]
     val rep = checked_clean(cd)
     var out: Buf[u64] = buf()
     var sb = raw(cd, 1)
-    mask_mount_fields(sb.view())
+    mask_mount_fields(sb.view_mut())
     out.push(digest(sb.view()))
     val g = fs.geo
     for t in 0..<u64(g.gdt_blocks)

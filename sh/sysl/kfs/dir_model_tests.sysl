@@ -34,11 +34,11 @@ private run_model(seed: u64, ops: u64, ids: u64, cap: u64) -> Run
     var r = Run(0, 0, 0, 0)
     var rng = seed
     for op in 0..<ops
-        rng = rng * 6364136223846793005 + 1442695040888963407
+        rng = rng *% 6364136223846793005 +% 1442695040888963407
         val growing = (op / 400) % 2 == 0
         val roll = (rng >> 33) % 4
         val insert = if growing then roll != 0 && count < cap else roll == 0
-        rng = rng * 6364136223846793005 + 1442695040888963407
+        rng = rng *% 6364136223846793005 +% 1442695040888963407
         // Three times in four the id is one the operation can act on (absent for an insert, present for
         // a removal): the nearest such after a random one. The fourth is any id, so Exists and NotFound
         // come up too.

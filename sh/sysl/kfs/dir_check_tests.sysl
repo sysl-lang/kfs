@@ -409,9 +409,9 @@ mapped_unreachable()
     // Give the block a valid leaf of its own, so nothing but its reachability is wrong.
     val gen = dir_inode(&fs, d).generation
     var blk = block_buf()
-    pack_leaf(blk.view(), buf())
-    set_tail(blk.view(), d, gen)
-    seal_block(fs.seed, blk.view())
+    pack_leaf(blk.view_mut(), buf())
+    set_tail(blk.view_mut(), d, gen)
+    seal_block(fs.seed, blk.view_mut())
     must(fs.checkpoint_all())
     raw_put(&dev, run.first, blk.view())
     only(&dev, Problem.DirReach(d, 3))

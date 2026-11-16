@@ -169,7 +169,7 @@ struct Buffer
 private empty_slot() -> Buffer = Buffer(0, null, buf(), 0, 0, buf(), 0, false, false, 0)
 
 // A buffer holding block `b`, with `data` (BLOCK_SIZE bytes) as its bytes.
-private filled_slot(b: u64, data: Buf[u8], now: u64) -> Buffer = Buffer(b, as_mut_ptr(data.view()), data, 0, 0, buf(), 0, false, true, now)
+private filled_slot(b: u64, data: Buf[u8], now: u64) -> Buffer = Buffer(b, as_mut_ptr(data.view_mut()), data, 0, 0, buf(), 0, false, true, now)
 
 // An operation's handle on the running transaction (section 14). `op` names the operation in a credit
 // failure; `used` is the blocks of the distinct buffers it has declared and `revoked` how many blocks it
@@ -242,7 +242,7 @@ struct Fs[D: BlockDevice, P: Platform]
             Some(id) -> return Ok(id)
             None -> ()
         var data = block_buf()
-        self.dev.read(b, data.view())?
+        self.dev.read(b, data.view_mut())?
         self.plat.lock(LockId.Cache)
         val placed = self.cached(b, now) match
             Some(other) -> Some(other)
@@ -307,7 +307,7 @@ struct Fs[D: BlockDevice, P: Platform]
 
     // How many slots the buffer table has, and how many hold a buffer.
     slots(self) -> usize = self.buffers.len()
-    cached_count(self) -> usize
+    cached_count(*self) -> usize
         var n: usize = 0
         for i in 0..<self.buffers.len()
             if self.buffers[i].valid then n += 1
@@ -385,7 +385,7 @@ struct Fs[D: BlockDevice, P: Platform]
         dropped
 
     // How many cached buffers are clean, pinned, and waiting for a checkpoint write.
-    cache_census(self) -> (usize, usize, usize)
+    cache_census(*self) -> (usize, usize, usize)
         var clean: usize = 0
         var pinned: usize = 0
         var dirty: usize = 0
@@ -551,10 +551,10 @@ struct Fs[D: BlockDevice, P: Platform]
     unmount(*self) -> Result[unit, FsError]
         if self.j.aborted
             var blk = block_buf()
-            self.dev.read(1, blk.view())?
-            val sb: *Superblock = at(blk.view(), 0)
+            self.dev.read(1, blk.view_mut())?
+            val sb: *Superblock = at(blk.view_mut(), 0)
             sb.state = sb.state | STATE_ERROR
-            seal_superblock(blk.view())
+            seal_superblock(blk.view_mut())
             self.dev.write(1, blk.view())?
             self.dev.flush()?
             self.sb.state = self.sb.state | STATE_ERROR
@@ -606,8 +606,8 @@ struct Fs[D: BlockDevice, P: Platform]
 // everything else in block 1 stays as it is there. Only while the log is empty (section 5).
 private set_state_directly[D: BlockDevice](dev: *D, set: u16, clear: u16, mounting: Option[i64]) -> Result[Superblock, DeviceError]
     var blk = block_buf()
-    dev.read(1, blk.view())?
-    val sb: *Superblock = at(blk.view(), 0)
+    dev.read(1, blk.view_mut())?
+    val sb: *Superblock = at(blk.view_mut(), 0)
     sb.state = (sb.state | set) & ~clear
     mounting match
         Some(now) ->
@@ -615,7 +615,7 @@ private set_state_directly[D: BlockDevice](dev: *D, set: u16, clear: u16, mounti
             sb.mount_time = now
             sb.write_time = now
         None -> ()
-    seal_superblock(blk.view())
+    seal_superblock(blk.view_mut())
     dev.write(1, blk.view())?
     dev.flush()?
     Ok(*sb)

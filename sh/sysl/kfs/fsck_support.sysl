@@ -71,15 +71,15 @@ disk_edit(dev: *RamDevice, ino: u64, seal: bool, edit: &Fn(*Inode) -> unit)
     val sb = super_of(dev)
     val loc = disk_slot(dev, ino)
     var blk = raw(dev, loc.block)
-    edit(at(blk.view(), loc.offset))
-    if seal then seal_inode(sb.csum_seed, ino, blk.view()[loc.offset..<loc.offset + INODE_SIZE])
+    edit(at(blk.view_mut(), loc.offset))
+    if seal then seal_inode(sb.csum_seed, ino, blk.view_mut()[loc.offset..<loc.offset + INODE_SIZE])
     raw_put(dev, loc.block, blk.view())
 
 // Inode `ino` as the device holds it.
 disk_inode(dev: *RamDevice, ino: u64) -> Inode
     val loc = disk_slot(dev, ino)
     var blk = raw(dev, loc.block)
-    val n: *Inode = at(blk.view(), loc.offset)
+    val n: *Inode = at(blk.view_mut(), loc.offset)
     *n
 
 // One byte of block `b` flipped, nothing resealed.
@@ -96,7 +96,7 @@ disk_block_bit(dev: *RamDevice, b: u64, set: bool)
     val grp = u32((b - 1) / u64(g.blocks_per_group))
     var bm = raw(dev, g.block_bitmap(grp))
     val i = usize(b - g.group_first(grp))
-    if set then bit_set(bm.view(), i) else bit_clear(bm.view(), i)
+    if set then bit_set(bm.view_mut(), i) else bit_clear(bm.view_mut(), i)
     raw_put(dev, g.block_bitmap(grp), bm.view())
     disk_desc(dev, grp, (d) ->
         d.free_blocks = if set then d.free_blocks - 1 else d.free_blocks + 1
@@ -108,15 +108,15 @@ disk_desc(dev: *RamDevice, grp: u32, edit: &Fn(*GroupDesc) -> unit)
     val tb = 2 + u64(grp / 64)
     var blk = raw(dev, tb)
     val off = usize(grp % 64) * 64
-    edit(at(blk.view(), off))
-    seal_group_desc(sb.csum_seed, grp, blk.view()[off..<off + 64])
+    edit(at(blk.view_mut(), off))
+    seal_group_desc(sb.csum_seed, grp, blk.view_mut()[off..<off + 64])
     raw_put(dev, tb, blk.view())
 
 // The superblock changed by `edit` and sealed again.
 disk_super(dev: *RamDevice, edit: &Fn(*Superblock) -> unit)
     var b = raw(dev, 1)
-    edit(at(b.view(), 0))
-    seal_superblock(b.view())
+    edit(at(b.view_mut(), 0))
+    seal_superblock(b.view_mut())
     raw_put(dev, 1, b.view())
 
 // A digest of every block of the device.
