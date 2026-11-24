@@ -8,7 +8,13 @@
 
 package {
   name    = "kfs"
-  version = "0.1.1"
+  version = "0.1.2"
+}
+
+// The 20,000-extent crash loop (`file_crash_tests.sysl`) walks every write of a shrinking truncate and
+// takes about five minutes on a busy machine, which is the default 300-second limit.
+test {
+  timeout = 900
 }
 
 workspace = ["host", "tools/*"]
